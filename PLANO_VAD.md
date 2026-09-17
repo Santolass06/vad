@@ -47,14 +47,24 @@ própria nem de extração manual de PCM.
 
 ## 2. Comparação VLC vs VAD
 
-Sem números inventados — o baseline real fica registado em M0 (medir o VLC nesta
-máquina) em vez de assumido.
+Baseline real medido em M0 (2026-09-17, Sprint_00) nesta máquina — substitui os
+"a medir". Metodologia e caveats: ver `docs/Sprint_00/Sprint_00.md`.
+Ficheiro de teste canónico (regenerável com o comando abaixo — vive em `/tmp/`,
+não é persistido): `M0_test_1080p_h264_aac.mp4` — 1920×1080@30 H.264 (CRF18) +
+AAC mono 44.1kHz, 90.0s, ~108.3 MiB.
+Comando gerador:
+`ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=90" -f lavfi -i "sine=frequency=440:duration=90" -c:v libx264 -pix_fmt yuv420p -crf 18 -c:a aac -shortest /tmp/M0_test_1080p_h264_aac.mp4`.
+VLC medido: **3.0.23 Vetinari (.deb/apt)**, após trocar o snap 3.0.20 que falhava
+o driver gráfico (`libGL error: iris`); o .deb reproduz sem `libGL error`.
+VA-API indisponível nesta sessão (iHD/i965 ausentes, fallback SW) — o CPU de
+playback abaixo é descodificação por software de padrão sintético de alta
+entropia, i.e. um limite superior, não conteúdo típico.
 
-| Critério | VLC (medir em M0) | Alvo VAD | Fonte do ganho |
+| Critério | VLC (M0, real) | Alvo VAD | Fonte do ganho |
 | :--- | :--- | :--- | :--- |
-| Arranque | a medir | menor | Rust nativo + egui vs Qt; não há reescrita de motor a acelerar isto |
-| RAM idle/playback | a medir | menor | UI mais leve; motor (mpv) é o mesmo custo base que o VLC paga |
-| CPU em pausa | a medir | próximo de 0% | `request_repaint_after` (sleep reativo do egui) |
+| Arranque | **1.831 s (mediana hyperfine, 10 runs + 2 warmup; inclui 1s `--run-time` + saída → arranque+saída líquido ≈0.83 s)** — cmd: `hyperfine --warmup 2 --runs 10 'vlc --intf dummy --play-and-exit --run-time 1 /tmp/M0_test_1080p_h264_aac.mp4'` | menor | Rust nativo + egui vs Qt; não há reescrita de motor a acelerar isto |
+| RAM idle/playback | **pausa: 202108 KB (~197.4 MiB, 5/5 amostras estáveis, estado `Paused` via MPRIS); playback: ~202460 KB (~197.7 MiB)** — cmd: `ps -o rss= -p $(pgrep -x vlc)` | menor | UI mais leve; motor (mpv) é o mesmo custo base que o VLC paga |
+| CPU em pausa | **~1% (`top` instantâneo 0/2/1/1/1 %, estado `Paused` confirmado; `ps %cpu` engana — é média cumulativa)** | próximo de 0% | `request_repaint_after` (sleep reativo do egui) |
 | Codecs/contentores | referência (FFmpeg) | igual | mesmo motor subjacente (mpv usa FFmpeg) — não há diferença aqui |
 | Segurança | CVEs periódicos em C | igual ao VLC nesta camada | ambos usam FFmpeg/libavcodec; a "memory safety" só se aplica ao código Rust que escrevermos, não à descodificação |
 | Transcrição/IA | inexistente | Whisper + resumo + tradução + skip-silence | diferencial real do projeto |
