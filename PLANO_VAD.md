@@ -196,6 +196,35 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     o waveform min/max não precisa de mais precisão). Este custo entra no ledger de
     RAM do §5, não é ignorado.
 
+13. **Modo de armazenamento dos modelos Whisper: escolha do utilizador, não
+    imposição.** RAM-only é a opção certa para um caso específico (uso pontual,
+    privacidade extrema, disco cheio) — não deve ser o único caminho nem o
+    predefinido silencioso. **Decisão:** o `whisper_panel.rs` oferece, por modelo,
+    duas ações explícitas:
+    - **"Guardar no disco"** (predefinição) — persistente em
+      `~/.local/share/vad/models/`; não volta a descarregar da próxima vez que for
+      ativado, e o whisper.cpp carrega por `mmap` a partir do ficheiro, o que usa
+      *menos* RAM residente do que manter o modelo todo em memória (as páginas são
+      partilhadas e recuperáveis sob pressão de memória).
+    - **"Usar só nesta sessão (RAM-only)"** (opt-in explícito) — nada é escrito no
+      disco; tem de ser descarregado outra vez sempre que for usado, e o modelo fica
+      inteiro em memória enquanto ativo (ver §4.11).
+
+    Ao passar o rato sobre cada opção, um tooltip explica o tradeoff em vez de
+    obrigar o utilizador a adivinhar:
+    - *RAM-only:* "Nada fica no disco. Ideal para privacidade extrema ou pouco
+      espaço livre. Tens de descarregar de novo (o tamanho do modelo escolhido, ex.
+      ~55 MB no `base-q5`) sempre que usares, e ocupa esse espaço em RAM enquanto
+      estiver ativo."
+    - *Disco:* "Guardado em `~/.local/share/vad/models/`. Mais rápido a ativar da
+      próxima vez e usa menos RAM (carregado por mmap), mas ocupa espaço em disco
+      até apagares manualmente."
+
+    Arquitetura: `model_manager.rs` (novo, em `vad-ai`) decide o destino do download
+    — ficheiro ou `Arc<[u8]>` em memória (ver §4.11) — consoante a escolha; ambos os
+    caminhos alimentam `whisper.rs` da mesma forma (a diferença fica isolada nesta
+    camada, não se propaga ao resto da app).
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -222,7 +251,8 @@ esforço real de performance do projeto:
   app": um ficheiro corrompido não pode abortar o processo.
 - **Whisper quantizado** (`q5_0` / `q5_1`, nomenclatura correta do whisper.cpp/ggml):
   modelo `base` cai de 142 MB para ~55 MB de RAM. É a maior alavanca de RAM do
-  playback/transcrição — usar por omissão no `whisper.rs` / RAM-only loader.
+  playback/transcrição — usar por omissão no caminho RAM-only do `whisper.rs`
+  (o caminho disco, predefinido, usa ainda menos RAM residente via `mmap`, ver §4.13).
 - **Waveform pyramid**: 3 níveis de resolução pré-computados em background (visão
   global, 5 min, 10s); a UI renderiza no máximo ~1000 pontos visíveis, independente da
   duração do ficheiro.
@@ -319,7 +349,8 @@ vad/
 │   ├── vad-ai/                   # transcrição, VAD, resumo, tradução — SEM deps de UI
 │   │   ├── src/
 │   │   │   ├── extractor.rs      # subprocesso ffmpeg -> PCM 16kHz mono i16, cache por ficheiro (waveform + Whisper, ver §4.12)
-│   │   │   ├── whisper.rs        # transcriber (whisper.cpp bindings); modelo RAM-only em Arc<[u8]> pinado, nunca Vec<u8> (ver §4.11)
+│   │   │   ├── model_manager.rs  # escolha do utilizador: disco (~/.local/share/vad/models/) ou RAM-only (ver §4.13)
+│   │   │   ├── whisper.rs        # transcriber (whisper.cpp bindings); caminho RAM-only em Arc<[u8]> pinado, nunca Vec<u8> (ver §4.11); caminho disco carrega por path
 │   │   │   ├── vad_detector.rs   # deteção de silêncio antes do Whisper
 │   │   │   ├── summarizer.rs     # LLM local (GGUF) para resumo da transcrição
 │   │   │   └── translator.rs     # Whisper translate (EN) + M5: mesmo LLM do summarizer p/ outros idiomas
@@ -387,7 +418,7 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
 | **M0** | Medir baseline real do VLC nesta máquina (RSS, arranque, CPU em pausa) | Números registados, substituem os "a medir" da tabela |
 | **M1** | `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL (obrigatório em Wayland) com `hwdec=auto-safe`, HUD básico, MPRIS + inibidor de screensaver (mesma base `zbus`, ver §4.7), CLI (clap) + drag-and-drop, `probe_dependencies` (ffmpeg/yt-dlp), guarda de foco de teclado (`wants_keyboard_input`); decisão de janela nova por execução (sem instância única) | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker; HUD mostra o `hwdec-current` real, incluindo fallback `SW (CPU)`; teclas de media do sistema funcionam; ecrã não suspende durante playback; app arranca e degrada graciosamente (botões desativados) sem `ffmpeg`/`yt-dlp` instalados; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
 | **M2** | Playlist (+ shuffle/repeat), faixas de áudio/legendas, hwdec visível no HUD, `video_panel.rs` (delay A/V, aspect/crop/rotação), reprodução por URL (yt-dlp — confirmar isolamento de `config-dir`, ver §3), resume playback (`recents.rs`) | Troca de faixa sem reiniciar; indicador de aceleração correto; URL do YouTube reproduz sem herdar `~/.config/mpv` do utilizador; reabrir a app oferece continuar o último ficheiro |
-| **M3** | Whisper (via `extractor.rs`/ffmpeg desacoplado) + VAD skip-silence + bookmarks exportáveis em .md (timestamps em texto simples) | Transcrição de um ficheiro de reunião real sem interromper outra reprodução; notas exportadas |
+| **M3** | Whisper (via `extractor.rs`/ffmpeg desacoplado) + `model_manager.rs` com escolha disco/RAM-only e tooltips (ver §4.13) + VAD skip-silence + bookmarks exportáveis em .md (timestamps em texto simples) | Transcrição de um ficheiro de reunião real sem interromper outra reprodução; utilizador escolhe e vê o tradeoff antes de descarregar um modelo; notas exportadas |
 | **M4** | Corte/exportação de clips (via ffmpeg CLI, ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido (corte por keyframe aceite) |
 | **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 20 segmentos reais traduzidos pelo LLM revistos manualmente sem alucinação/enchimento antes de expor a feature |
 | **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
@@ -403,8 +434,11 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
    sem crash da app).
 2. `vad-ai`: teste do VAD detector com áudio sintético (silêncio conhecido) validando
    que não corta início/fim de fala.
-3. Validação RAM-only: carregar modelo Whisper para `Vec<u8>`, confirmar zero ficheiros
-   novos em `~/.cache` e `/tmp`.
+3. Validação RAM-only: carregar modelo Whisper para `Arc<[u8]>` (ver §4.11), confirmar
+   zero ficheiros novos em `~/.local/share/vad`, `~/.cache` e `/tmp`.
+4. Validação modo disco: carregar modelo via `model_manager.rs` com "Guardar no disco",
+   confirmar ficheiro criado em `~/.local/share/vad/models/` e reutilizado (sem novo
+   download) na ativação seguinte.
 
 ### Verificação manual
 1. Comparar RSS e CPU em pausa contra o baseline medido em M0.
@@ -412,3 +446,5 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
 3. Transcrever um áudio de reunião com silêncios e validar tempo de transcrição vs
    duração real.
 4. Testar teclas de media do teclado/sistema (MPRIS) com a app em segundo plano.
+5. No painel de modelos, confirmar que os tooltips de "Guardar no disco" e "RAM-only"
+   aparecem ao passar o rato e que a escolha é respeitada (ficheiro criado vs nenhum).
