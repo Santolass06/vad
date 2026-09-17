@@ -82,6 +82,9 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
 | Playlists M3U/PLS/XSPF | Parcial | Parser próprio se quisermos formatos fora do que o mpv já lê |
 | Redução de ruído (voz) | Sim (`af=arnndn`, RNNoise compilado no `libavfilter` desta distro) | Toggle na UI de áudio |
 | Extração de PCM para o Whisper (16kHz mono) | Não — libmpv não expõe isto de forma simples a partir da reprodução ao vivo | Subprocesso `ffmpeg` separado (ver §4.3), desacoplado da reprodução |
+| Delay de áudio/legendas (`audio-delay`, `sub-delay`) | Sim | Slider/atalhos de teclado na UI (equivalente a j/k/g/h do VLC) |
+| Aspect ratio, crop, rotação (`video-aspect-override`, `video-crop`, `video-rotate`) | Sim | Controlos no painel de vídeo |
+| Reprodução direta por URL (YouTube/Twitch via yt-dlp) | Sim, em princípio — confirmado nesta máquina: `libmpv.so` linka `liblua5.2` (o `ytdl_hook` interno do mpv é Lua, não mujs) e `yt-dlp` já está instalado. **Por confirmar em M2:** a libmpv, ao contrário do binário standalone, não carrega config/scripts por omissão — é preciso ativar isso explicitamente em `player.rs`, e ao fazê-lo isolar `config-dir` numa pasta própria do VAD, não a do utilizador (`~/.config/mpv`), para não herdar `hwdec`/`vo`/`af` de fora | Aceitar URL na caixa "Abrir"; **`yt-dlp` passa a dependência de runtime**, tal como o `ffmpeg` |
 
 ---
 
@@ -135,6 +138,53 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
    acima. **Decisão para v1:** cada execução de `vad` abre uma janela nova (mais
    simples, sem IPC). Instância única só entra em âmbito se/quando o esquema de URI do
    ponto 4 for implementado — decide-se uma vez, não duas.
+
+6. **Lembrar posição de reprodução (resume).** Isto exige guardar estado entre
+   execuções — **não é o mesmo objetivo que o "zero-disk footprint"** do plano original,
+   que se referia especificamente aos buffers de descodificação e ao modelo Whisper
+   (por privacidade/discos cheios). Guardar os últimos ~20 ficheiros + timestamp num
+   ficheiro de configuração pequeno (`~/.config/vad/recentes.json`) é comportamento
+   normal de qualquer app e não contradiz essa filosofia. Não delegar isto ao
+   `watch-later` nativo do mpv — o VAD precisa de mostrar o próprio diálogo
+   "continuar de onde parou" à sua maneira, não a semântica de ficheiro do mpv.
+
+7. **Inibidor de suspensão de ecrã.** Sem isto, o ecrã apaga-se a meio de um vídeo
+   longo sem interação do rato/teclado — falha visível logo na primeira demonstração
+   de M1 (qualquer teste real de "play e não tocar no rato por 5 minutos" apanha isto
+   se ficar para depois). **Movido para M1**, não M2: usa `zbus`, a mesma dependência
+   já necessária para o MPRIS no mesmo milestone — é código incremental, não uma
+   integração nova. Implementar via `org.freedesktop.ScreenSaver.Inhibit`, ativo
+   apenas durante reprodução de vídeo/áudio, liberta ao pausar.
+
+8. **Bandeja de sistema (system tray).** Útil para "fechar a janela, o áudio da
+   reunião continua a tocar". Mesmo padrão de registo de serviço D-Bus do MPRIS/
+   screensaver — mas com um passo adicional (protocolo `StatusNotifierItem`, crate
+   `ksni`). **Risco a registar:** funciona bem em KDE, mas o GNOME *não mostra* ícones
+   de bandeja por omissão sem uma extensão do utilizador (AppIndicator/
+   KStatusNotifierItem Support). Tratar como best-effort, não como garantia universal
+   — documentar isto na própria app em vez de o utilizador achar que está avariado.
+
+9. **Picture-in-Picture / Always-on-Top.** Já está no mockup do HUD mas falta o
+   mecanismo: `window.set_window_level` via `winit`/`eframe`. **Risco a registar:**
+   fiável em X11; em Wayland depende do compositor — o GNOME Wayland, por exemplo,
+   não expõe always-on-top a aplicações cliente por restrição do protocolo. Mesmo
+   tratamento do ponto 8: best-effort, comunicado na UI.
+
+10. **Descarregamento automático de legendas (OpenSubtitles).** Fica como stretch
+    goal pós-M6, tal como sugerido. **Nota que não é zero-custo:** a API pública da
+    OpenSubtitles hoje exige registo/chave de API e tem limites de taxa — não é uma
+    integração livre de fricção como era a extensão VLSub há alguns anos.
+
+### Fora de âmbito, por decisão deliberada
+
+Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
+fora, com a razão:
+
+- **Servidor de streaming (RTSP/HTTP broadcast)** — hoje o caminho normal é OBS/nginx-rtmp.
+- **Sintonizador de TV analógica/DVB-T** — hardware praticamente extinto.
+- **CD de áudio (`cdda://`)** — leitores de CD físico já não existem na generalidade das máquinas.
+- **Efeitos de vídeo gimmick** (espelho, puzzle, ondulação) — sem utilidade real.
+- **Transcodificador geral** — o corte/exportação via `ffmpeg` (§8) cobre o caso que interessa, sem o menu "Converter/Guardar" cheio de erros do VLC.
 
 ---
 
@@ -230,9 +280,10 @@ vad/
 ├── crates/
 │   ├── vad-core/                 # motor: embutir libmpv, estado, playlist — SEM deps de UI
 │   │   ├── src/
-│   │   │   ├── player.rs         # wrapper sobre libmpv2 (mpv_render_context/OpenGL; play/pause/seek/tracks/filtros)
+│   │   │   ├── player.rs         # wrapper sobre libmpv2 (mpv_render_context/OpenGL; play/pause/seek/tracks/filtros/delay/aspect/crop/rotate)
 │   │   │   ├── state.rs          # eventos do mpv (thread interna em C) -> crossbeam-channel/watch para a UI
-│   │   │   ├── playlist.rs
+│   │   │   ├── playlist.rs       # shuffle/repeat, URLs (yt-dlp) além de ficheiros locais
+│   │   │   ├── recents.rs        # últimos ~20 ficheiros + timestamp p/ "continuar de onde parou" (ver §4.6)
 │   │   │   └── bookmarks.rs      # notas de reunião exportáveis (.md, timestamps em texto simples)
 │   │   └── Cargo.toml
 │   │
@@ -257,12 +308,15 @@ vad/
 │       │   ├── app.rs            # loop reativo (request_repaint_after); drag-and-drop (egui raw.dropped_files)
 │       │   ├── render.rs         # egui_glow::CallbackFn que invoca a mpv_render_context na thread de UI
 │       │   ├── mpris.rs          # org.mpris.MediaPlayer2[.Player] via zbus — Metadata: trackid/title/artist/length
+│       │   ├── screensaver.rs    # org.freedesktop.ScreenSaver.Inhibit via zbus (ver §4.7)
+│       │   ├── tray.rs           # StatusNotifierItem via ksni — best-effort, ver §4.8
 │       │   ├── theme.rs
 │       │   └── panels/
 │       │       ├── hud.rs
 │       │       ├── whisper_panel.rs
 │       │       ├── playlist_panel.rs
-│       │       └── audio_panel.rs
+│       │       ├── audio_panel.rs
+│       │       └── video_panel.rs    # cor, aspect/crop/rotação, delay A/V — já estava no mockup, faltava no código
 │       └── Cargo.toml
 ```
 
@@ -302,12 +356,13 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
 | Fase | Entregável | Critério de aceitação |
 | :--- | :--- | :--- |
 | **M0** | Medir baseline real do VLC nesta máquina (RSS, arranque, CPU em pausa) | Números registados, substituem os "a medir" da tabela |
-| **M1** | `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL (obrigatório em Wayland), HUD básico, MPRIS completo (zbus), CLI (clap) + drag-and-drop; decisão de janela nova por execução (sem instância única) | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker; teclas de media do sistema funcionam; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
-| **M2** | Playlist, faixas de áudio/legendas, hwdec visível no HUD | Troca de faixa sem reiniciar; indicador de aceleração correto |
+| **M1** | `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL (obrigatório em Wayland), HUD básico, MPRIS + inibidor de screensaver (mesma base `zbus`, ver §4.7), CLI (clap) + drag-and-drop; decisão de janela nova por execução (sem instância única) | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker; teclas de media do sistema funcionam; ecrã não suspende durante playback; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
+| **M2** | Playlist (+ shuffle/repeat), faixas de áudio/legendas, hwdec visível no HUD, `video_panel.rs` (delay A/V, aspect/crop/rotação), reprodução por URL (yt-dlp — confirmar isolamento de `config-dir`, ver §3), resume playback (`recents.rs`) | Troca de faixa sem reiniciar; indicador de aceleração correto; URL do YouTube reproduz sem herdar `~/.config/mpv` do utilizador; reabrir a app oferece continuar o último ficheiro |
 | **M3** | Whisper (via `extractor.rs`/ffmpeg desacoplado) + VAD skip-silence + bookmarks exportáveis em .md (timestamps em texto simples) | Transcrição de um ficheiro de reunião real sem interromper outra reprodução; notas exportadas |
 | **M4** | Corte/exportação de clips (via ffmpeg CLI, ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido (corte por keyframe aceite) |
 | **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 20 segmentos reais traduzidos pelo LLM revistos manualmente sem alucinação/enchimento antes de expor a feature |
-| **M6** | Polish (tema, animações), perfil de release, empacotamento (Flatpak) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
+| **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
+| **Pós-M6** | Esquema de URI `vad://` + instância única (§4.4/4.5); legendas automáticas via OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
 
 ---
 
