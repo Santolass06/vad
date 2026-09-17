@@ -16,7 +16,9 @@ de usar.
    placeholders).
 3. Botão "Testar ligação" (§4.23) para os 3 backends cloud — validar `base_url`/chave
    **antes** de gravar a configuração, para não virar um bug irreprodutível ("o
-   resumo não funciona" sem mais contexto).
+   resumo não funciona" sem mais contexto). 4 estados explícitos na UI: Repouso, A
+   testar (spinner), Sucesso (com a latência medida em ms), Erro (com o diagnóstico
+   da falha) — nunca só um "falhou"/"ok" binário.
 
 ## Fora de âmbito
 

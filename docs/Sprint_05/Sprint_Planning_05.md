@@ -15,13 +15,24 @@ sessão, configuração unificada.
    `config-dir`** numa pasta própria do VAD (nunca `~/.config/mpv`) **e passar
    `--no-config` explicitamente** — isolar o `config-dir` sozinho não chega, o
    `ytdl_hook` e outros scripts podem ainda ler de localizações por omissão fora dessa
-   pasta (§3, item marcado como "por confirmar em M2").
+   pasta (§3, item marcado como "por confirmar em M2"). **Validar o esquema do URL
+   antes de o passar ao mpv/yt-dlp** (§4.27) — só `http://`/`https://`/`rtsp://`;
+   rejeitar `file://`, `smb://` e outros. Configurar `network-timeout` explícito no
+   mpv para streams (§4.22 é sobre chamadas cloud do LLM — este é o equivalente para
+   a reprodução de rede, não pode ficar implícito).
 2. `vad-core/src/recents.rs`: últimos ~20 ficheiros + timestamp (§4.6). **Não** usar o
-   `watch-later` nativo do mpv — diálogo próprio "continuar de onde parou".
-3. Diálogo de resume na UI (design `Dialogs.dc.html`, "Continuar de onde parou?").
+   `watch-later` nativo do mpv — diálogo próprio "continuar de onde parou". Escrita
+   **atómica** (`.tmp` + `rename`, §4.30) — nunca sobrescrever `recentes.json`
+   diretamente.
+3. Diálogo de resume na UI (design `Dialogs.dc.html`, "Continuar de onde parou?") —
+   como toast não-bloqueante com timeout (~8s), não um modal que impede continuar a
+   usar a app enquanto decide.
 4. `vad-core/src/config.rs`: `~/.config/vad/config.toml` via `serde`+`toml`,
    consolidando `recents`, atalhos de teclado, e o **schema** (ainda não a UI) para a
    escolha disco/RAM-only por modelo — a feature de Whisper em si só chega em M3.
+   Escrita **atómica** (`.tmp` + `rename`, §4.30) — mesma razão do `recents.rs`: um
+   corte de energia a meio da escrita não pode deixar o ficheiro a 0 bytes e impedir
+   o arranque seguinte.
 
 ## Fora de âmbito
 

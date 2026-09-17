@@ -13,7 +13,11 @@ com gestão de segredos correta desde o início.
 
 1. `vad-ai/src/llm_provider.rs`: implementar a variante `OpenAiCompatible{base_url}` —
    mesmo código para OpenAI oficial, Ollama, OpenRouter ou qualquer endpoint
-   compatível (§4.2 — não são duas integrações, é uma só).
+   compatível (§4.2 — não são duas integrações, é uma só). **Validar o `base_url`
+   com `url::Url` antes de gravar** (§4.28) — rejeitar esquemas fora de http/https e
+   endereços de metadados de cloud conhecidos (`169.254.169.254`) — um endpoint
+   customizado é o único ponto do plano onde o utilizador controla um destino de
+   rede arbitrário.
 2. Dependências atrás de feature flags: `reqwest` com `rustls` (evita a dor de linkar
    OpenSSL entre distros), `async-openai` para este caminho — quem só usa local não
    paga o custo binário.
@@ -26,7 +30,10 @@ com gestão de segredos correta desde o início.
 5. `vad-app/src/panels/settings_panel.rs`: scaffold inicial (design `Settings.dc.html`)
    — card do OpenAI-compatible funcional (base_url + chave); cards de
    Anthropic/Gemini como placeholders visuais nesta sprint (implementação real na
-   Sprint_12).
+   Sprint_12). **Operações de keyring e chamadas HTTP nunca dentro do `update()`
+   do egui** — são bloqueantes (D-Bus/Secret Service, rede) e um `update()` bloqueado
+   trava a UI inteira; correr sempre numa tarefa em background e comunicar o
+   resultado de volta por canal.
 6. Aplicar o gate de qualidade do §4.1 aqui: um `OpenAiCompatible` com `base_url`
    não-oficial (self-hosted) passa pelo **mesmo gate** do `LocalQwen` — o resultado
    do gate da Sprint_10 **não** se transfere automaticamente para um endpoint

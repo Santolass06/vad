@@ -18,7 +18,9 @@ longas.
 2. `vad-ai/src/summarizer.rs`: chunking/map-reduce (§4.19) — resume por blocos e funde
    os resumos parciais. A janela de contexto é por provider, não uma constante global
    — desenhar a interface já com isso em mente, mesmo só com `LocalQwen` implementado
-   nesta sprint.
+   nesta sprint. **Descartar cada bloco bruto de transcrição assim que o resumo
+   parcial correspondente é produzido** (§4.19) — não reter todos os blocos em
+   memória até ao fim do map-reduce, ou o pico de heap cresce com o número de blocos.
 3. `vad-ai/src/translator.rs`: modo `translate` do Whisper (PT→EN, já disponível desde
    M3) + M5a: reutilizar o `LocalQwen` via prompt para PT↔outro idioma (§4.1).
 4. Progresso por bloco (§4.20): "a resumir bloco 3 de 7" em vez de streaming SSE

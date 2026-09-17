@@ -12,7 +12,14 @@ distribuível.
 ## Tarefas
 
 1. `vad-app/src/theme.rs`: tema/animações finais, alinhado ao design "Cinema Violet"
-   já publicado (`design/vad-ui-design.html`).
+   já publicado (`design/vad-ui-design.html`). **Requisito de acessibilidade a
+   verificar ao implementar a paleta, não a assumir dos mockups:** texto secundário/
+   separadores têm de cumprir WCAG AA (≥4.5:1) e marcadores finos (ex. keyframes na
+   waveform) ≥3.0:1 — usar um medidor de contraste real sobre as cores escolhidas,
+   nenhum tamanho de texto abaixo de 12px. Anéis de foco visíveis (2px, cor de
+   acento) em todo o controlo interativo e todo diálogo modal fecha com `Escape`
+   (§4.34) — configurado aqui em `egui::Visuals`, aplicado retroativamente aos
+   diálogos já existentes desde a Sprint_02.
 2. `vad-app/src/tray.rs`: implementa `PlatformIntegration` (§4.25) para Linux —
    `StatusNotifierItem` via `ksni` — **best-effort**, documentar na própria app que o
    GNOME sem a extensão AppIndicator não mostra o ícone (§4.8), em vez de o

@@ -18,11 +18,17 @@ descobrir agora do que depois de construir HUD, MPRIS, playlist, etc. por cima.
    `vad-audio-tools` podem ficar como stubs vazios nesta sprint; só `vad-core` e
    `vad-app` têm trabalho real.
 2. `vad-core/src/player.rs`: wrapper mínimo sobre `libmpv2`, inicializar o
-   `mpv_render_context` com backend OpenGL.
+   `mpv_render_context` com backend OpenGL. Leitura de propriedades do mpv
+   (`hwdec-current`, etc.) tem de tratar `MPV_ERROR_PROPERTY_NOT_FOUND` como caso
+   normal (§4.32) — não assumir que todas as propriedades existem em qualquer versão
+   de `libmpv` instalada na distro do utilizador.
 3. `vad-app/src/render.rs`: `egui_glow::CallbackFn` que invoca a render API do mpv na
    thread de UI — restrição do §4.3: o contexto OpenGL tem de estar *current* na
    thread que chama a render API. A renderização do vídeo fica presa a essa thread; só
-   os *eventos* do mpv correm à parte.
+   os *eventos* do mpv correm à parte. **Alocar o FBO em píxeis físicos** — multiplicar
+   as dimensões lógicas da janela pelo `pixels_per_point` real do `egui_glow` (§4.33),
+   não pelas dimensões lógicas diretamente, ou o vídeo fica desfocado em Wayland com
+   fractional scaling (125%/150%).
 3a. **Callback de `mpv_render_context_set_update_callback` envolvido em
    `std::panic::catch_unwind`** (§4.24). É Rust chamado de volta pelo C — um panic aqui
    sem guarda aborta o processo tal como `panic="abort"` faria, o que o §5 já rejeitou
@@ -32,7 +38,12 @@ descobrir agora do que depois de construir HUD, MPRIS, playlist, etc. por cima.
 5. HUD mínimo (não o HUD completo do M1) só para mostrar `hwdec-current` real — ler a
    propriedade do mpv, nunca assumir que o valor pedido foi aplicado.
 6. `vad-core/src/state.rs`: canal `crossbeam-channel`/`watch` dos eventos do mpv
-   (thread C interna) para a UI — versão inicial, mesmo que rudimentar.
+   (thread C interna) para a UI — versão inicial, mesmo que rudimentar. **Decidir já
+   aqui, não na Sprint_02:** `time-pos` chega a ~60 eventos/s do mpv — se cada um
+   virar uma mensagem de canal a acordar a UI, quebra o sleep reativo
+   (`request_repaint_after`, §5). A posição de reprodução corrente fica num
+   `AtomicU64`/canal `watch` (último valor, não uma fila), que a UI lê sob procura em
+   vez de processar um evento por frame de vídeo.
 7. Play/pause/seek/volume básicos ligados a controlos mínimos, só o suficiente para
    testar manualmente.
 

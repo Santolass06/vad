@@ -298,7 +298,10 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     LLM local nem em muitos limites de cloud. `summarizer.rs` resume por blocos e
     funde os resumos parciais; cada provider tem a sua janela de contexto, o limite
     de tokens por chamada é por provider, não uma constante global. Isto já era uma
-    lacuna do M5 antes de existir cloud — devia ter sido apanhado antes.
+    lacuna do M5 antes de existir cloud — devia ter sido apanhado antes. **Nota de
+    memória:** descartar cada bloco bruto de transcrição assim que o respetivo resumo
+    parcial é produzido, em vez de reter tudo até ao fim do map-reduce — o pico de
+    heap não deve crescer com o número de blocos já processados.
 
 20. **Progresso do LLM: por bloco, não por token — mesma política do §4.17, não uma
     nova.** Um resumo cloud demora 10-60s; um map-reduce sobre 90 min de transcrição,
@@ -356,6 +359,62 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     `#[cfg(target_os = "...")]` atrás do mesmo trait, sem tocar em `vad-core`/`vad-ai`
     nem reescrever a app base.
 
+26. **Segurança de subprocessos CLI (`ffmpeg`/`yt-dlp`): argv como vetor, nunca
+    shell.** Um nome de ficheiro com espaços, aspas ou um prefixo como `-vcodec` pode
+    ser interpretado como opção pelo `ffmpeg` se a invocação passar por uma shell.
+    **Regra única, aplicada em todos os pontos que chamam estes binários**
+    (`extractor.rs` Sprint_06, URL/yt-dlp Sprint_05, `clip_export.rs` Sprint_08):
+    `Command::new("ffmpeg").args([...])` — nunca `sh -c`/interpolação de string — e
+    terminar as opções com `--` antes de qualquer caminho de ficheiro arbitrário do
+    utilizador.
+27. **Validação de esquema de URL antes de encaminhar para o mpv/yt-dlp.** A caixa
+    "Abrir" aceita URLs (§3); sem validação, um utilizador (ou um link colado de
+    outro lado) podia passar `file:///etc/shadow` ou `smb://`. **Decisão:** validar
+    contra uma lista permitida (`http://`, `https://`, `rtsp://`) antes de passar ao
+    mpv, em `playlist.rs`/URL handling (Sprint_05).
+28. **Validação do `base_url` customizado (OpenAI-compatible) contra SSRF.** Um
+    endpoint customizado no `settings_panel.rs` (§4.2/§4.23) podia apontar para
+    `169.254.169.254` (metadados de cloud) ou uma porta interna da própria máquina.
+    **Decisão:** validar o URL com a crate `url::Url` (esquema http/https, sem
+    reescrita para endereços de metadados conhecidos) antes de gravar a configuração
+    — o mesmo botão "Testar ligação" do §4.23 é o sítio natural para isto
+    (Sprint_11/12).
+29. **HUD sobre o FBO do mpv não pode usar blur de fundo.** O `egui_glow` não tem
+    `backdrop-filter` nativo sobre uma textura externa (o FBO onde o mpv renderiza);
+    simular blur por múltiplas passagens de shader sobrecarregaria GPUs integradas
+    (Intel Iris/Mesa) sem necessidade. **Decisão:** superfícies do HUD/modais em
+    opacidade fixa ~92% (`Color32::from_rgba_premultiplied`) com borda de 1px, em vez
+    de tentar reproduzir o blur dos mockups (`Dialogs.dc.html`) literalmente
+    (Sprint_02).
+30. **Escrita atómica de estado persistente.** `recentes.json` (§4.6) e
+    `config.toml` (§5) podem corromper-se (ficar a 0 bytes) se o processo morrer a
+    meio da escrita — um corte de energia ou `kill -9` não avisa. **Decisão:** escrever
+    sempre primeiro para um ficheiro `.tmp` no mesmo diretório e aplicar
+    `std::fs::rename` (atómico no mesmo filesystem) sobre o destino final
+    (Sprint_05, onde ambos os ficheiros são implementados).
+31. **Morte súbita do subprocesso `ffmpeg` (OOM-killer/sinal).** O `extractor.rs`
+    já trata cancelamento pedido pelo utilizador (§4.17); falta o caso em que o
+    processo morre sozinho (ex. OOM-killer numa reunião de 4h) — sem isto, a UI fica
+    presa em "A extrair áudio... 0%" para sempre. **Decisão:** monitorizar o
+    `ExitStatus` do processo filho; código não-zero ou terminação por sinal converte
+    de imediato em `VadError::ExtractionFailed` (§4.14) e repõe a UI (Sprint_06).
+32. **Introspecção defensiva de propriedades do mpv.** Distros com uma `libmpv` mais
+    antiga podem não ter todas as propriedades que o `player.rs` lê (`hwdec-current`,
+    etc.). **Decisão:** tratar `MPV_ERROR_PROPERTY_NOT_FOUND` como um caso normal
+    (valor por omissão/indisponível), nunca como erro fatal — evita que o VAD falhe
+    o arranque numa distro com mpv mais velho (Sprint_01, `player.rs`).
+33. **FBO do render em píxeis físicos, não lógicos (fractional scaling/HiDPI).** Em
+    Wayland com escala 125%/150%, um FBO criado com as dimensões lógicas da janela
+    produz vídeo desfocado. **Decisão:** multiplicar sempre as dimensões lógicas pelo
+    `pixels_per_point` real do `egui_glow` ao alocar o framebuffer do
+    `mpv_render_context` (Sprint_01, `render.rs`).
+34. **Acessibilidade de teclado nos diálogos e controlos.** Sem isto, utilizadores de
+    teclado ficam presos num diálogo modal ou perdem a noção de onde está o foco.
+    **Decisão:** todo diálogo modal fecha com `Escape`; todo controlo interativo tem
+    anel de foco visível (`2px`, cor de acento) — parte da configuração de
+    `egui::Visuals` em `theme.rs` (Sprint_15), aplicada a diálogos já existentes
+    desde a Sprint_02.
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -385,6 +444,17 @@ fora, com a razão:
   de ~55 MB do §5 vem do `whisper.cpp`). Reabrir esta decisão exige, no mínimo, essa
   medição — não é para ser reproposta só com o argumento de "é mais seguro por ser
   Rust".
+- **Vetorização SIMD manual da conversão PCM `i16`→`f32`** — avaliada e recusada. A
+  cache de PCM já fica em `i16` por decisão (§4.12); a conversão para `f32` que o
+  Whisper precisa acontece **dentro do próprio `whisper.cpp`/ggml ao ingerir os
+  dados**, não em código do VAD. Não há laço de conversão próprio para vetorizar —
+  otimizar isto seria trabalho sem alvo real.
+- **`shortcuts.toml` (remapeamento de atalhos de teclado) e `[mpv_options]`
+  (passthrough de opções arbitrárias do mpv) no `config.toml`** — adiado para
+  pós-M6/stretch, não v1. Ambos são aditivos (não bloqueiam nenhum milestone) e o
+  segundo tem uma superfície a considerar com cuidado (opções arbitrárias do mpv
+  correm no mesmo processo) — não é para ser adicionado apressadamente só por
+  conveniência de utilizadores de i3/Hyprland.
 
 ---
 
@@ -408,7 +478,17 @@ esforço real de performance do projeto:
   utilizador faz zoom, não antecipadamente — evita atraso na abertura de ficheiros
   longos. Armazenamento é min/max por pixel (~KB), não o PCM bruto, por isso o custo
   aqui é de tempo de cálculo, não de RAM. UI renderiza no máximo ~1000 pontos visíveis,
-  independente da duração do ficheiro.
+  independente da duração do ficheiro, desenhados num único lote (`egui::Mesh`/
+  `rect_filled` em sequência) em vez de uma chamada de desenho por barra — custo real
+  de CPU a medir, não assumido.
+- **Threads do `whisper.cpp`**: fixar por omissão em `num_cpus::get_physical()` em
+  vez do total de threads lógicas — evita contenção de cache entre threads irmãs de
+  Hyper-Threading/SMT. Valor por omissão a confirmar por medição em Sprint_06, não
+  um ganho percentual assumido.
+- **Libertar VRAM em reprodução só-áudio**: desativar o pipeline de textura OpenGL do
+  `render.rs` quando o ficheiro aberto não tem faixa de vídeo — sem isto, uma
+  reunião em `.opus` continua a reservar memória de GPU para um frame que nunca é
+  desenhado.
 - **Logging estruturado** via `tracing`, com `--verbose`/`--log-file` no CLI
   (`~/.cache/vad/vad.log`) — sem isto, um bug reportado por um utilizador é
   inreproduzível.
@@ -470,7 +550,8 @@ software e o HUD mostra `SW (CPU)` em vez de continuar a exibir "VA-API" a menti
 |  |   || |||| | | ||||||||||||||||||||| | | | ||||||||||||||||| | | ||||||||| |  | [🎙 Whisper AI] |
 |  |===||=||||=|=|======================[▲]====================================|  | [📑 Playlist]  |
 |  +---------------------------------------------------------------------------+  | [🎛 Equalizador]|
-|                                                                                 | [🎨 Cores Vídeo]|
+|  [⏪5s] [▶/⏸] [5s⏩]   00:14:23 / 01:30:00   1.5x ▾   🔊 100%   (playhead acima  | [🎨 Cores Vídeo]|
+|  é clicável/arrastável — não há Modo Reunião sem controlo de transporte)         | --------------- |
 |  Controlos Rápidos de Reunião:                                                  | --------------- |
 |  [ Saltar Silêncios: ATIVO ]  [ Redução de Ruído: ATIVO ]  [ Speed: 1.5x ]     | Modelo:         |
 |                                                                                 | [ base-q5 (~55M)▼

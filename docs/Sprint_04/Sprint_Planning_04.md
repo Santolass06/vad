@@ -20,7 +20,13 @@ equalizador — tudo o que o mpv já resolve internamente (§3), só falta a UI.
    (`audio-delay`/`sub-delay`) — painel do design `VideoPanel.dc.html`.
 4. `vad-app/src/panels/audio_panel.rs`: equalizador de 10 bandas + presets + volume
    boost, usando os filtros `lavfi` que o mpv já expõe (§3 — "vem de graça", só falta
-   a UI) — painel do design `Equalizer.dc.html`.
+   a UI) — painel do design `Equalizer.dc.html`, com linha de referência nos 0 dB e
+   curva espectral contínua entre bandas. Expor também a lista `audio-device-list` do
+   mpv nas definições de áudio — útil para quem tem mais de um DAC/interface USB
+   ligado (o PipeWire já faz o roteamento automático, isto é só para escolha manual).
+5. Painéis laterais (Playlist, Equalizador, Vídeo, futura Reunião) com largura
+   uniforme de **340px fixos** — evita saltos de layout na área de vídeo ao trocar de
+   painel.
 
 ## Fora de âmbito
 
