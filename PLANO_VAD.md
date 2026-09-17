@@ -16,7 +16,7 @@ o VAD constrói-se por cima, não ao lado.
 | Decisão | Escolha | Razão |
 | :--- | :--- | :--- |
 | Motor de reprodução | **libmpv** (`libmpv2` crate) | Sync A/V, hwdec (VA-API/NVDEC), legendas, DVD/Blu-ray, streaming de rede e filtros de DSP já resolvidos e testados em produção. Reescrever isto do zero era anos de trabalho para reimplementar o que já existe. |
-| Licenciamento | **VAD em licença GPL-compatível** | libmpv nesta distro é GPLv2+ (linka libavcodec/libavfilter com componentes GPL). Distribuir um binário que depende dele implica que o VAD também deve ser GPL-compatível. Não há forma de manter "100% permissivo" com este motor — decisão aceite, não é um projeto comercial. |
+| Licenciamento | **Binário final em licença GPL-compatível** | libmpv nesta distro é GPLv2+ (linka libavcodec/libavfilter com componentes GPL). Distribuir um binário que depende dele implica que o **binário distribuído** do VAD também deve ser GPL-compatível — decisão aceite, não é um projeto comercial. **Clarificação:** isto é sobre a obra distribuída, não sobre cada ficheiro de código; um crate sem dependências GPL (ex. `llm_provider.rs`, se isolado) pode ser lançado à parte sob MIT se algum dia fizer sentido para reutilização — não bloqueia isso, só o binário `vad` completo é sempre GPL. |
 | Arquitetura | **Core desacoplado da UI** (workspace multi-crate) | Pedido explícito: preparar para eventual porte futuro (outra UI, outro SO) sem acoplar tudo ao egui. |
 | Âmbito de features de IA v1 | Transcrição (Whisper), skip-silence, bookmarks, corte/exportação de clips, redução de ruído, resumo automático (LLM), tradução de legendas | Definido em conversa como o diferencial real do projeto. |
 
@@ -84,7 +84,7 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
 | Extração de PCM para o Whisper e para a waveform (16kHz mono) | Não — libmpv não expõe isto de forma simples a partir da reprodução ao vivo | Subprocesso `ffmpeg` separado (ver §4.3), desacoplado da reprodução; cache por ficheiro partilhada entre `waveform_pyramid` e `whisper.rs` (ver §4.12, custo de RAM) |
 | Delay de áudio/legendas (`audio-delay`, `sub-delay`) | Sim | Slider/atalhos de teclado na UI (equivalente a j/k/g/h do VLC) |
 | Aspect ratio, crop, rotação (`video-aspect-override`, `video-crop`, `video-rotate`) | Sim | Controlos no painel de vídeo |
-| Reprodução direta por URL (YouTube/Twitch via yt-dlp) | Sim, em princípio — confirmado nesta máquina: `libmpv.so` linka `liblua5.2` (o `ytdl_hook` interno do mpv é Lua, não mujs) e `yt-dlp` já está instalado. **Por confirmar em M2:** a libmpv, ao contrário do binário standalone, não carrega config/scripts por omissão — é preciso ativar isso explicitamente em `player.rs`, e ao fazê-lo isolar `config-dir` numa pasta própria do VAD, não a do utilizador (`~/.config/mpv`), para não herdar `hwdec`/`vo`/`af` de fora | Aceitar URL na caixa "Abrir"; **`yt-dlp` passa a dependência de runtime**, tal como o `ffmpeg` |
+| Reprodução direta por URL (YouTube/Twitch via yt-dlp) | Sim, em princípio — confirmado nesta máquina: `libmpv.so` linka `liblua5.2` (o `ytdl_hook` interno do mpv é Lua, não mujs) e `yt-dlp` já está instalado. **Por confirmar em M2:** a libmpv, ao contrário do binário standalone, não carrega config/scripts por omissão — é preciso ativar isso explicitamente em `player.rs`, isolar `config-dir` numa pasta própria do VAD (não `~/.config/mpv`), **e passar `--no-config` explicitamente** — isolar o `config-dir` sozinho não chega, o `ytdl_hook` e outros scripts podem ainda ler de localizações por omissão fora dessa pasta | Aceitar URL na caixa "Abrir"; **`yt-dlp` passa a dependência de runtime**, tal como o `ffmpeg` |
 
 ---
 
@@ -93,24 +93,52 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
 1. **Tradução de legendas em tempo real.** O modo `translate` do Whisper só traduz
    **para inglês** — não existe tradução PT→outro idioma nativa no Whisper.
    - **v1:** tradução apenas para inglês (uma chamada Whisper, offline, sem modelo extra).
-   - **M5 (revisto):** em vez de um segundo modelo dedicado (NLLB), reutilizar o mesmo
-     LLM local do resumo (ver ponto 2) para traduzir PT↔qualquer idioma via prompt —
-     poupa uma dependência de inferência inteira. **Condição de aceitação antes de
-     adotar isto:** correr 20 segmentos reais do Whisper pelo LLM candidato e validar
-     manualmente que não há alucinação nem enchimento de texto — modelos pequenos
-     (0.5B–1B) são conhecidos por falhar exatamente em fragmentos curtos e sem
-     contexto, que é a forma de uma legenda. Se falhar no teste, volta-se à opção de
-     um modelo de tradução dedicado.
+   - **M5a (local):** reutilizar o mesmo LLM local do resumo (ver ponto 2) para
+     traduzir PT↔qualquer idioma via prompt — poupa uma dependência de inferência
+     inteira. **Condição de aceitação:** correr 100 segmentos reais do Whisper
+     (PT→EN/ES/FR) pelo LLM candidato e validar manualmente que não há alucinação
+     nem enchimento de texto — modelos pequenos (0.5B–1B) falham exatamente em
+     fragmentos curtos e sem contexto, que é a forma de uma legenda.
+   - **M5b (cloud, decisão tomada — ver ponto 2):** os providers cloud de primeira
+     parte (OpenAI, Anthropic, Gemini oficiais) não passam pelo gate — a qualidade já
+     é validada pelo próprio provider. **Um `OpenAiCompatible` com `base_url`
+     não-oficial (Ollama, self-hosted, OpenRouter) passa pelo mesmo gate do
+     `LocalQwen`** — o `base_url` é escolhido pelo utilizador em runtime, por isso
+     nenhum resultado de gate de um endpoint se transfere para outro; a regra é sobre
+     quem controla o endpoint, não sobre o tamanho do modelo.
+   - UI mostra um badge por operação — `🔒 local` vs `☁️ sai do PC` — para o
+     utilizador escolher conscientemente antes de cada resumo/tradução que sai da
+     máquina, o mesmo padrão já usado no tooltip disco/RAM-only do Whisper (§4.13).
 
-2. **Resumo automático (LLM).** Consistente com a filosofia de privacidade já presente
-   no plano (Whisper RAM-only), a recomendação é um **modelo local pequeno em GGUF**
-   (`Qwen2.5-0.5B-Instruct-Q4_K_M` ~350 MB, ou `Llama-3.2-1B-Instruct-Q4_K_M` ~700 MB,
-   via `llama-cpp-rs` ou `candle`) em vez de API cloud. Isto é uma recomendação, não uma
-   decisão tua — API cloud é mais simples de implementar e dá melhores resumos, mas
-   contradiz a filosofia "zero-disco/privacidade" do resto do documento. **Nota de
-   RAM:** este modelo soma-se aos ~55 MB do Whisper quantizado (ver §5) — o footprint
-   total do M5 fica bem acima do resto da app; isto é um custo aceite pela feature, não
-   um erro na tabela de otimizações.
+2. **Resumo e tradução por LLM: 2 backends, local por omissão + cloud opt-in
+   (decisão tomada).** Local continua a ser o caminho por omissão, consistente com a
+   filosofia de privacidade do resto do plano — modelo pequeno em GGUF
+   (`Qwen2.5-0.5B-Instruct-Q4_K_M` ~350 MB, ou `Llama-3.2-1B-Instruct-Q4_K_M`
+   ~700 MB, via `llama-cpp-rs` ou `candle`). **Cloud é opt-in explícito**, com 4
+   opções: OpenAI-compatible (cobre também "custom" — é o mesmo código, `base_url`
+   configurável aponta para OpenAI oficial, Ollama, OpenRouter ou qualquer endpoint
+   compatível; não são duas integrações), Anthropic e Gemini.
+   - **Segredos nunca em `config.toml`** (plaintext, `chmod 644`, contradiria
+     §4.13/§4.18): chaves de API no keyring do SO (crate `keyring`, Secret Service no
+     Linux) com variáveis de ambiente como fallback (`VAD_OPENAI_KEY`,
+     `VAD_ANTHROPIC_KEY`, `VAD_GEMINI_KEY`, `VAD_CUSTOM_KEY`). Sem Secret Service
+     disponível (comum em setups mínimos/headless) — terceira via, mantida a uma
+     linha para não crescer: pedir na UI e guardar só em memória de sessão.
+   - Novo erro `VadError::LlmAuthFailed` → UI mostra "chave inválida — abre
+     Definições → IA", sem retry infinito nem crash.
+   - **Nota de RAM:** o modelo local soma-se aos ~55 MB do Whisper quantizado
+     (ver §5); **modo cloud é ~0 MB extra** — é o melhor argumento de eficiência do
+     projeto para quem está limitado em RAM, vale a pena o utilizador saber disto.
+   - Dependências atrás de feature flags (quem só usa local não paga o custo
+     binário): `reqwest` com `rustls` (evita a dor de linkar OpenSSL entre
+     distros), `async-openai` para o caminho OpenAI-compatible, clientes finos
+     próprios (POST simples) para Anthropic/Gemini em vez de SDKs pesados.
+   - **Ordem de execução, não o inverso:** M5a (local, com gate) fica à frente de
+     M5b (cloud). M5b sozinho — 4 providers, keyring, painel de definições com teste
+     de ligação, chunking, retry/backoff, fallback offline, testes com HTTP mockado —
+     é comparável em dimensão a M1–M3 juntos; é um milestone com peso próprio, não um
+     refinamento do M5. Se quiseres cloud mais cedo, é uma troca consciente de
+     prioridade, não a ordem por omissão.
 
 3. **Mecanismo de renderização de vídeo.** Incorporar o vídeo por `wid` (janela nativa
    X11) **não funciona em Wayland** — não é uma questão de estabilidade, é uma
@@ -265,6 +293,40 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     for adicionado (para acelerar reabrir o mesmo ficheiro), tem de ser opt-in e
     comunicado, nunca automático.
 
+19. **Chunking (map-reduce) para transcrições longas — falta independentemente de
+    cloud.** Uma transcrição de 90 min de reunião não cabe num único prompt, nem no
+    LLM local nem em muitos limites de cloud. `summarizer.rs` resume por blocos e
+    funde os resumos parciais; cada provider tem a sua janela de contexto, o limite
+    de tokens por chamada é por provider, não uma constante global. Isto já era uma
+    lacuna do M5 antes de existir cloud — devia ter sido apanhado antes.
+
+20. **Progresso do LLM: por bloco, não por token — mesma política do §4.17, não uma
+    nova.** Um resumo cloud demora 10-60s; um map-reduce sobre 90 min de transcrição,
+    mais. Em vez de streaming SSE (3 formatos diferentes por provider, para um caso
+    de uso batch, não chat ao vivo), reportar progresso por chunk do map-reduce
+    ("a resumir bloco 3 de 7") — dá feedback real e torna o cancelar significativo,
+    sem exigir parsing de streaming específico por provider. Streaming token-a-token
+    fica como melhoria posterior, não requisito do M5b.
+
+21. **Fallback automático para local quando offline: só com aviso, nunca silencioso.**
+    Se a chamada cloud falhar por falta de rede, cair para o LLM local é razoável —
+    mas trocar de um modelo cloud para um modelo de 0.5B muda a qualidade do
+    resultado sem o utilizador saber. O badge 🔒/☁️ (ponto 1) existe precisamente
+    para isto: um resumo produzido pelo fallback tem de ficar marcado como local
+    (🔒), não apresentado como se tivesse vindo do provider pedido. Trocar de
+    caminho sem avisar é o mesmo erro que já rejeitámos na ronda da auditoria do
+    Mistral — só que na direção inversa (cloud→local em vez de local→cloud).
+
+22. **Resiliência de rede.** Timeouts, retry com backoff+jitter para 429/5xx,
+    deteção de offline (aciona o ponto 21). Estende o `VadError` do §4.14:
+    `LlmTimeout`, `LlmRateLimited`, `NoNetwork`, `LlmAuthFailed` (já no ponto 2).
+
+23. **Endpoint OpenAI-compatible customizado: validar antes de guardar.** Um
+    `base_url` errado sem validação vira bug irreprodutível ("o resumo não
+    funciona" sem mais contexto). Botão "Testar ligação" no painel de definições
+    (`settings_panel.rs`, novo em `vad-app/src/panels/`) antes de gravar a
+    configuração.
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -403,9 +465,10 @@ vad/
 │   │   │   ├── model_manager.rs  # escolha do utilizador: disco (~/.local/share/vad/models/) ou RAM-only (ver §4.13)
 │   │   │   ├── whisper.rs        # transcriber (whisper.cpp bindings); caminho RAM-only em Arc<[u8]> pinado, nunca Vec<u8> (ver §4.11); caminho disco carrega por path
 │   │   │   ├── vad_detector.rs   # deteção de silêncio antes do Whisper
-│   │   │   ├── summarizer.rs     # LLM local (GGUF) para resumo da transcrição
-│   │   │   └── translator.rs     # Whisper translate (EN) + M5: mesmo LLM do summarizer p/ outros idiomas
-│   │   └── Cargo.toml           # nota: redução de ruído é af=arnndn no mpv, não crate própria
+│   │   │   ├── llm_provider.rs   # trait Summarizer + enum LocalQwen/OpenAiCompatible{base_url}/Anthropic/Gemini (ver §4.2)
+│   │   │   ├── summarizer.rs     # orquestra chunking/map-reduce (ver §4.19) sobre o llm_provider.rs escolhido
+│   │   │   └── translator.rs     # Whisper translate (EN) + M5a/M5b: mesmo llm_provider.rs p/ outros idiomas (ver §4.1)
+│   │   └── Cargo.toml           # nota: redução de ruído é af=arnndn no mpv, não crate própria; deps de cloud atrás de feature flags (ver §4.2)
 │   │
 │   ├── vad-audio-tools/          # corte/exportação de clips, waveform pyramid
 │   │   ├── src/
@@ -427,7 +490,8 @@ vad/
 │       │       ├── whisper_panel.rs
 │       │       ├── playlist_panel.rs
 │       │       ├── audio_panel.rs
-│       │       └── video_panel.rs    # cor, aspect/crop/rotação, delay A/V — já estava no mockup, faltava no código
+│       │       ├── video_panel.rs    # cor, aspect/crop/rotação, delay A/V — já estava no mockup, faltava no código
+│       │       └── settings_panel.rs # providers de IA, chaves (nunca lidas/escritas em config.toml, ver §4.2), botão "Testar ligação" (§4.23)
 │       └── Cargo.toml
 ```
 
@@ -474,7 +538,8 @@ conscientemente, em vez de o v1 impor silenciosamente o corte por keyframe.
 | **M2** | Playlist (+ shuffle/repeat), faixas de áudio/legendas, hwdec visível no HUD, `video_panel.rs` (delay A/V, aspect/crop/rotação), reprodução por URL (yt-dlp — confirmar isolamento de `config-dir`, ver §3), resume playback (`recents.rs`), `config.rs` unificado (§5) | Troca de faixa sem reiniciar; indicador de aceleração correto; URL do YouTube reproduz sem herdar `~/.config/mpv` do utilizador; reabrir a app oferece continuar o último ficheiro |
 | **M3** | Whisper offline (§4.15, via `extractor.rs` assíncrono com progresso/cancelamento, §4.17) + `model_manager.rs` com escolha disco/RAM-only e tooltips (§4.13) + unload por inatividade (§4.16) + VAD skip-silence + bookmarks exportáveis em .md | Transcrição de um ficheiro de reunião real sem congelar a UI durante a extração nem interromper outra reprodução; utilizador escolhe e vê o tradeoff antes de descarregar um modelo; notas exportadas |
 | **M4** | Corte/exportação de clips (via ffmpeg CLI + checkbox "corte exato", ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido; ambos os modos de corte (keyframe e exato) funcionam |
-| **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 100 segmentos reais (PT→EN/ES/FR) revistos manualmente sem alucinação/enchimento; se falhar, fallback é EN-only via Whisper ou um modelo de tradução dedicado local (§4.1) — **nunca API cloud**, contradiria a decisão de LLM local já tomada |
+| **M5a** | Resumo + tradução via `llm_provider.rs` (`LocalQwen`), chunking/map-reduce (§4.19), progresso por bloco (§4.20) | **Gate de aceitação:** 100 segmentos reais (PT→EN/ES/FR) revistos manualmente sem alucinação/enchimento; transcrição de 90 min resumida sem exceder a janela de contexto |
+| **M5b** | Cloud opt-in: `OpenAiCompatible`/Anthropic/Gemini, `settings_panel.rs` com teste de ligação (§4.23), keyring + fallback env vars (§4.2), fallback offline com disclosure (§4.21), resiliência de rede (§4.22) — **milestone com peso próprio, não refinamento do M5a** | Badge 🔒/☁️ visível antes de cada operação cloud; `base_url` inválido detetado no "Testar ligação", nunca só ao usar; nenhuma chave em `config.toml` nem em `vad.log` |
 | **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak com ffmpeg/yt-dlp incluídos no manifesto, removendo a dependência de runtime do sistema na versão empacotada) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
 | **Pós-M6** | Esquema de URI `vad://` + instância única (§4.4/4.5); legendas automáticas via OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
 
@@ -498,6 +563,14 @@ conscientemente, em vez de o v1 impor silenciosamente o corte por keyframe.
    pânico no `Mutex` do contexto mpv. Sem alvo numérico — o critério é "não trava,
    não crasha", não um tempo específico (targets de performance vêm sempre do
    baseline medido em M0, nunca de números assumidos).
+6. `llm_provider.rs` com HTTP mockado (ex. `wiremock`): respostas 401 (auth), 429
+   (rate limit) e timeout, validar que cada uma mapeia para o `VadError` certo
+   (§4.22) e aciona o fallback com disclosure (§4.21), não um crash nem um retry
+   infinito.
+7. **Teste anti-leak (específico, não "não deve haver segredos" vago):** depois de
+   uma sessão que exercite uma chamada autenticada real, fazer grep dos padrões de
+   chave API tanto em `~/.config/vad/config.toml` como em `~/.cache/vad/vad.log` —
+   zero ocorrências em ambos.
 
 ### Verificação manual
 1. Comparar RSS e CPU em pausa contra o baseline medido em M0.
