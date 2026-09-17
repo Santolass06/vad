@@ -10,11 +10,18 @@ demonstração: o ecrã a apagar-se a meio de um vídeo.
 
 ## Tarefas
 
-1. `vad-app/src/mpris.rs`: `org.mpris.MediaPlayer2[.Player]` via `zbus` — `Metadata`
+0. `vad-core/src/platform.rs`: definir o trait `PlatformIntegration` (§4.25) — a
+   interface comum que `mpris.rs` e `screensaver.rs` vão implementar. **Decisão de
+   arquitetura, não trabalho extra por antecipação de Windows/mobile:** o v1 só tem a
+   implementação `#[cfg(target_os = "linux")]`; o trait existe para que um port futuro
+   troque só este módulo, sem tocar em `vad-core`/`vad-ai`.
+1. `vad-app/src/mpris.rs`: implementa `PlatformIntegration` para Linux —
+   `org.mpris.MediaPlayer2[.Player]` via `zbus` — `Metadata`
    (trackid/title/artist/length), `PlayPause`/`Next`/`Previous`/`Seek`.
-2. `vad-app/src/screensaver.rs`: `org.freedesktop.ScreenSaver.Inhibit` via `zbus`
-   (mesma dependência do `mpris.rs`, código incremental — §4.7) — ativo só durante
-   reprodução de vídeo/áudio, liberta ao pausar.
+2. `vad-app/src/screensaver.rs`: implementa `PlatformIntegration` para Linux —
+   `org.freedesktop.ScreenSaver.Inhibit` via `zbus` (mesma dependência do `mpris.rs`,
+   código incremental — §4.7) — ativo só durante reprodução de vídeo/áudio, liberta ao
+   pausar.
 3. Guarda de foco de teclado: atalhos globais só disparam se
    `!ctx.wants_keyboard_input()` — evita que setas/espaço interfiram com campos de
    texto focados.

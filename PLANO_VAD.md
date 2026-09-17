@@ -327,6 +327,35 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     (`settings_panel.rs`, novo em `vad-app/src/panels/`) antes de gravar a
     configuração.
 
+24. **Segurança de FFI: panics não podem atravessar a fronteira C→Rust.** Não é toda
+    fronteira FFI que precisa disto — chamar *para* C a partir de Rust não exige nada
+    de especial. O que precisa de guarda é o **Rust que o C chama de volta**: o
+    callback de `mpv_render_context_set_update_callback` (§4.3, Sprint_01) e os
+    callbacks de progresso/abort do `whisper.rs` (§4.17, Sprint_06). O Rust moderno
+    aborta o processo (não é UB silencioso) quando um panic escapa de um `extern "C"`
+    — mas abortar o processo é exatamente o que o §5 já rejeitou ao decidir **não**
+    usar `panic = "abort"`, precisamente porque contradiz o critério de M1 "erro
+    tratado sem crash da app". Um panic sem guarda nesses dois callbacks mata o
+    processo de qualquer forma, anulando essa decisão já tomada. **Decisão:** envolver
+    esses callbacks especificamente em `std::panic::catch_unwind`, converter o panic
+    apanhado num `VadError` e seguir a tabela erro→ação→UI do §4.14 — não é uma
+    prática genérica de "toda fronteira FFI precisa disto", é a consequência direta de
+    uma decisão já tomada no plano.
+
+25. **Integrações de sistema operativo isoladas atrás de um trait comum, não
+    espalhadas pela app (decisão de arquitetura, não de âmbito).** O v1 continua a
+    ser **Linux em primeiro lugar** — não há trabalho de Windows/macOS/mobile
+    planeado nem no roteiro (§9/§11). Mas MPRIS, inibidor de screensaver e bandeja de
+    sistema (§4.7/§4.8, hoje via `zbus`/`ksni`, só existem no Linux) não devem ser
+    chamados diretamente dos painéis da UI — ficam atrás de um trait `PlatformIntegration`
+    definido em `vad-core` (ver `platform.rs` no §7), com a única implementação de v1
+    marcada `#[cfg(target_os = "linux")]`. Isto não é trabalho extra por antecipação —
+    é o mesmo desacoplamento já decidido em §1 ("Core desacoplado da UI... preparar
+    para eventual porte futuro") aplicado de forma concreta: se um dia houver um port
+    para outro SO, esse trabalho fica confinado a escrever um novo módulo
+    `#[cfg(target_os = "...")]` atrás do mesmo trait, sem tocar em `vad-core`/`vad-ai`
+    nem reescrever a app base.
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -337,6 +366,25 @@ fora, com a razão:
 - **CD de áudio (`cdda://`)** — leitores de CD físico já não existem na generalidade das máquinas.
 - **Efeitos de vídeo gimmick** (espelho, puzzle, ondulação) — sem utilidade real.
 - **Transcodificador geral** — o corte/exportação via `ffmpeg` (§8) cobre o caso que interessa, sem o menu "Converter/Guardar" cheio de erros do VLC.
+- **Windows/macOS/Android/iOS como alvo de desenvolvimento do v1** — o projeto é
+  Linux em primeiro lugar. O ponto 25 acima garante que a arquitetura não fecha essa
+  porta, mas nenhum destes SOs entra no roteiro §9/§11 sem uma decisão explícita
+  futura. Para mobile especificamente, a razão é mais forte que "falta de tempo": o
+  iOS proíbe `fork()`/`exec()` na sandbox da app, e o Android bloqueia (SELinux
+  `W^X`) executar binários próprios a partir da pasta de dados da app desde a API 29
+  — o modelo atual de subprocessos (`ffmpeg`, `yt-dlp`) é inviável em mobile por
+  construção, não por imaturidade das crates.
+- **Migração de `ffmpeg`/`whisper.cpp`/`af=arnndn` para crates Pure Rust
+  (`symphonia`/`candle`/`nnnoiseless`) — avaliada e recusada para já.** A motivação
+  citada para essa migração (eliminar dependências de subprocesso) já está resolvida
+  no desktop Linux: o M6 empacota `ffmpeg`/`yt-dlp` no manifesto Flatpak (§9) e o M1
+  já degrada graciosamente na ausência deles via `probe_dependencies`+`error.rs`
+  (§4.14). Em troca, `symphonia` não cobre AC3/DTS/TrueHD (áudio comum em rips de
+  filmes, ainda que não em gravações de reunião), e não há medição de paridade
+  velocidade/qualidade/RAM do `candle` contra o `whisper.cpp` já validado (o número
+  de ~55 MB do §5 vem do `whisper.cpp`). Reabrir esta decisão exige, no mínimo, essa
+  medição — não é para ser reproposta só com o argumento de "é mais seguro por ser
+  Rust".
 
 ---
 
@@ -456,7 +504,8 @@ vad/
 │   │   │   ├── recents.rs        # últimos ~20 ficheiros + timestamp p/ "continuar de onde parou" (ver §4.6)
 │   │   │   ├── bookmarks.rs      # notas de reunião exportáveis (.md, timestamps em texto simples)
 │   │   │   ├── error.rs          # VadError (thiserror) + tabela erro->ação->UI (ver §4.14)
-│   │   │   └── config.rs         # ~/.config/vad/config.toml, serde+toml (ver §5)
+│   │   │   ├── config.rs         # ~/.config/vad/config.toml, serde+toml (ver §5)
+│   │   │   └── platform.rs       # trait PlatformIntegration (media session, inibir screensaver, tray) — só cfg(target_os="linux") implementado no v1 (ver §4.25)
 │   │   └── Cargo.toml
 │   │
 │   ├── vad-ai/                   # transcrição, VAD, resumo, tradução — SEM deps de UI
@@ -480,10 +529,10 @@ vad/
 │       ├── src/
 │       │   ├── main.rs           # clap (abrir ficheiro por argumento, --fullscreen); probe_dependencies (ffmpeg/yt-dlp no $PATH)
 │       │   ├── app.rs            # loop reativo (request_repaint_after); drag-and-drop (egui raw.dropped_files); atalhos globais só se !ctx.wants_keyboard_input()
-│       │   ├── render.rs         # egui_glow::CallbackFn que invoca a mpv_render_context na thread de UI
-│       │   ├── mpris.rs          # org.mpris.MediaPlayer2[.Player] via zbus — Metadata: trackid/title/artist/length
-│       │   ├── screensaver.rs    # org.freedesktop.ScreenSaver.Inhibit via zbus (ver §4.7)
-│       │   ├── tray.rs           # StatusNotifierItem via ksni — best-effort, ver §4.8
+│       │   ├── render.rs         # egui_glow::CallbackFn que invoca a mpv_render_context na thread de UI; callback de update envolvido em catch_unwind (ver §4.24)
+│       │   ├── mpris.rs          # implementa PlatformIntegration p/ Linux: org.mpris.MediaPlayer2[.Player] via zbus — Metadata: trackid/title/artist/length (ver §4.25)
+│       │   ├── screensaver.rs    # implementa PlatformIntegration p/ Linux: org.freedesktop.ScreenSaver.Inhibit via zbus (ver §4.7/§4.25)
+│       │   ├── tray.rs           # implementa PlatformIntegration p/ Linux: StatusNotifierItem via ksni — best-effort, ver §4.8/§4.25
 │       │   ├── theme.rs
 │       │   └── panels/
 │       │       ├── hud.rs
@@ -499,6 +548,12 @@ vad/
 ou portar para outro SO sem tocar na lógica. Nota: a renderização do vídeo (`render.rs`)
 fica presa à thread de UI por exigência da `mpv_render_context` (contexto OpenGL
 current); só os eventos de estado do mpv correm em canal — não é a mesma decisão.
+
+O mesmo princípio aplica-se às integrações de sistema operativo: `mpris.rs`,
+`screensaver.rs` e `tray.rs` implementam o trait `PlatformIntegration` de
+`vad-core/src/platform.rs` em vez de serem chamados diretamente pelos painéis — no v1
+só existe a implementação `#[cfg(target_os = "linux")]`, mas um port futuro (§4.25)
+troca só esse módulo, nunca a lógica de `vad-core`/`vad-ai` por cima.
 
 ---
 

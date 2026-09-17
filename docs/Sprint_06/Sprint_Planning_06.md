@@ -27,7 +27,11 @@ Pipeline de extração de áudio + waveform + escolha de armazenamento do modelo
 4. `vad-ai/src/whisper.rs`: bindings whisper.cpp. Caminho RAM-only carrega para
    `Arc<[u8]>` **pinado** (nunca `Vec<u8>` — §4.11: `whisper_init_from_buffer` não
    copia o modelo, um `Vec` realocado seria use-after-free real, não excesso de
-   cautela); caminho disco carrega por path/`mmap`.
+   cautela); caminho disco carrega por path/`mmap`. **Os callbacks de
+   progresso/abort passados ao whisper.cpp (Rust chamado de volta pelo C) vão
+   envolvidos em `std::panic::catch_unwind`** (§4.24) — pela mesma razão do callback
+   de update do mpv na Sprint_01: um panic sem guarda aqui aborta o processo, anulando
+   a decisão do §5 de não usar `panic="abort"`.
 5. Diálogo "A extrair áudio" com progresso (design `Dialogs.dc.html`).
 6. `vad-app/src/panels/whisper_panel.rs`: UI do `model_manager` (lista de modelos no
    disco, radio disco/RAM-only, tooltips) — design `Meeting.dc.html`.

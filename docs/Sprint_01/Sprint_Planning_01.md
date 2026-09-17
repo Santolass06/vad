@@ -23,6 +23,11 @@ descobrir agora do que depois de construir HUD, MPRIS, playlist, etc. por cima.
    thread de UI — restrição do §4.3: o contexto OpenGL tem de estar *current* na
    thread que chama a render API. A renderização do vídeo fica presa a essa thread; só
    os *eventos* do mpv correm à parte.
+3a. **Callback de `mpv_render_context_set_update_callback` envolvido em
+   `std::panic::catch_unwind`** (§4.24). É Rust chamado de volta pelo C — um panic aqui
+   sem guarda aborta o processo tal como `panic="abort"` faria, o que o §5 já rejeitou
+   explicitamente. Converter o panic apanhado num `VadError` em vez de o deixar
+   escapar.
 4. `hwdec=auto-safe` (§4.3/§6) configurado no `player.rs`.
 5. HUD mínimo (não o HUD completo do M1) só para mostrar `hwdec-current` real — ler a
    propriedade do mpv, nunca assumir que o valor pedido foi aplicado.
