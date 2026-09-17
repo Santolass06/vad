@@ -30,7 +30,9 @@ impl VadApp {
         let shared_state = Arc::new(SharedPlayerState::new());
 
         let player = Player::new().expect("Failed to initialize libmpv player");
-        let _ = player.start_event_loop(event_tx.clone(), Arc::clone(&shared_state));
+        if let Err(e) = player.start_event_loop(event_tx.clone(), Arc::clone(&shared_state)) {
+            error!("Failed to start mpv event loop thread: {:?}", e);
+        }
 
         // Setup OpenGL video renderer if glow context is present
         let renderer = if let Some(gl) = cc.gl.clone() {

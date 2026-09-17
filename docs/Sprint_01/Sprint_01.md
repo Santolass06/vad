@@ -73,7 +73,21 @@ não resultou tem valor para quem vier depois.
 
 ## Desvios face ao Sprint_Planning_01.md
 
-Nenhum desvio em relação ao planeado. Todas as 7 tarefas e os critérios de gate foram estritamente cumpridos.
+As 7 tarefas e os critérios de gate foram cumpridos, mas há um desvio implícito não
+registado na primeira versão deste diário (encontrado em revisão):
+
+- **`render_ctx.update()`/`.render()` correm em `render.rs::prepare_frame`, chamado
+  diretamente do corpo do `CentralPanel` em `app.rs::ui()`, não de dentro do
+  `egui_glow::CallbackFn` em si** (que só faz `blit_framebuffer`). Isto respeita a
+  restrição do §4.3 (mesma thread), mas depende de o contexto OpenGL do `eframe`
+  estar *current* nessa altura do frame — confirmado por leitura do código-fonte do
+  `eframe 0.36.2` (`glow_integration.rs`): `change_gl_context` mantém o mesmo
+  contexto current entre frames enquanto houver **um único viewport** (caso do VAD
+  nesta sprint); com múltiplos viewports, a troca de contexto só acontece mais
+  tarde no pipeline de paint, depois do `ui()` do utilizador já ter corrido. Não é
+  um bug para o âmbito atual (janela única), mas é uma dependência implícita, não
+  garantida pelo contrato do `CallbackFn` — revisitar se alguma sprint futura
+  (ex. PIP na Sprint_15) introduzir uma segunda janela/viewport.
 
 ## Problemas encontrados
 
@@ -92,3 +106,46 @@ Nenhum desvio em relação ao planeado. Todas as 7 tarefas e os critérios de ga
 4. **Assincronismo do comando `loadfile` nos testes unitários:**
    - *Problema:* Chamar `seek` imediatamente após `load_file` falhava com erro `-12` (`MPV_ERROR_NOTHING_TO_PLAY`), porque o demuxer do mpv corre em background e ainda não tinha aberto os fluxos.
    - *Resolução:* Adicionado loop de espera de até 1.5s até `player.duration()` reportar valor positivo antes de executar os comandos de seek.
+
+## Correções de revisão (pós-gate, mesma sprint)
+
+Encontradas ao rever a implementação antes de avançar para a Sprint_02 — nenhuma
+invalida o gate SIM, mas ficam registadas por transparência:
+
+5. **`VadError::RenderCallbackPanic` definido mas nunca construído:** o comentário
+   do código (`player.rs`) já dizia "converter num `VadError`", mas o panic
+   apanhado só virava uma `String` solta num `PlayerEvent::Error`. Corrigido para
+   construir a variante e usar o seu `Display` — comportamento observável igual,
+   tipo de erro agora consistente com o que o comentário sempre afirmou.
+6. **`report_swap()` nunca chamado** (`VideoRenderContext`, código morto) —
+   **tentativa de correção revertida.** `mpv/render.h` é explícito:
+   "calling this at least once informs libmpv that you will use this function.
+   If you use it inconsistently, expect bad video playback." O único sítio
+   disponível para chamar (`prepare_frame`, antes do `needs_render`) não
+   corresponde ao momento real de apresentação (esse é o `blit_framebuffer`
+   dentro do `CallbackFn` + `swap_buffers` do glutin, mais tarde no pipeline), e
+   ficaria por chamar em frames sem conteúdo novo ou durante realocação do FBO —
+   exatamente o padrão inconsistente que o header desaconselha. O gate foi
+   validado **sem** nunca chamar `report_swap()`; método removido em vez de
+   chamado incorretamente. Fica para quando existir um hook real pós-apresentação
+   (ex. dentro do próprio `CallbackFn`, depois do blit).
+7. **Erro de `start_event_loop` silenciado** (`let _ = ...` em `app.rs`) — se a
+   thread de eventos não arrancasse, a UI ficaria com o relógio parado sem
+   qualquer aviso. Trocado por `if let Err(e) = ... { error!(...) }`.
+8. **Comentário SAFETY do `transmute` em `player.rs` estava incompleto:** citava o
+   `Arc<Mpv>` mas não a invariante real — `ctx` tem de estar declarado antes de
+   `_mpv` na struct para que o `Drop` (ordem dos campos) liberte o
+   `mpv_render_context` antes do `Mpv` ser destruído. Reordenar os campos no
+   futuro seria um use-after-free silencioso. Comentário reescrito a nomear isto.
+9. **Teste `test_player_playback_and_hwdec_query` dependia de
+   `/tmp/M0_test_1080p_h264_aac.mp4`** (ficheiro da Sprint_00, deliberadamente
+   volátil) e passava "verde" silenciosamente se o ficheiro não existisse.
+   Corrigido: o teste agora gera o seu próprio fixture pequeno (320×240, 3s) com
+   `ffmpeg` se não existir, ficando hermético; só salta (com aviso explícito) se o
+   `ffmpeg` não estiver disponível no sistema.
+10. **`.cargo/config.toml` sem comentário explicando o `PKG_CONFIG_PATH`
+    hardcoded** — confirmado via `man pkg-config` que a variável é aditiva (os
+    diretórios por omissão continuam a ser pesquisados depois), portanto é
+    inofensiva/no-op noutras distros (Fedora/Arch), não uma substituição
+    (`PKG_CONFIG_LIBDIR` seria essa). Adicionado comentário a explicar a origem
+    Nix do problema e esta garantia.

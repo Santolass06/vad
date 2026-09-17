@@ -1,2 +1,7 @@
+# Works around a Nix profile shadowing the system pkg-config (Sprint_01): its
+# default search path misses the Debian/Ubuntu multiarch dir. PKG_CONFIG_PATH
+# is additive — pkg-config still searches its own default dirs afterwards
+# (PKG_CONFIG_LIBDIR would be the replacing var) — so this is a no-op on
+# distros that don't have this exact path, not a breaking override.
 [env]
 PKG_CONFIG_PATH = { value = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig", relative = false }

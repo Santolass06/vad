@@ -35,11 +35,24 @@ O protótipo mínimo de renderização do VAD foi construído e validado com suc
 2. **Compatibilidade de `glow` com `eframe 0.36`:** Removida dependência externa duplicada de `glow 0.16` e unificada através da reexportação canónica `eframe::glow` (v0.17).
 3. **Assinatura de componentes egui 0.36:** Adaptado o código para a nova arquitetura do egui 0.36 (`eframe::App::ui(&mut self, ui, frame)` e `egui::Panel::top/bottom`).
 4. **Assincronismo de `loadfile` nos testes:** Testes de seek ajustados para aguardar a confirmação de que o demuxer abriu o ficheiro de mídia.
+5. **Revisão pós-gate (mesma sprint):** encontrados e corrigidos 5 problemas menores de qualidade de código — `VadError::RenderCallbackPanic` nunca construído apesar do comentário afirmar o contrário, `report_swap()` morto, erro de arranque da thread de eventos silenciado, comentário SAFETY do `transmute` incompleto (faltava a invariante de ordem dos campos), e um teste que passava "verde" silenciosamente sem o seu ficheiro de fixture. Detalhe completo em `Sprint_01.md` §"Correções de revisão".
 
 ## Dívida técnica / riscos para sprints seguintes
 
-- **Sprint 02 (M1 parte 1):** O HUD atual é mínimo e provisório (apenas para validação do gate); a Sprint 02 substituirá este painel pelo HUD completo flutuante com auto-hide (2s), scrubber com suporte a timestamps, e integrará `probe_dependencies` com a tabela de erros `VadError` (§4.14).
+- **RAM acima do baseline do VLC — a acompanhar, não a ignorar.** O protótipo mediu
+  ~273620 KB (≈267.2 MiB) de RSS em release durante reprodução 1080p; o VLC medido
+  na Sprint_00, nesta mesma máquina, ficou em ~197.7 MiB no mesmo cenário — o VAD
+  está **~70 MiB (~35%) acima**, não abaixo, do que a tese central do §2 do
+  `PLANO_VAD.md` ("RAM menor") promete. As duas medições não são diretamente
+  comparáveis (UI própria do VLC vs. eframe+egui+glow ainda sem otimização, binário
+  ainda sem `mimalloc`/todas as libs finais) e este protótipo não tenta otimizar RAM
+  — só validar a arquitetura de render. Mas o número fica registado como risco
+  explícito para o M6 (`Sprint_Planning_15.md` tarefa 6, comparação final ao
+  baseline do M0): se a lacuna persistir depois do polish, a alegação de "mais
+  leve" do §2 tem de ser revista, não silenciada.
+- **Sprint 02 (M1 parte 1):** O HUD atual é mínimo e provisório (apenas para validação do gate); a Sprint 02 substituirá este painel pelo HUD completo flutuante com auto-hide (2s), scrubber com suporte a timestamps, e integrará `probe_dependencies` com a tabela de erros `VadError` (§4.14). Isto deve incluir substituir os `.expect()` de `VadApp::new` (falha a inicializar o `Player` ou a obter `get_proc_address` aborta o processo) por erros geridos através dessa mesma tabela, em vez de crash — o protótipo do M0.5 aceitou isto deliberadamente para não construir tratamento de erro que a Sprint_02 vai reescrever de raiz.
 - **Driver VA-API:** A ausência dos pacotes de aceleração Intel VA-API (`intel-media-va-driver`) faz com que a máquina corra por omissão em software decode (`SW (CPU)`), o que permitiu validar o fallback do gate mas continuará a usar CPU nos testes até que o utilizador instale os drivers gráficos opcionais no host.
+- **Dependência implícita de viewport único para o render do mpv:** ver `Sprint_01.md` §"Desvios" — o `render_ctx.update()`/`.render()` corre fora do `CallbackFn`, assumindo que o contexto OpenGL do `eframe` continua *current* nessa altura do frame, o que só é garantido enquanto o VAD tiver uma única janela/viewport. Revisitar se alguma feature futura (PIP, Sprint_15) introduzir uma segunda janela.
 
 ## Gate M0.5 — passou?
 

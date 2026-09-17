@@ -84,10 +84,29 @@ mod tests {
 
     #[test]
     fn test_player_playback_and_hwdec_query() {
-        let test_file = "/tmp/M0_test_1080p_h264_aac.mp4";
+        // Self-contained fixture (not the Sprint_00 /tmp file, which is
+        // deliberately volatile and may not exist on this run) — regenerated
+        // with the same ffmpeg synthetic-source approach as Sprint_00, just
+        // smaller/shorter so the test stays fast.
+        let test_file = "/tmp/vad_test_core_playback.mp4";
         if !std::path::Path::new(test_file).exists() {
-            eprintln!("Skipping playback test, file {} does not exist", test_file);
-            return;
+            let generated = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=3",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "30",
+                    "-c:a", "aac", "-shortest", test_file,
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !generated {
+                eprintln!(
+                    "Skipping playback test: ffmpeg unavailable or failed to generate fixture at {}",
+                    test_file
+                );
+                return;
+            }
         }
 
         let player = Player::new().expect("Failed to create player");

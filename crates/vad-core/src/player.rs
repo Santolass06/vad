@@ -37,8 +37,13 @@ impl VideoRenderContext {
             }),
         ])?;
 
-        // SAFETY: The static lifetime is erased safely because `_mpv` keeps the Mpv instance
-        // alive for the entire lifetime of `VideoRenderContext`.
+        // SAFETY: `RenderContext<'a>`'s lifetime is only a borrow-check marker
+        // (`PhantomData<&'a Mpv>`); the raw pointer it wraps has no lifetime
+        // dependency of its own. Erasing it to 'static is sound only because
+        // `ctx` is declared BEFORE `_mpv` below — Rust drops fields in
+        // declaration order, so `ctx` (and mpv_render_context_free) always
+        // runs before `_mpv`'s Arc<Mpv> can be dropped. Reordering these two
+        // fields would silently turn this into a use-after-free.
         let ctx: RenderContext<'static> = unsafe { std::mem::transmute(render_ctx) };
         Ok(Self { ctx, _mpv: mpv })
     }
@@ -63,9 +68,10 @@ impl VideoRenderContext {
                 } else {
                     "unknown panic in mpv render update callback".to_string()
                 };
-                error!("Caught panic in mpv render update callback: {}", msg);
+                let err = VadError::RenderCallbackPanic(msg);
+                error!("Caught panic in mpv render update callback: {}", err);
                 if let Some(ref tx) = err_tx {
-                    let _ = tx.send(PlayerEvent::Error(format!("Callback panic: {msg}")));
+                    let _ = tx.send(PlayerEvent::Error(err.to_string()));
                 }
             }
         });
@@ -84,10 +90,6 @@ impl VideoRenderContext {
             .map_err(VadError::Mpv)
     }
 
-    /// Reports swap buffers to mpv for frame timing accuracy.
-    pub fn report_swap(&self) {
-        self.ctx.report_swap();
-    }
 }
 
 /// Core player controlling playback and observing mpv events.
