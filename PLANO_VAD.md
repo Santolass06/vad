@@ -194,7 +194,9 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     ~700 MB retidos, mais do que o LLM do M5. **Mitigação:** guardar a cache em
     `i16` em vez de `f32` (metade do custo; o Whisper converte para f32 ao ingerir, e
     o waveform min/max não precisa de mais precisão). Este custo entra no ledger de
-    RAM do §5, não é ignorado.
+    RAM do §5, não é ignorado. **Limite:** cap de duração em cache (ex. 4h); acima
+    disso, truncar com aviso em vez de crescer sem limite — evita o caso patológico
+    de uma gravação de 8h+ inflacionar a RAM sem controlo.
 
 13. **Modo de armazenamento dos modelos Whisper: escolha do utilizador, não
     imposição.** RAM-only é a opção certa para um caso específico (uso pontual,
@@ -225,6 +227,44 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     caminhos alimentam `whisper.rs` da mesma forma (a diferença fica isolada nesta
     camada, não se propaga ao resto da app).
 
+14. **Taxonomia de erros e degradação, num sítio só.** Em vez de tratamento disperso
+    por módulo, um único `VadError` (via `thiserror`) em `vad-core/error.rs`, com uma
+    tabela erro→ação→UI curta (ex.: `FfmpegNotFound` → desativar waveform/Whisper +
+    mostrar o comando de instalação; `HwDecUnavailable` → já coberto por §4.3;
+    `ModelDownloadFailed` → manter modelo local se existir, senão desativar a
+    feature). **Nunca invocar `sudo` a partir da app** para instalar dependências —
+    isso é escalar privilégios silenciosamente; mostrar o comando (`sudo apt install
+    ffmpeg`) para o utilizador copiar e correr, nunca executá-lo por ele.
+
+15. **Transcrição é offline (batch), não ao vivo — explícito para não haver
+    ambiguidade.** O utilizador abre o ficheiro, pede transcrição, o `extractor.rs`
+    corre e o Whisper processa o áudio já extraído. Transcrição em tempo real
+    (enquanto o vídeo reproduz) fica fora do v1 — exigiria buffer circular e
+    sincronização com o `time-pos` do mpv, sem benefício claro para o caso de uso
+    (reuniões já gravadas, não streams ao vivo).
+
+16. **Descarregamento automático de modelos inativos — só onde faz diferença.** Um
+    temporizador de inatividade (ex. 5 min sem uso) liberta o Whisper/LLM da RAM.
+    **Isto só importa para o caminho RAM-only e para o LLM** — um modelo carregado
+    por `mmap` (modo disco, §4.13) já é gerido pelo kernel via page cache; construir
+    um unload ativo para esse caminho não ganha nada e compete com o próprio SO.
+
+17. **Extração de PCM: assíncrona, com progresso e cancelamento — falta no plano
+    atual.** Correr o `ffmpeg` do `extractor.rs` numa tarefa em background (não
+    bloquear a UI), reportar progresso (ex. "Extraindo áudio... 65%") e permitir
+    cancelar se o utilizador fechar o ficheiro antes de terminar (mata o
+    subprocesso, não o deixa órfão). Sem isto, abrir uma reunião de 1h congela a UI
+    por 10-30s.
+
+18. **Cache de PCM permanente em disco: decidido que NÃO entra em v1.** A cache em
+    memória por sessão (§4.12) já serve waveform e Whisper; persistir PCM
+    descodificado em `~/.cache/vad/pcm/` sobreviveria ao fecho da app — para
+    gravações de reuniões, isso significa **áudio potencialmente confidencial
+    retido indefinidamente e sem encriptação**, o oposto do motivo de o Whisper ter
+    modo RAM-only. Aqui o "zero-disk" é estrutural, não incidental. Se algum dia
+    for adicionado (para acelerar reabrir o mesmo ficheiro), tem de ser opt-in e
+    comunicado, nunca automático.
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -253,9 +293,18 @@ esforço real de performance do projeto:
   modelo `base` cai de 142 MB para ~55 MB de RAM. É a maior alavanca de RAM do
   playback/transcrição — usar por omissão no caminho RAM-only do `whisper.rs`
   (o caminho disco, predefinido, usa ainda menos RAM residente via `mmap`, ver §4.13).
-- **Waveform pyramid**: 3 níveis de resolução pré-computados em background (visão
-  global, 5 min, 10s); a UI renderiza no máximo ~1000 pontos visíveis, independente da
-  duração do ficheiro.
+- **Waveform pyramid**: só o nível global (visão da reunião inteira) é pré-computado
+  ao abrir o ficheiro; os níveis de 5 min e 10s calculam-se **sob demanda** quando o
+  utilizador faz zoom, não antecipadamente — evita atraso na abertura de ficheiros
+  longos. Armazenamento é min/max por pixel (~KB), não o PCM bruto, por isso o custo
+  aqui é de tempo de cálculo, não de RAM. UI renderiza no máximo ~1000 pontos visíveis,
+  independente da duração do ficheiro.
+- **Logging estruturado** via `tracing`, com `--verbose`/`--log-file` no CLI
+  (`~/.cache/vad/vad.log`) — sem isto, um bug reportado por um utilizador é
+  inreproduzível.
+- **Configuração unificada** em `~/.config/vad/config.toml` (serde+toml): consolida o
+  que já precisa de persistir — `recents.rs` (§7), escolha disco/RAM-only por modelo
+  (§4.13), atalhos de teclado. Um único ficheiro, não vários formatos ad-hoc.
 
 **Ledger de RAM (não esconder o custo do M5):** Whisper `base-q5` (~55 MB) + LLM local
 de resumo/tradução (~350-700 MB, ver §4.2) somam-se quando ambos estão carregados. O
@@ -340,15 +389,17 @@ vad/
 │   ├── vad-core/                 # motor: embutir libmpv, estado, playlist — SEM deps de UI
 │   │   ├── src/
 │   │   │   ├── player.rs         # wrapper sobre libmpv2 (mpv_render_context/OpenGL; hwdec=auto-safe c/ leitura de hwdec-current; play/pause/seek/tracks/filtros/delay/aspect/crop/rotate)
-│   │   │   ├── state.rs          # eventos do mpv (thread interna em C) -> crossbeam-channel/watch para a UI
+│   │   │   ├── state.rs          # eventos do mpv (thread interna em C) -> crossbeam-channel/watch para a UI; reconciliação periódica (poll a cada ~5s) como rede de segurança contra eventos perdidos
 │   │   │   ├── playlist.rs       # shuffle/repeat, URLs (yt-dlp) além de ficheiros locais
 │   │   │   ├── recents.rs        # últimos ~20 ficheiros + timestamp p/ "continuar de onde parou" (ver §4.6)
-│   │   │   └── bookmarks.rs      # notas de reunião exportáveis (.md, timestamps em texto simples)
+│   │   │   ├── bookmarks.rs      # notas de reunião exportáveis (.md, timestamps em texto simples)
+│   │   │   ├── error.rs          # VadError (thiserror) + tabela erro->ação->UI (ver §4.14)
+│   │   │   └── config.rs         # ~/.config/vad/config.toml, serde+toml (ver §5)
 │   │   └── Cargo.toml
 │   │
 │   ├── vad-ai/                   # transcrição, VAD, resumo, tradução — SEM deps de UI
 │   │   ├── src/
-│   │   │   ├── extractor.rs      # subprocesso ffmpeg -> PCM 16kHz mono i16, cache por ficheiro (waveform + Whisper, ver §4.12)
+│   │   │   ├── extractor.rs      # subprocesso ffmpeg -> PCM 16kHz mono i16, assíncrono c/ progresso e cancelamento (ver §4.17), cache por ficheiro com cap de duração (ver §4.12), SEM persistência em disco (ver §4.18)
 │   │   │   ├── model_manager.rs  # escolha do utilizador: disco (~/.local/share/vad/models/) ou RAM-only (ver §4.13)
 │   │   │   ├── whisper.rs        # transcriber (whisper.cpp bindings); caminho RAM-only em Arc<[u8]> pinado, nunca Vec<u8> (ver §4.11); caminho disco carrega por path
 │   │   │   ├── vad_detector.rs   # deteção de silêncio antes do Whisper
@@ -406,8 +457,10 @@ ffmpeg -ss {inicio} -to {fim} -i {input} -c copy -avoid_negative_ts 1 {output}
 
 **Tradeoff a mostrar na UI, não descobrir em M4:** com `-ss` antes de `-i` e `-c copy`,
 o corte encaixa no keyframe mais próximo — os limites do clip não são exatos ao frame.
-Para corte exato seria preciso recodificar (perde a vantagem de velocidade/qualidade
-deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
+**Resolução:** checkbox "Corte exato (recodificar)" no painel de exportação — desligado
+por omissão (rápido, `-c copy`, keyframe); ligado usa `-c:v libx264 -crf 18 -c:a aac`
+(mais lento, preciso ao frame, ficheiro pode crescer). O utilizador escolhe
+conscientemente, em vez de o v1 impor silenciosamente o corte por keyframe.
 
 ---
 
@@ -416,12 +469,13 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
 | Fase | Entregável | Critério de aceitação |
 | :--- | :--- | :--- |
 | **M0** | Medir baseline real do VLC nesta máquina (RSS, arranque, CPU em pausa) | Números registados, substituem os "a medir" da tabela |
-| **M1** | `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL (obrigatório em Wayland) com `hwdec=auto-safe`, HUD básico, MPRIS + inibidor de screensaver (mesma base `zbus`, ver §4.7), CLI (clap) + drag-and-drop, `probe_dependencies` (ffmpeg/yt-dlp), guarda de foco de teclado (`wants_keyboard_input`); decisão de janela nova por execução (sem instância única) | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker; HUD mostra o `hwdec-current` real, incluindo fallback `SW (CPU)`; teclas de media do sistema funcionam; ecrã não suspende durante playback; app arranca e degrada graciosamente (botões desativados) sem `ffmpeg`/`yt-dlp` instalados; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
-| **M2** | Playlist (+ shuffle/repeat), faixas de áudio/legendas, hwdec visível no HUD, `video_panel.rs` (delay A/V, aspect/crop/rotação), reprodução por URL (yt-dlp — confirmar isolamento de `config-dir`, ver §3), resume playback (`recents.rs`) | Troca de faixa sem reiniciar; indicador de aceleração correto; URL do YouTube reproduz sem herdar `~/.config/mpv` do utilizador; reabrir a app oferece continuar o último ficheiro |
-| **M3** | Whisper (via `extractor.rs`/ffmpeg desacoplado) + `model_manager.rs` com escolha disco/RAM-only e tooltips (ver §4.13) + VAD skip-silence + bookmarks exportáveis em .md (timestamps em texto simples) | Transcrição de um ficheiro de reunião real sem interromper outra reprodução; utilizador escolhe e vê o tradeoff antes de descarregar um modelo; notas exportadas |
-| **M4** | Corte/exportação de clips (via ffmpeg CLI, ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido (corte por keyframe aceite) |
-| **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 20 segmentos reais traduzidos pelo LLM revistos manualmente sem alucinação/enchimento antes de expor a feature |
-| **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
+| **⭐ M0.5** | Protótipo mínimo: só `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL com `hwdec=auto-safe`, sem HUD nem features. **Gate — não avançar para M1 sem isto validado.** | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker (testar com Intel e, se possível, NVIDIA); HUD mínimo mostra `hwdec-current` real, incluindo fallback `SW (CPU)` quando forçado |
+| **M1** | HUD completo, MPRIS + inibidor de screensaver (mesma base `zbus`, ver §4.7), CLI (clap) + drag-and-drop, `probe_dependencies` (ffmpeg/yt-dlp, ver §4.14 — nunca sudo automático), guarda de foco de teclado (`wants_keyboard_input`), `VadError`/`error.rs` (§4.14); decisão de janela nova por execução (sem instância única) | Teclas de media do sistema funcionam; ecrã não suspende durante playback; app arranca e degrada graciosamente (botões desativados, comando de instalação mostrado) sem `ffmpeg`/`yt-dlp`; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
+| **M2** | Playlist (+ shuffle/repeat), faixas de áudio/legendas, hwdec visível no HUD, `video_panel.rs` (delay A/V, aspect/crop/rotação), reprodução por URL (yt-dlp — confirmar isolamento de `config-dir`, ver §3), resume playback (`recents.rs`), `config.rs` unificado (§5) | Troca de faixa sem reiniciar; indicador de aceleração correto; URL do YouTube reproduz sem herdar `~/.config/mpv` do utilizador; reabrir a app oferece continuar o último ficheiro |
+| **M3** | Whisper offline (§4.15, via `extractor.rs` assíncrono com progresso/cancelamento, §4.17) + `model_manager.rs` com escolha disco/RAM-only e tooltips (§4.13) + unload por inatividade (§4.16) + VAD skip-silence + bookmarks exportáveis em .md | Transcrição de um ficheiro de reunião real sem congelar a UI durante a extração nem interromper outra reprodução; utilizador escolhe e vê o tradeoff antes de descarregar um modelo; notas exportadas |
+| **M4** | Corte/exportação de clips (via ffmpeg CLI + checkbox "corte exato", ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido; ambos os modos de corte (keyframe e exato) funcionam |
+| **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 100 segmentos reais (PT→EN/ES/FR) revistos manualmente sem alucinação/enchimento; se falhar, fallback é EN-only via Whisper ou um modelo de tradução dedicado local (§4.1) — **nunca API cloud**, contradiria a decisão de LLM local já tomada |
+| **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak com ffmpeg/yt-dlp incluídos no manifesto, removendo a dependência de runtime do sistema na versão empacotada) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
 | **Pós-M6** | Esquema de URI `vad://` + instância única (§4.4/4.5); legendas automáticas via OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
 
 ---
@@ -439,6 +493,11 @@ deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
 4. Validação modo disco: carregar modelo via `model_manager.rs` com "Guardar no disco",
    confirmar ficheiro criado em `~/.local/share/vad/models/` e reutilizado (sem novo
    download) na ativação seguinte.
+5. Teste de concorrência no `player.rs`: disparar comandos (play/pause/seek) a partir
+   do handler MPRIS e da UI ao mesmo tempo, em loop; validar que não há deadlock nem
+   pânico no `Mutex` do contexto mpv. Sem alvo numérico — o critério é "não trava,
+   não crasha", não um tempo específico (targets de performance vêm sempre do
+   baseline medido em M0, nunca de números assumidos).
 
 ### Verificação manual
 1. Comparar RSS e CPU em pausa contra o baseline medido em M0.
