@@ -1,0 +1,7 @@
+[package]
+name = "vad-ai"
+version = "0.1.0"
+edition = "2021"
+description = "VAD AI crate (Whisper, VAD, Summarization, Translation) - stub for M3/M5"
+
+[dependencies]

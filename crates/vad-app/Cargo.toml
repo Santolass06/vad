@@ -1,0 +1,13 @@
+[package]
+name = "vad-app"
+version = "0.1.0"
+edition = "2021"
+description = "VAD video player desktop application with egui and OpenGL"
+
+[dependencies]
+vad-core = { path = "../vad-core" }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui_glow = "0.36.2"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

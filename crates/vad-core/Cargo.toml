@@ -1,0 +1,13 @@
+[package]
+name = "vad-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core playback and state management engine for VAD using libmpv"
+
+[dependencies]
+libmpv2 = "6.0.0"
+crossbeam-channel = "0.5"
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
