@@ -580,3 +580,49 @@ conscientemente, em vez de o v1 impor silenciosamente o corte por keyframe.
 4. Testar teclas de media do teclado/sistema (MPRIS) com a app em segundo plano.
 5. No painel de modelos, confirmar que os tooltips de "Guardar no disco" e "RAM-only"
    aparecem ao passar o rato e que a escolha é respeitada (ficheiro criado vs nenhum).
+
+---
+
+## 11. Divisão em Sprints
+
+Isto **não** introduz novo âmbito — é o §9 (Fases e Milestones) reordenado em unidades
+de trabalho mais pequenas, respeitando as mesmas dependências. Cada sprint fecha com um
+critério verificável; onde o critério é o do milestone completo (§9), a tabela remete
+para lá em vez de o repetir. Dois milestones (M1, M2, M3, M5b) foram divididos em mais
+do que uma sprint por serem grandes demais para uma unidade só — os pontos de corte
+seguem sub-blocos de trabalho já distintos no §7 (ficheiros diferentes) ou no §4 (temas
+diferentes), nunca um corte arbitrário a meio de uma peça.
+
+**Duração de cada sprint não é fixada aqui.** Sem velocidade medida nem horas/semana
+definidas pelo utilizador, pôr um número (ex. "2 semanas") e somar um total de meses
+seria o mesmo tipo de número inventado já rejeitado no resto do plano (§2, "a medir").
+Cada linha é uma unidade de âmbito com critério de saída — a cadência é para o
+utilizador decidir e medir à medida que a primeira sprint acontece.
+
+| Sprint | Milestone | Foco (ficheiros/temas) | Critério de saída específico desta sprint |
+| :--- | :--- | :--- | :--- |
+| **0** | M0 | Medir baseline real do VLC. **Nota:** o VLC instalado é o snap e já falhou o driver gráfico (§1) — trocar para o pacote `.deb`/apt antes de medir, ou a medição fica contaminada pelo mesmo bug. | Critério do §9 (M0) |
+| **1** | M0.5 (gate) | `player.rs` mínimo: `mpv_render_context`/OpenGL, `hwdec=auto-safe`. | Critério do §9 (M0.5) — gate, não passar à sprint 2 sem isto validado |
+| **2** | M1 (parte 1) | `hud.rs` (transporte/scrubber/velocidade/volume/faixas), `main.rs` (clap, `probe_dependencies`), drag-and-drop, `error.rs`/`VadError` (§4.14) | `probe_dependencies` sem `ffmpeg`/`yt-dlp` degrada via a tabela erro→ação→UI do `error.rs` — os dois ficheiros têm de existir juntos, o critério do §9 de "degrada graciosamente" depende do `error.rs`, não só do probe |
+| **3** | M1 (parte 2) | `mpris.rs` (zbus), `screensaver.rs` (zbus, §4.7), guarda de foco de teclado (`wants_keyboard_input`) | Critério do §9 (M1) — fecha o milestone |
+| **4** | M2 (parte 1) | `playlist.rs` (shuffle/repeat, ficheiros+URLs), seletor de faixas áudio/legendas, `video_panel.rs` (aspect/crop/rotação/delay A-V), `audio_panel.rs`/equalizador (10 bandas + presets, EQ vem de graça do lavfi por §3, só falta a UI) | Troca de faixa sem reiniciar; EQ aplica-se à reprodução em tempo real |
+| **5** | M2 (parte 2) | Reprodução por URL (yt-dlp, isolamento `config-dir` + `--no-config`, §3), `recents.rs` (resume), `config.rs` unificado (§5) | Critério do §9 (M2) — fecha o milestone |
+| **6** | M3 (parte 1) | `extractor.rs` assíncrono (progresso/cancelamento, §4.17), `waveform_pyramid.rs` (§5 — pertence aqui, não a M4: partilha a cache de PCM do `extractor.rs` por §4.12, e o mockup de reunião do §6 já assume a waveform pronta), `model_manager.rs` + `whisper.rs` (`Arc<[u8]>` pinado, §4.11) | Transcrição de um ficheiro real sem congelar a UI; waveform da reunião inteira visível ao abrir o ficheiro |
+| **7** | M3 (parte 2) | `vad_detector.rs` (skip-silence), unload por inatividade (§4.16), `bookmarks.rs` exportável em `.md` | Critério do §9 (M3) — fecha o milestone |
+| **8** | M4 | `clip_export.rs` (ffmpeg CLI, corte por keyframe + checkbox "corte exato", §8), toggle `af=arnndn` | Critério do §9 (M4) — a waveform já existe desde a sprint 6, por isso a seleção de troço não é trabalho novo aqui |
+| **9** | M5a (parte 1) | `llm_provider.rs` (`LocalQwen`), `summarizer.rs` (chunking/map-reduce, §4.19), `translator.rs`, progresso por bloco (§4.20) | Resumo de transcrição de 90 min sem exceder janela de contexto |
+| **10** | M5a (parte 2 — gate) | Correr e rever manualmente 100 segmentos reais (PT→EN/ES/FR) | Critério de aceitação do §9 (M5a) — gate, não avançar para M5b sem isto passar |
+| **11** | M5b (parte 1) | Cliente `OpenAiCompatible` (cobre OpenAI oficial e custom/self-hosted), keyring + fallback env vars (§4.2), scaffold do `settings_panel.rs` | Cliente funcional com um provider real testado manualmente |
+| **12** | M5b (parte 2) | Clientes `Anthropic`/`Gemini`, botão "Testar ligação" (§4.23) para os 3 backends | `base_url`/chave inválidos detetados no teste de ligação, nunca só ao usar |
+| **13** | M5b (parte 3) | Fallback offline com badge 🔒/☁️ (§4.21), retry/backoff 429/5xx, `VadError` estendido (`LlmTimeout`/`LlmRateLimited`/`NoNetwork`, §4.22) | Badge visível antes de cada operação cloud; fallback nunca silencioso |
+| **14** | M5b (parte 4) | Testes com HTTP mockado (§10.6), teste anti-leak (§10.7) | Critério do §9 (M5b) — fecha o milestone |
+| **15** | M6 | Tema/animações, `tray.rs` (ksni, best-effort, §4.8), PIP/always-on-top (§4.9), perfil de release (§5), Flatpak com `ffmpeg`/`yt-dlp` embutidos | Critério do §9 (M6) |
+| **16** (opcional) | Pós-M6 | Esquema de URI `vad://` + instância única (§4.4/4.5), OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
+
+**Nota sobre M5b ocupar 4 sprints contra as 6 de M1–M3 juntos:** o §4.2 descreve M5b
+como "comparável em dimensão" a M1–M3 juntos. Contagem de sprints não é a mesma coisa
+que dimensão de esforço — M5b tem mais peças em paralelo (4 backends, keyring, UI de
+definições, resiliência, testes) mas cada uma é mais rasa que uma integração como o
+`mpv_render_context` (sprint 1) ou o `whisper.rs` (sprint 6). Se a sprint 9 ou a 12
+"transbordarem" na prática, é sinal de que a comparação do §4.2 estava certa e a
+divisão aqui deve ser ajustada — não o contrário.
