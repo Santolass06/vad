@@ -20,8 +20,24 @@ fn resolve_gl_proc(gpa: &GlProcAddressFn, name: &str) -> *mut c_void {
     gpa(name)
 }
 
+/// Information about an audio or subtitle track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackInfo {
+    pub id: i64,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub is_selected: bool,
+}
+
+/// Status of A-B repeat loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AbLoopStatus {
+    Off,
+    AOnly(f64),
+    Looping { a: f64, b: f64 },
+}
+
 /// Thin safe wrapper around `mpv_render_context`.
-/// The OpenGL context MUST be current on the thread that calls `render` and `update` (§4.3).
 pub struct VideoRenderContext {
     ctx: RenderContext<'static>,
     _mpv: Arc<Mpv>,
@@ -239,6 +255,102 @@ impl Player {
     /// Gets total media duration in seconds.
     pub fn duration(&self) -> Result<Option<f64>, VadError> {
         self.get_property_optional::<f64>("duration")
+    }
+
+    /// Gets current playback speed factor (1.0 = normal).
+    pub fn speed(&self) -> Result<f64, VadError> {
+        Ok(self.get_property_optional::<f64>("speed")?.unwrap_or(1.0))
+    }
+
+    /// Sets playback speed factor (e.g. 0.5 to 2.0).
+    pub fn set_speed(&self, speed: f64) -> Result<(), VadError> {
+        let clamped = speed.clamp(0.1, 8.0);
+        self.mpv.set_property("speed", clamped).map_err(VadError::Mpv)
+    }
+
+    /// Takes a video frame screenshot using mpv's native screenshot engine.
+    pub fn take_screenshot(&self) -> Result<(), VadError> {
+        info!("Capturing video frame screenshot");
+        self.mpv
+            .command("screenshot", &["video"])
+            .map_err(VadError::Mpv)?;
+        Ok(())
+    }
+
+    /// Queries the current A-B loop status.
+    pub fn ab_loop_status(&self) -> Result<AbLoopStatus, VadError> {
+        let a_str = self.get_property_optional::<String>("ab-loop-a")?;
+        let b_str = self.get_property_optional::<String>("ab-loop-b")?;
+
+        let a_val = a_str.and_then(|s| if s == "no" { None } else { s.parse::<f64>().ok() });
+        let b_val = b_str.and_then(|s| if s == "no" { None } else { s.parse::<f64>().ok() });
+
+        match (a_val, b_val) {
+            (Some(a), Some(b)) => Ok(AbLoopStatus::Looping { a, b }),
+            (Some(a), None) => Ok(AbLoopStatus::AOnly(a)),
+            _ => Ok(AbLoopStatus::Off),
+        }
+    }
+
+    /// Cycles A-B loop state: Off -> Point A set -> Point B set (looping) -> Off.
+    pub fn cycle_ab_loop(&self) -> Result<AbLoopStatus, VadError> {
+        self.mpv.command("ab-loop", &[]).map_err(VadError::Mpv)?;
+        self.ab_loop_status()
+    }
+
+    /// Returns list of available audio tracks.
+    pub fn audio_tracks(&self) -> Result<Vec<TrackInfo>, VadError> {
+        self.query_tracks_by_type("audio")
+    }
+
+    /// Returns list of available subtitle tracks.
+    pub fn subtitle_tracks(&self) -> Result<Vec<TrackInfo>, VadError> {
+        self.query_tracks_by_type("sub")
+    }
+
+    /// Selects an audio track by ID, or disables audio if `None`.
+    pub fn set_audio_track(&self, id: Option<i64>) -> Result<(), VadError> {
+        let val = match id {
+            Some(track_id) => format!("{track_id}"),
+            None => "no".to_string(),
+        };
+        self.mpv.set_property("aid", val.as_str()).map_err(VadError::Mpv)
+    }
+
+    /// Selects a subtitle track by ID, or disables subtitles if `None`.
+    pub fn set_subtitle_track(&self, id: Option<i64>) -> Result<(), VadError> {
+        let val = match id {
+            Some(track_id) => format!("{track_id}"),
+            None => "no".to_string(),
+        };
+        self.mpv.set_property("sid", val.as_str()).map_err(VadError::Mpv)
+    }
+
+    fn query_tracks_by_type(&self, track_type: &str) -> Result<Vec<TrackInfo>, VadError> {
+        let count = self.get_property_optional::<i64>("track-list/count")?.unwrap_or(0);
+        let mut tracks = Vec::new();
+
+        for i in 0..count {
+            let t_type: Option<String> = self.get_property_optional(&format!("track-list/{i}/type"))?;
+            if t_type.as_deref() == Some(track_type) {
+                let id = self
+                    .get_property_optional::<i64>(&format!("track-list/{i}/id"))?
+                    .unwrap_or(i + 1);
+                let title = self.get_property_optional::<String>(&format!("track-list/{i}/title"))?;
+                let lang = self.get_property_optional::<String>(&format!("track-list/{i}/lang"))?;
+                let is_selected = self
+                    .get_property_optional::<bool>(&format!("track-list/{i}/selected"))?
+                    .unwrap_or(false);
+
+                tracks.push(TrackInfo {
+                    id,
+                    title,
+                    lang,
+                    is_selected,
+                });
+            }
+        }
+        Ok(tracks)
     }
 
     /// Spawns a background thread listening for mpv events and updating `SharedPlayerState`.

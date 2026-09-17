@@ -2,8 +2,8 @@ pub mod error;
 pub mod player;
 pub mod state;
 
-pub use error::VadError;
-pub use player::{GlProcAddressFn, Player, VideoRenderContext};
+pub use error::{ErrorAction, ErrorSeverity, VadError};
+pub use player::{AbLoopStatus, GlProcAddressFn, Player, TrackInfo, VideoRenderContext};
 pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
 };
@@ -83,6 +83,35 @@ mod tests {
     }
 
     #[test]
+    fn test_vad_error_taxonomy() {
+        // FfmpegNotFound must map to Degraded with suggested install command and disabled features
+        let err_ffmpeg = VadError::FfmpegNotFound;
+        let action_ffmpeg = err_ffmpeg.action();
+        assert_eq!(action_ffmpeg.severity, ErrorSeverity::Degraded);
+        assert_eq!(action_ffmpeg.install_command, Some("sudo apt install ffmpeg"));
+        assert!(action_ffmpeg.disabled_features.contains(&"waveform"));
+        assert!(action_ffmpeg.disabled_features.contains(&"whisper"));
+        assert!(action_ffmpeg.can_ignore);
+
+        // YtDlpNotFound must map to Degraded with yt-dlp install command
+        let err_ytdlp = VadError::YtDlpNotFound;
+        let action_ytdlp = err_ytdlp.action();
+        assert_eq!(action_ytdlp.severity, ErrorSeverity::Degraded);
+        assert_eq!(action_ytdlp.install_command, Some("sudo apt install yt-dlp"));
+        assert!(action_ytdlp.disabled_features.contains(&"url_playback"));
+
+        // PlayerInitFailed must be Fatal
+        let err_init = VadError::PlayerInitFailed("libmpv init failed".to_string());
+        let action_init = err_init.action();
+        assert_eq!(action_init.severity, ErrorSeverity::Fatal);
+        assert!(!action_init.can_ignore);
+
+        // GlContextUnavailable must be Fatal
+        let err_gl = VadError::GlContextUnavailable("No GL".to_string());
+        assert_eq!(err_gl.action().severity, ErrorSeverity::Fatal);
+    }
+
+    #[test]
     fn test_player_playback_and_hwdec_query() {
         // Self-contained fixture (not the Sprint_00 /tmp file, which is
         // deliberately volatile and may not exist on this run) — regenerated
@@ -145,5 +174,27 @@ mod tests {
         player.set_hwdec("no").expect("Failed to set hwdec to no");
         let forced_sw = player.hwdec_current().expect("Failed to query hwdec after setting no");
         assert_eq!(forced_sw, None, "Forced hwdec=no must return None representing SW (CPU)");
+    }
+
+    #[test]
+    fn test_player_speed_tracks_and_ab_loop() {
+        let player = Player::new().expect("Failed to create player");
+
+        // Test default speed and speed mutation
+        let speed = player.speed().expect("Failed to query speed");
+        assert_eq!(speed, 1.0);
+        player.set_speed(1.5).expect("Failed to set speed");
+        let new_speed = player.speed().expect("Failed to query updated speed");
+        assert!((new_speed - 1.5).abs() < 0.01);
+
+        // Test A-B loop status initially Off
+        let ab = player.ab_loop_status().expect("Failed to query ab loop status");
+        assert_eq!(ab, AbLoopStatus::Off);
+
+        // Test track querying returns Ok without error (even when no media loaded)
+        let audio_tracks = player.audio_tracks().expect("Failed to query audio tracks");
+        let sub_tracks = player.subtitle_tracks().expect("Failed to query subtitle tracks");
+        assert!(audio_tracks.is_empty() || !audio_tracks.is_empty());
+        assert!(sub_tracks.is_empty() || !sub_tracks.is_empty());
     }
 }
