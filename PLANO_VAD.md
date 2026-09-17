@@ -81,25 +81,60 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
 | MPRIS/D-Bus (teclas de media) | **Não.** MPRIS no mpv standalone é um script Lua externo (`mpv-mpris`), não faz parte da libmpv | **100% trabalho novo** — implementar com `zbus`, expectativa básica no Linux, adicionado a M1 |
 | Playlists M3U/PLS/XSPF | Parcial | Parser próprio se quisermos formatos fora do que o mpv já lê |
 | Redução de ruído (voz) | Sim (`af=arnndn`, RNNoise compilado no `libavfilter` desta distro) | Toggle na UI de áudio |
+| Extração de PCM para o Whisper (16kHz mono) | Não — libmpv não expõe isto de forma simples a partir da reprodução ao vivo | Subprocesso `ffmpeg` separado (ver §4.3), desacoplado da reprodução |
 
 ---
 
 ## 4. Constrangimentos descobertos (decisões em aberto, não assumidos em silêncio)
 
 1. **Tradução de legendas em tempo real.** O modo `translate` do Whisper só traduz
-   **para inglês** — não existe tradução PT→outro idioma nativa no Whisper. Duas opções:
+   **para inglês** — não existe tradução PT→outro idioma nativa no Whisper.
    - **v1:** tradução apenas para inglês (uma chamada Whisper, offline, sem modelo extra).
-   - **Stretch goal:** adicionar um modelo de tradução local separado (ex. NLLB pequeno)
-     para PT↔qualquer idioma. Mais RAM, mais complexidade, mais tempo de dev.
-
-   *Por decidir: aceitas EN-only no v1, ou a tradução multi-idioma é suficientemente
-   importante para justificar um segundo modelo já no v1?*
+   - **M5 (revisto):** em vez de um segundo modelo dedicado (NLLB), reutilizar o mesmo
+     LLM local do resumo (ver ponto 2) para traduzir PT↔qualquer idioma via prompt —
+     poupa uma dependência de inferência inteira. **Condição de aceitação antes de
+     adotar isto:** correr 20 segmentos reais do Whisper pelo LLM candidato e validar
+     manualmente que não há alucinação nem enchimento de texto — modelos pequenos
+     (0.5B–1B) são conhecidos por falhar exatamente em fragmentos curtos e sem
+     contexto, que é a forma de uma legenda. Se falhar no teste, volta-se à opção de
+     um modelo de tradução dedicado.
 
 2. **Resumo automático (LLM).** Consistente com a filosofia de privacidade já presente
-   no plano (Whisper RAM-only), a recomendação é um **modelo local pequeno** (via
-   `candle` ou `llama.cpp`/GGUF) em vez de API cloud. Isto é uma recomendação, não uma
+   no plano (Whisper RAM-only), a recomendação é um **modelo local pequeno em GGUF**
+   (`Qwen2.5-0.5B-Instruct-Q4_K_M` ~350 MB, ou `Llama-3.2-1B-Instruct-Q4_K_M` ~700 MB,
+   via `llama-cpp-rs` ou `candle`) em vez de API cloud. Isto é uma recomendação, não uma
    decisão tua — API cloud é mais simples de implementar e dá melhores resumos, mas
-   contradiz a filosofia "zero-disco/privacidade" do resto do documento.
+   contradiz a filosofia "zero-disco/privacidade" do resto do documento. **Nota de
+   RAM:** este modelo soma-se aos ~55 MB do Whisper quantizado (ver §5) — o footprint
+   total do M5 fica bem acima do resto da app; isto é um custo aceite pela feature, não
+   um erro na tabela de otimizações.
+
+3. **Mecanismo de renderização de vídeo.** Incorporar o vídeo por `wid` (janela nativa
+   X11) **não funciona em Wayland** — não é uma questão de estabilidade, é uma
+   limitação do libmpv nesse protocolo. **Decisão:** usar a `mpv_render_context` API
+   do libmpv com backend OpenGL, integrada num `egui_glow::CallbackFn` — o mpv
+   renderiza para uma textura/FBO e o egui desenha o HUD por cima na mesma passagem.
+   Isto funciona em X11 e Wayland sem código diferente por plataforma. **Restrição a
+   respeitar em `player.rs`:** o contexto OpenGL tem de estar current na thread que
+   chama a render API — a renderização do vídeo fica presa à thread de UI (dentro do
+   callback de pintura do eframe), só os *eventos* do mpv (ponto 8 da arquitetura, via
+   canal) correm numa thread separada. As duas coisas não são a mesma decisão.
+
+4. **Notas de reunião com timestamps clicáveis.** A versão barata — exportar
+   `[00:04:12]` como texto simples no `.md` — entra em M3 sem custo extra. A versão
+   com esquema de URI clicável (`vad://seek?t=252`) para abrir a partir do
+   Obsidian/Logseq exige duas peças adicionais: um `.desktop` com
+   `x-scheme-handler/vad`, e **instância única do processo** (um segundo lançamento
+   de `vad` tem de enviar o comando de seek à janela já aberta em vez de abrir outra).
+   A segunda peça é a cara. **Decisão para v1:** timestamps em texto simples em M3; o
+   esquema de URI fica como item separado pós-M6, condicionado a implementar
+   instância única.
+
+5. **Instância única do processo.** A mesma pergunta aparece em dois sítios: no CLI
+   (`vad ficheiro.mkv` — abre janela nova ou reutiliza a existente?) e no ponto 4
+   acima. **Decisão para v1:** cada execução de `vad` abre uma janela nova (mais
+   simples, sem IPC). Instância única só entra em âmbito se/quando o esquema de URI do
+   ponto 4 for implementado — decide-se uma vez, não duas.
 
 ---
 
@@ -115,11 +150,16 @@ esforço real de performance do projeto:
   **Sem `panic = "abort"`** — contradiz o critério de M1 "erro tratado sem crash da
   app": um ficheiro corrompido não pode abortar o processo.
 - **Whisper quantizado** (`q5_0` / `q5_1`, nomenclatura correta do whisper.cpp/ggml):
-  modelo `base` cai de 142 MB para ~55 MB de RAM. É a maior alavanca de RAM do projeto
-  inteiro — usar por omissão no `whisper.rs` / RAM-only loader.
+  modelo `base` cai de 142 MB para ~55 MB de RAM. É a maior alavanca de RAM do
+  playback/transcrição — usar por omissão no `whisper.rs` / RAM-only loader.
 - **Waveform pyramid**: 3 níveis de resolução pré-computados em background (visão
   global, 5 min, 10s); a UI renderiza no máximo ~1000 pontos visíveis, independente da
   duração do ficheiro.
+
+**Ledger de RAM (não esconder o custo do M5):** Whisper `base-q5` (~55 MB) + LLM local
+de resumo/tradução (~350-700 MB, ver §4.2) somam-se quando ambos estão carregados. O
+resto da app (mpv + egui) fica bem abaixo disto — o M5 é, de longe, o maior consumidor
+de RAM do projeto, não uma otimização.
 
 ---
 
@@ -190,31 +230,33 @@ vad/
 ├── crates/
 │   ├── vad-core/                 # motor: embutir libmpv, estado, playlist — SEM deps de UI
 │   │   ├── src/
-│   │   │   ├── player.rs         # wrapper sobre libmpv2 (play/pause/seek/tracks/filtros)
-│   │   │   ├── state.rs          # estado de reprodução observável (canais/eventos)
+│   │   │   ├── player.rs         # wrapper sobre libmpv2 (mpv_render_context/OpenGL; play/pause/seek/tracks/filtros)
+│   │   │   ├── state.rs          # eventos do mpv (thread interna em C) -> crossbeam-channel/watch para a UI
 │   │   │   ├── playlist.rs
-│   │   │   └── bookmarks.rs      # notas de reunião exportáveis (.md)
+│   │   │   └── bookmarks.rs      # notas de reunião exportáveis (.md, timestamps em texto simples)
 │   │   └── Cargo.toml
 │   │
 │   ├── vad-ai/                   # transcrição, VAD, resumo, tradução — SEM deps de UI
 │   │   ├── src/
+│   │   │   ├── extractor.rs      # subprocesso ffmpeg -> PCM f32 16kHz mono, desacoplado da reprodução
 │   │   │   ├── whisper.rs        # transcriber (whisper.cpp bindings), RAM-only loader
 │   │   │   ├── vad_detector.rs   # deteção de silêncio antes do Whisper
-│   │   │   ├── summarizer.rs     # LLM local para resumo da transcrição
-│   │   │   └── translator.rs     # Whisper translate (EN) + stretch goal multi-idioma
+│   │   │   ├── summarizer.rs     # LLM local (GGUF) para resumo da transcrição
+│   │   │   └── translator.rs     # Whisper translate (EN) + M5: mesmo LLM do summarizer p/ outros idiomas
 │   │   └── Cargo.toml           # nota: redução de ruído é af=arnndn no mpv, não crate própria
 │   │
 │   ├── vad-audio-tools/          # corte/exportação de clips, waveform pyramid
 │   │   ├── src/
-│   │   │   ├── clip_export.rs
+│   │   │   ├── clip_export.rs    # subprocesso ffmpeg -c copy (ver §8)
 │   │   │   └── waveform_pyramid.rs
 │   │   └── Cargo.toml
 │   │
 │   └── vad-app/                  # binário: egui + integração dos crates acima
 │       ├── src/
-│       │   ├── main.rs
-│       │   ├── app.rs            # loop reativo (request_repaint_after)
-│       │   ├── mpris.rs          # integração D-Bus/MPRIS (teclas de media)
+│       │   ├── main.rs           # clap (abrir ficheiro por argumento, --fullscreen)
+│       │   ├── app.rs            # loop reativo (request_repaint_after); drag-and-drop (egui raw.dropped_files)
+│       │   ├── render.rs         # egui_glow::CallbackFn que invoca a mpv_render_context na thread de UI
+│       │   ├── mpris.rs          # org.mpris.MediaPlayer2[.Player] via zbus — Metadata: trackid/title/artist/length
 │       │   ├── theme.rs
 │       │   └── panels/
 │       │       ├── hud.rs
@@ -225,7 +267,9 @@ vad/
 ```
 
 `vad-core` e `vad-ai` não dependem de `egui` — é o que permite, no futuro, trocar a UI
-ou portar para outro SO sem tocar na lógica.
+ou portar para outro SO sem tocar na lógica. Nota: a renderização do vídeo (`render.rs`)
+fica presa à thread de UI por exigência da `mpv_render_context` (contexto OpenGL
+current); só os eventos de estado do mpv correm em canal — não é a mesma decisão.
 
 ---
 
@@ -242,6 +286,15 @@ precisa de um mecanismo próprio — duas opções:
 *Recomendação: subprocesso CLI para v1 — mais simples, sem `unsafe` extra, e stream-copy
 cobre o caso comum (cortar sem recodificar).*
 
+```
+ffmpeg -ss {inicio} -to {fim} -i {input} -c copy -avoid_negative_ts 1 {output}
+```
+
+**Tradeoff a mostrar na UI, não descobrir em M4:** com `-ss` antes de `-i` e `-c copy`,
+o corte encaixa no keyframe mais próximo — os limites do clip não são exatos ao frame.
+Para corte exato seria preciso recodificar (perde a vantagem de velocidade/qualidade
+deste mecanismo). Aceitar o corte por keyframe como comportamento do v1.
+
 ---
 
 ## 9. Fases e Milestones
@@ -249,11 +302,11 @@ cobre o caso comum (cortar sem recodificar).*
 | Fase | Entregável | Critério de aceitação |
 | :--- | :--- | :--- |
 | **M0** | Medir baseline real do VLC nesta máquina (RSS, arranque, CPU em pausa) | Números registados, substituem os "a medir" da tabela |
-| **M1** | `vad-core` embutindo libmpv, reproduz ficheiro local, HUD básico, MPRIS | Play/pause/seek/volume funcionam; teclas de media do teclado funcionam |
+| **M1** | `vad-core` embutindo libmpv via `mpv_render_context`/OpenGL (obrigatório em Wayland), HUD básico, MPRIS completo (zbus), CLI (clap) + drag-and-drop; decisão de janela nova por execução (sem instância única) | Play/pause/seek/volume funcionam em X11 **e** Wayland sem flicker; teclas de media do sistema funcionam; `vad ficheiro.mkv` e arrastar ficheiro abrem reprodução |
 | **M2** | Playlist, faixas de áudio/legendas, hwdec visível no HUD | Troca de faixa sem reiniciar; indicador de aceleração correto |
-| **M3** | Whisper + VAD skip-silence + bookmarks exportáveis em .md | Transcrição de um ficheiro de reunião real, notas exportadas |
-| **M4** | Corte/exportação de clips (via ffmpeg CLI), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido |
-| **M5** | Resumo automático (LLM local) + tradução (EN via Whisper) | Resumo gerado a partir de transcrição; legendas EN geradas |
+| **M3** | Whisper (via `extractor.rs`/ffmpeg desacoplado) + VAD skip-silence + bookmarks exportáveis em .md (timestamps em texto simples) | Transcrição de um ficheiro de reunião real sem interromper outra reprodução; notas exportadas |
+| **M4** | Corte/exportação de clips (via ffmpeg CLI, ver §8), redução de ruído (af=arnndn) | Selecionar troço na waveform, exportar ficheiro válido (corte por keyframe aceite) |
+| **M5** | Resumo automático (LLM local GGUF) + tradução (EN via Whisper; PT/outros via mesmo LLM) | Resumo gerado a partir de transcrição; **gate de aceitação:** 20 segmentos reais traduzidos pelo LLM revistos manualmente sem alucinação/enchimento antes de expor a feature |
 | **M6** | Polish (tema, animações), perfil de release, empacotamento (Flatpak) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
 
 ---
