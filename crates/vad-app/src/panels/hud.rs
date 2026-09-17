@@ -233,7 +233,7 @@ impl HudPanel {
         container_rect: Rect,
         player: &Player,
         shared_state: &Arc<SharedPlayerState>,
-        is_ffmpeg_missing: bool,
+        whisper_disabled: bool,
     ) {
         let is_paused = shared_state.is_paused();
         let current_time = shared_state.get_time_pos();
@@ -407,17 +407,15 @@ impl HudPanel {
             }
 
             // Frame screenshot capture button
-            if ui.button("📸 Frame").clicked() {
-                if player.take_screenshot().is_ok() {
-                    self.set_notification("Fotograma guardado");
-                }
+            if ui.button("📸 Frame").clicked() && player.take_screenshot().is_ok() {
+                self.set_notification("Fotograma guardado");
             }
 
             // Whisper AI button (prominent badge, disabled if ffmpeg is missing)
             let whisper_btn_text = egui::RichText::new("🎙 Whisper").strong();
             let whisper_btn = egui::Button::new(whisper_btn_text);
 
-            if is_ffmpeg_missing {
+            if whisper_disabled {
                 ui.add_enabled(false, whisper_btn)
                     .on_disabled_hover_text("Desativado: Requer FFmpeg (`sudo apt install ffmpeg`)");
             } else {

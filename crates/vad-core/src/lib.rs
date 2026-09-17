@@ -191,10 +191,10 @@ mod tests {
         let ab = player.ab_loop_status().expect("Failed to query ab loop status");
         assert_eq!(ab, AbLoopStatus::Off);
 
-        // Test track querying returns Ok without error (even when no media loaded)
+        // Test track querying: with no media loaded, track-list/count is 0, so both must be empty
         let audio_tracks = player.audio_tracks().expect("Failed to query audio tracks");
         let sub_tracks = player.subtitle_tracks().expect("Failed to query subtitle tracks");
-        assert!(audio_tracks.is_empty() || !audio_tracks.is_empty());
-        assert!(sub_tracks.is_empty() || !sub_tracks.is_empty());
+        assert!(audio_tracks.is_empty());
+        assert!(sub_tracks.is_empty());
     }
 }

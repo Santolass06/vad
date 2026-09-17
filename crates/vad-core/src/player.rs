@@ -38,6 +38,7 @@ pub enum AbLoopStatus {
 }
 
 /// Thin safe wrapper around `mpv_render_context`.
+/// The OpenGL context MUST be current on the thread that calls `render` and `update` (§4.3).
 pub struct VideoRenderContext {
     ctx: RenderContext<'static>,
     _mpv: Arc<Mpv>,

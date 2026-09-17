@@ -58,7 +58,16 @@ não resultou tem valor para quem vier depois.
 
 ## Desvios face ao Sprint_Planning_02.md
 
-Nenhum desvio de funcionalidade ou âmbito. Ajustes técnicos decorrentes da versão `egui 0.36.2`:
+**Desvio de âmbito identificado na revisão:** a redação da tarefa 5 do planning
+era ambígua sobre se `Ctrl+U` devia ficar apenas **visível** no ecrã de
+acolhimento ou já **funcional** (a funcionalidade de URL/yt-dlp em si é
+Sprint_05). A implementação optou por o tornar funcional, o que fez o modal
+entregar texto arbitrário a `player.load_file()` sem a validação de esquema do
+§4.27 — três sprints antes da data em que o plano assume essa validação.
+Corrigido na secção "Correções de revisão" abaixo (ponto 3) com uma validação
+mínima, sem trazer o resto da Sprint_05 para esta sprint.
+
+Fora isso, nenhum desvio de funcionalidade ou âmbito. Ajustes técnicos decorrentes da versão `egui 0.36.2`:
 - `Rounding` foi renomeado para `CornerRadius` no egui 0.36 e os métodos de desenho do `Painter` agora requerem o parâmetro explícito `StrokeKind::Inside`.
 - `Frame::new()` foi configurado com `.corner_radius(16)` e margem inteira `.inner_margin(20)`.
 
@@ -79,3 +88,52 @@ Nenhum desvio de funcionalidade ou âmbito. Ajustes técnicos decorrentes da ver
 4. **Conflito de borrows no loop de eventos e na listagem de faixas do HUD:**
    - *Problema:* Em `poll_events`, ler diretamente de `self.event_rx` impedia a chamada a `self.update_hwdec_label()`; de forma análoga, iterar sobre `&self.cached_audio_tracks` impedia a mutação de `self.poke()` dentro do closure do `ComboBox`.
    - *Resolução:* Coletar eventos para um `Vec` local antes do processamento, e clonar a lista de faixas (vetor de pequenas structs) antes de passar ao menu.
+
+## Correções de revisão (pós-fecho, mesma sprint)
+
+Uma revisão de código encontrou e corrigiu os seguintes problemas antes de a sprint
+ser dada como verificada:
+
+1. **Comentário de invariante do §4.3 apagado sem substituição.** O diff desta
+   sprint removeu, sem qualquer relação com o trabalho da Sprint_02, o comentário
+   em `VideoRenderContext` que documenta que o contexto OpenGL tem de estar
+   corrente na thread que chama `render`/`update` (§4.3) — exatamente a invariante
+   que a revisão da Sprint_01 tinha deixado registada como risco. Restaurado.
+2. **`ErrorAction::disabled_features` era dados mortos — a UI contornava a tabela.**
+   `app.rs` decidia se o Whisper estava desativado com `matches!(e,
+   VadError::FfmpegNotFound)` em vez de ler `action.disabled_features`, e
+   `YtDlpNotFound`'s `disabled_features: &["url_playback"]` não era consultado em
+   lado nenhum: com `yt-dlp` em falta, o botão "Abrir URL" continuava totalmente
+   funcional. Isto contradiz o próprio critério de saída do planning ("degrada...
+   via a tabela do `error.rs`, não via lógica ad-hoc"). Adicionado
+   `VadApp::is_feature_disabled(feature)` que lê a tabela, e usado tanto para o
+   botão Whisper como para desativar (com tooltip, mesmo padrão) o botão "Abrir
+   URL (Ctrl+U)" e o botão "Abrir" dentro do modal de URL quando `yt-dlp` falta.
+3. **Gap de segurança do §4.27 introduzido por âmbito adiantado.** O
+   `Sprint_Planning_02.md` (tarefa 5) só pedia o atalho `Ctrl+U` **visível**; o
+   modal de URL foi implementado como **funcional**, entregando qualquer texto
+   diretamente a `player.load_file()` sem validação de esquema — reabrindo a
+   ameaça que o §4.27 nomeia explicitamente (`file:///etc/shadow`, `smb://`) três
+   sprints antes do previsto (Sprint_05). Corrigido com uma validação mínima de
+   esquema (`http://`/`https://`/`rtsp://`) no submit do modal — não foi
+   implementada nenhuma outra parte da infraestrutura de URL/yt-dlp da Sprint_05
+   (isso continua fora de âmbito).
+4. **`VadError::action()` tinha um `_ =>` genérico.** Isto derrota a verificação
+   de exaustividade do compilador para um enum que o próprio §4.14 diz que vai
+   continuar a crescer — uma variante nova ficaria silenciosamente a cair no
+   fallback "Erro de Operação" em vez de alguém ser forçado a decidir a ação
+   certa. Substituído por braços explícitos para `Mpv`, `Property`, `Playback` e
+   `Io`.
+5. **Teste `test_probe_dependencies_missing_detection` mutava `$PATH` global.**
+   O teste chamava `std::env::set_var("PATH", ...)`, uma mutação ao nível do
+   processo que corre em threads partilhadas com outros testes do mesmo binário
+   (`cargo test` corre em paralelo por omissão) — mesma categoria de risco de
+   teste não-hermético identificada na revisão da Sprint_01. Refatorado
+   `is_executable_in_path_list(binary, paths)` como função pura parametrizada, e
+   o teste passou a chamá-la diretamente com um `OsStr` de teste, sem tocar no
+   ambiente do processo.
+6. **Asserção tautológica em `test_player_speed_tracks_and_ab_loop`.**
+   `assert!(audio_tracks.is_empty() || !audio_tracks.is_empty())` é sempre
+   verdadeira independentemente do valor — não testava nada além de o `.expect()`
+   anterior não ter entrado em pânico. Corrigido para `assert!(audio_tracks.is_empty())`
+   (comportamento correto e específico quando não há média carregada).

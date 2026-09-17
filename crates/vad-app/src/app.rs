@@ -195,6 +195,23 @@ impl VadApp {
         }
     }
 
+    /// Checks the error→ação→UI table (§4.14) for whether `feature` is currently
+    /// disabled because of a missing dependency, instead of matching `VadError`
+    /// variants ad-hoc at each call site.
+    fn is_feature_disabled(&self, feature: &str) -> bool {
+        self.missing_dependencies
+            .iter()
+            .any(|e| e.action().disabled_features.contains(&feature))
+    }
+
+    /// Validates a URL against the allowlisted schemes (§4.27) before it is ever
+    /// handed to mpv — prevents `file://`/`smb://` style paths from reaching the
+    /// player through the "Abrir URL" surface.
+    fn is_allowed_url_scheme(input: &str) -> bool {
+        const ALLOWED_SCHEMES: [&str; 3] = ["http://", "https://", "rtsp://"];
+        ALLOWED_SCHEMES.iter().any(|scheme| input.starts_with(scheme))
+    }
+
     fn update_hwdec_label(&mut self) {
         if let Some(ref p) = self.player {
             if let Ok(hw) = p.hwdec_current() {
@@ -390,9 +407,11 @@ impl VadApp {
         let is_url = self.open_modal_is_url;
         let title = if is_url { "Abrir Endereço Web / URL" } else { "Abrir Ficheiro de Mídia" };
         let placeholder = if is_url { "https://... ou rtsp://..." } else { "/caminho/para/video.mp4" };
+        let url_playback_disabled = is_url && self.is_feature_disabled("url_playback");
 
         let mut close_modal = false;
         let mut load_path = None;
+        let mut validation_error = None;
 
         egui::Window::new(title)
             .collapsible(false)
@@ -422,16 +441,35 @@ impl VadApp {
                 );
                 edit.request_focus();
 
+                if url_playback_disabled {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        Color32::from_rgb(230, 160, 60),
+                        "yt-dlp em falta — reprodução por URL desativada (`sudo apt install yt-dlp`).",
+                    );
+                }
+
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Abrir").clicked()
-                            || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
+                        let open_btn = egui::Button::new("Abrir");
+                        let submit = ui.add_enabled(!url_playback_disabled, open_btn).clicked()
+                            || (!url_playback_disabled
+                                && edit.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+
+                        if submit {
                             let input = self.open_modal_input.trim().to_string();
                             if !input.is_empty() {
-                                load_path = Some(input);
-                                close_modal = true;
+                                if is_url && !Self::is_allowed_url_scheme(&input) {
+                                    validation_error = Some(
+                                        "URL inválido: só são aceites http://, https:// ou rtsp:// (§4.27)."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    load_path = Some(input);
+                                    close_modal = true;
+                                }
                             }
                         }
                         if ui.button("Cancelar").clicked() {
@@ -446,6 +484,9 @@ impl VadApp {
         }
         if close_modal {
             self.open_modal_open = false;
+        }
+        if validation_error.is_some() {
+            self.last_error = validation_error;
         }
     }
 
@@ -484,7 +525,12 @@ impl VadApp {
                     self.open_modal_open = true;
                     self.open_modal_input.clear();
                 }
-                if ui.button("🌐 Abrir URL (Ctrl+U)").clicked() {
+                let url_playback_disabled = self.is_feature_disabled("url_playback");
+                let url_btn = egui::Button::new("🌐 Abrir URL (Ctrl+U)");
+                if url_playback_disabled {
+                    ui.add_enabled(false, url_btn)
+                        .on_disabled_hover_text("Desativado: Requer yt-dlp (`sudo apt install yt-dlp`)");
+                } else if ui.add(url_btn).clicked() {
                     self.open_modal_is_url = true;
                     self.open_modal_open = true;
                     self.open_modal_input.clear();
@@ -629,17 +675,14 @@ impl eframe::App for VadApp {
 
                 // Overlay Floating HUD over the video canvas
                 if let Some(ref player) = self.player {
-                    let is_ffmpeg_missing = self
-                        .missing_dependencies
-                        .iter()
-                        .any(|e| matches!(e, VadError::FfmpegNotFound));
+                    let whisper_disabled = self.is_feature_disabled("whisper");
 
                     self.hud.show(
                         ui,
                         available_rect,
                         player,
                         &self.shared_state,
-                        is_ffmpeg_missing,
+                        whisper_disabled,
                     );
                 }
             } else {

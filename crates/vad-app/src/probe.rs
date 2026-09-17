@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 use vad_core::VadError;
 
@@ -10,8 +11,14 @@ pub fn is_executable_in_path(binary: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
+    is_executable_in_path_list(binary, &paths)
+}
 
-    for dir in std::env::split_paths(&paths) {
+/// Core search logic, parameterized on the path list so it can be tested without
+/// mutating the process-global `$PATH` (which would race with other tests in this
+/// binary running on other threads).
+fn is_executable_in_path_list(binary: &str, paths: &OsStr) -> bool {
+    for dir in std::env::split_paths(paths) {
         let candidate = dir.join(binary);
         if is_file_executable(&candidate) {
             return true;
@@ -73,13 +80,11 @@ mod tests {
 
     #[test]
     fn test_probe_dependencies_missing_detection() {
-        let prev_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", "/tmp/non_existent_vad_test_path_9999");
-        let missing = probe_dependencies();
-        if let Some(ref p) = prev_path {
-            std::env::set_var("PATH", p);
-        }
-        assert!(missing.iter().any(|e| matches!(e, VadError::FfmpegNotFound)));
-        assert!(missing.iter().any(|e| matches!(e, VadError::YtDlpNotFound)));
+        // Exercises the same lookup `probe_dependencies` relies on, but against an
+        // explicit bogus path list instead of mutating the process-global `PATH`
+        // (which would race with other tests reading it on other threads — Sprint_02 review).
+        let bogus_path = OsStr::new("/tmp/non_existent_vad_test_path_9999");
+        assert!(!is_executable_in_path_list("ffmpeg", bogus_path));
+        assert!(!is_executable_in_path_list("yt-dlp", bogus_path));
     }
 }
