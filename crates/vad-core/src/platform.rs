@@ -68,6 +68,14 @@ pub trait PlatformIntegration: Send {
         Ok(())
     }
 
+    /// Whether this integration has requested a full application shutdown
+    /// (e.g. an external controller invoked MPRIS `Quit`). Polled every frame
+    /// so the app can close through its normal viewport-close path, letting
+    /// `Drop` run for all integrations instead of killing the process directly.
+    fn quit_requested(&self) -> bool {
+        false
+    }
+
     /// Explicit cleanup hook called on application shutdown.
     fn shutdown(&mut self) -> Result<(), VadError> {
         Ok(())

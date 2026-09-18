@@ -108,7 +108,7 @@ impl VadApp {
         let mut platform_integrations: Vec<Box<dyn PlatformIntegration>> = Vec::new();
         #[cfg(target_os = "linux")]
         if let Some(ref p) = player {
-            match crate::mpris::MprisServer::new(p.clone(), Arc::clone(&shared_state)) {
+            match crate::mpris::MprisServer::new(p.clone(), Arc::clone(&shared_state), cc.egui_ctx.clone()) {
                 Ok(mpris) => platform_integrations.push(Box::new(mpris)),
                 Err(err) => error!("Failed to initialize MPRIS integration: {:?}", err),
             }
@@ -648,6 +648,13 @@ impl eframe::App for VadApp {
 
         for integration in &mut self.platform_integrations {
             let _ = integration.update();
+        }
+
+        // A platform integration (e.g. MPRIS Quit) may request shutdown; close via
+        // the normal viewport path so `Drop for VadApp` still runs and releases
+        // the screensaver inhibitor / D-Bus name instead of killing the process.
+        if self.platform_integrations.iter().any(|i| i.quit_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // If fatal error occurred during initialization, render recovery screen

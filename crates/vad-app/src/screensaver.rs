@@ -72,18 +72,27 @@ impl ScreenSaverInhibitor {
     }
 
     fn do_un_inhibit(&mut self) {
-        if let Some(cookie) = self.cookie.take() {
-            if let Some(ref conn) = self.connection {
-                let conn_clone = conn.clone();
-                let result = zbus::block_on(async move {
-                    let proxy = ScreenSaverDbusProxy::new(&conn_clone).await?;
-                    proxy.un_inhibit(cookie).await
-                });
+        let Some(cookie) = self.cookie else {
+            return;
+        };
 
-                if let Err(e) = result {
-                    debug!("Could not un-inhibit screensaver (cookie {}): {:?}", cookie, e);
-                } else {
+        if let Some(ref conn) = self.connection {
+            let conn_clone = conn.clone();
+            let result = zbus::block_on(async move {
+                let proxy = ScreenSaverDbusProxy::new(&conn_clone).await?;
+                proxy.un_inhibit(cookie).await
+            });
+
+            // Only clear the cookie once release actually succeeds — on a
+            // transient D-Bus failure we keep it so a later pause/stop retries
+            // instead of leaking the inhibition for the rest of the session.
+            match result {
+                Ok(()) => {
                     info!("Screensaver inhibition released (cookie: {})", cookie);
+                    self.cookie = None;
+                }
+                Err(e) => {
+                    debug!("Could not un-inhibit screensaver (cookie {}): {:?}", cookie, e);
                 }
             }
         }

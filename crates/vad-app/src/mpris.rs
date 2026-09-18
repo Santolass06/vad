@@ -4,14 +4,26 @@
 //! per PLANO_VAD.md §4.25 and Sprint_Planning_03.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, RwLock};
 
+use eframe::egui;
 use tracing::{debug, info, warn};
 use vad_core::platform::PlatformIntegration;
 use vad_core::{PlaybackState, Player, SharedPlayerState, VadError};
 
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, Value};
+
+/// Validates a URI's scheme against exactly what `MprisRoot::supported_uri_schemes`
+/// advertises, before it is ever handed to mpv — an external MPRIS controller must
+/// not be able to reach schemes (`smb://`, `javascript:`, ...) that this player does
+/// not claim to support.
+fn is_allowed_mpris_uri(uri: &str) -> bool {
+    const ALLOWED_SCHEMES: [&str; 4] = ["file://", "http://", "https://", "rtsp://"];
+    ALLOWED_SCHEMES.iter().any(|scheme| uri.starts_with(scheme))
+}
 
 /// Internal metadata and status state shared between MPRIS D-Bus interface and player events.
 #[derive(Debug, Clone)]
@@ -20,7 +32,21 @@ struct MprisState {
     title: String,
     url: String,
     duration_micros: i64,
+    /// Underlying player volume (0.0..1.0), tracked independently of `muted`
+    /// so it can be restored verbatim when the player is unmuted.
     volume: f64,
+    muted: bool,
+}
+
+impl MprisState {
+    /// Volume as reported to MPRIS clients: 0.0 while muted, actual volume otherwise.
+    fn effective_volume(&self) -> f64 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume
+        }
+    }
 }
 
 impl Default for MprisState {
@@ -31,12 +57,16 @@ impl Default for MprisState {
             url: String::new(),
             duration_micros: 0,
             volume: 1.0,
+            muted: false,
         }
     }
 }
 
 /// Root MPRIS interface `org.mpris.MediaPlayer2`.
-struct MprisRoot;
+struct MprisRoot {
+    quit_requested: Arc<AtomicBool>,
+    egui_ctx: egui::Context,
+}
 
 #[interface(name = "org.mpris.MediaPlayer2")]
 impl MprisRoot {
@@ -90,11 +120,13 @@ impl MprisRoot {
     }
 
     fn quit(&self) {
-        info!("MPRIS Root.Quit invoked, scheduling clean application exit");
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            std::process::exit(0);
-        });
+        info!("MPRIS Root.Quit invoked, requesting clean application shutdown");
+        self.quit_requested.store(true, Ordering::Relaxed);
+        // `quit_requested` is only polled from the egui update loop, which may not
+        // be repainting (e.g. paused, no media loaded) when Quit arrives — force a
+        // frame so the request is picked up immediately instead of waiting for the
+        // next unrelated repaint.
+        self.egui_ctx.request_repaint();
     }
 }
 
@@ -158,7 +190,7 @@ impl MprisPlayer {
     fn volume(&self) -> f64 {
         self.state
             .read()
-            .map(|s| s.volume)
+            .map(|s| s.effective_volume())
             .unwrap_or_else(|_| self.player.volume().unwrap_or(100.0) / 100.0)
     }
 
@@ -258,6 +290,10 @@ impl MprisPlayer {
     }
 
     fn open_uri(&self, uri: String) {
+        if !is_allowed_mpris_uri(&uri) {
+            warn!("MPRIS Player.OpenUri rejected (unsupported scheme): {}", uri);
+            return;
+        }
         debug!("MPRIS Player.OpenUri invoked: {}", uri);
         let _ = self.player.load_file(&uri);
     }
@@ -266,23 +302,45 @@ impl MprisPlayer {
     async fn seeked(emitter: &zbus::object_server::SignalEmitter<'_>, position: i64) -> zbus::Result<()>;
 }
 
+/// A pending D-Bus notification for the single background notifier thread.
+enum MprisNotification {
+    PropertyChanged(&'static str),
+    Seeked(i64),
+}
+
 /// Linux MPRIS integration managing D-Bus connection and event dispatch.
 pub struct MprisServer {
     state: Arc<RwLock<MprisState>>,
     connection: Option<zbus::connection::Connection>,
     bus_name: String,
+    quit_requested: Arc<AtomicBool>,
+    /// Bounded, non-blocking handoff to the notifier thread (see
+    /// `spawn_notifier_thread`). `None` when D-Bus is unavailable.
+    notify_tx: Option<SyncSender<MprisNotification>>,
 }
 
 impl MprisServer {
-    pub fn new(player: Player, shared_state: Arc<SharedPlayerState>) -> Result<Self, VadError> {
+    pub fn new(
+        player: Player,
+        shared_state: Arc<SharedPlayerState>,
+        egui_ctx: egui::Context,
+    ) -> Result<Self, VadError> {
         let state = Arc::new(RwLock::new(MprisState::default()));
+        let quit_requested = Arc::new(AtomicBool::new(false));
+        let quit_requested_for_root = Arc::clone(&quit_requested);
 
         // Connect to session bus
         let (conn, bus_name) = match zbus::block_on(async {
             let primary_name = "org.mpris.MediaPlayer2.vad";
             let conn_builder = zbus::connection::Builder::session()
                 .map_err(|e| VadError::Platform(format!("Failed to connect to D-Bus session: {e}")))?
-                .serve_at("/org/mpris/MediaPlayer2", MprisRoot)
+                .serve_at(
+                    "/org/mpris/MediaPlayer2",
+                    MprisRoot {
+                        quit_requested: quit_requested_for_root,
+                        egui_ctx,
+                    },
+                )
                 .map_err(|e| VadError::Platform(format!("Failed to register MPRIS root: {e}")))?
                 .serve_at(
                     "/org/mpris/MediaPlayer2",
@@ -318,57 +376,77 @@ impl MprisServer {
             }
         };
 
+        let notify_tx = conn
+            .as_ref()
+            .map(|c| Self::spawn_notifier_thread(c.clone()));
+
         Ok(Self {
             state,
             connection: conn,
             bus_name,
+            quit_requested,
+            notify_tx,
         })
     }
 
-    /// Helper to emit property changed signal for MPRIS player interface
-    fn notify_player_property_changed(&self, property_name: &str) {
-        if let Some(ref conn) = self.connection {
-            let conn_clone = conn.clone();
-            let prop = property_name.to_string();
-            // Emit properties changed via zbus object server in async task
-            zbus::block_on(async move {
-                if let Ok(iface_ref) = conn_clone
-                    .object_server()
-                    .interface::<_, MprisPlayer>("/org/mpris/MediaPlayer2")
-                    .await
-                {
-                    let iface = iface_ref.get().await;
-                    let emitter = iface_ref.signal_emitter();
-                    match prop.as_str() {
-                        "PlaybackStatus" => {
-                            let _ = iface.playback_status_changed(emitter).await;
+    /// Starts the single background thread that performs D-Bus signal emission,
+    /// fed by a bounded channel. All `notify_*` calls come from `on_event`, which
+    /// runs on the egui UI thread every frame; one persistent thread (instead of
+    /// spawning one per event) keeps a stalled session bus from piling up
+    /// unbounded OS threads under sustained events like scrubbing.
+    fn spawn_notifier_thread(conn: zbus::connection::Connection) -> SyncSender<MprisNotification> {
+        let (tx, rx): (_, Receiver<MprisNotification>) = sync_channel(16);
+        std::thread::spawn(move || {
+            while let Ok(notification) = rx.recv() {
+                zbus::block_on(async {
+                    let Ok(iface_ref) = conn
+                        .object_server()
+                        .interface::<_, MprisPlayer>("/org/mpris/MediaPlayer2")
+                        .await
+                    else {
+                        return;
+                    };
+                    match notification {
+                        MprisNotification::PropertyChanged(prop) => {
+                            let iface = iface_ref.get().await;
+                            let emitter = iface_ref.signal_emitter();
+                            match prop {
+                                "PlaybackStatus" => {
+                                    let _ = iface.playback_status_changed(emitter).await;
+                                }
+                                "Metadata" => {
+                                    let _ = iface.metadata_changed(emitter).await;
+                                }
+                                "Volume" => {
+                                    let _ = iface.volume_changed(emitter).await;
+                                }
+                                _ => {}
+                            }
                         }
-                        "Metadata" => {
-                            let _ = iface.metadata_changed(emitter).await;
+                        MprisNotification::Seeked(pos_micros) => {
+                            let _ = MprisPlayer::seeked(iface_ref.signal_emitter(), pos_micros).await;
                         }
-                        "Volume" => {
-                            let _ = iface.volume_changed(emitter).await;
-                        }
-                        _ => {}
                     }
-                }
-            });
+                });
+            }
+        });
+        tx
+    }
+
+    /// Queues a property-changed signal for the notifier thread. Non-blocking:
+    /// if the channel is full (notifier stuck on a stalled bus), the update is
+    /// dropped rather than blocking the UI thread or piling up more work.
+    fn notify_player_property_changed(&self, property_name: &'static str) {
+        if let Some(ref tx) = self.notify_tx {
+            let _ = tx.try_send(MprisNotification::PropertyChanged(property_name));
         }
     }
 
+    /// See `notify_player_property_changed` for the non-blocking/dropping rationale.
     fn notify_seeked(&self, position_secs: f64) {
-        if let Some(ref conn) = self.connection {
-            let conn_clone = conn.clone();
+        if let Some(ref tx) = self.notify_tx {
             let pos_micros = (position_secs * 1_000_000.0) as i64;
-            zbus::block_on(async move {
-                if let Ok(iface_ref) = conn_clone
-                    .object_server()
-                    .interface::<_, MprisPlayer>("/org/mpris/MediaPlayer2")
-                    .await
-                {
-                    let _ = MprisPlayer::seeked(iface_ref.signal_emitter(), pos_micros).await;
-                }
-            });
+            let _ = tx.try_send(MprisNotification::Seeked(pos_micros));
         }
     }
 }
@@ -442,8 +520,12 @@ impl PlatformIntegration for MprisServer {
         if let Ok(mut guard) = self.state.write() {
             if (guard.volume - vol_normalized).abs() > 0.001 {
                 guard.volume = vol_normalized;
+                let muted = guard.muted;
                 drop(guard);
-                self.notify_player_property_changed("Volume");
+                // Effective (reported) volume only moves if we're not currently muted.
+                if !muted {
+                    self.notify_player_property_changed("Volume");
+                }
             }
         }
         Ok(())
@@ -451,11 +533,11 @@ impl PlatformIntegration for MprisServer {
 
     fn on_mute_changed(&mut self, muted: bool) -> Result<(), VadError> {
         if let Ok(mut guard) = self.state.write() {
-            if muted {
-                guard.volume = 0.0;
+            if guard.muted != muted {
+                guard.muted = muted;
+                drop(guard);
+                self.notify_player_property_changed("Volume");
             }
-            drop(guard);
-            self.notify_player_property_changed("Volume");
         }
         Ok(())
     }
@@ -472,6 +554,10 @@ impl PlatformIntegration for MprisServer {
         }
         Ok(())
     }
+
+    fn quit_requested(&self) -> bool {
+        self.quit_requested.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -483,7 +569,8 @@ mod tests {
         let player = Player::new().expect("Failed to initialize player");
         let shared_state = Arc::new(SharedPlayerState::new());
 
-        let mut server = MprisServer::new(player, shared_state).expect("Failed to create MprisServer");
+        let mut server = MprisServer::new(player, shared_state, egui::Context::default())
+            .expect("Failed to create MprisServer");
         assert_eq!(server.name(), "mpris");
 
         // 1. Test playback state update
@@ -513,19 +600,42 @@ mod tests {
             assert_eq!(guard.duration_micros, 150_000_000);
         }
 
-        // 3. Test volume updates
+        // 3. Test volume updates: muting reports 0.0 externally but preserves the
+        // real volume internally, and unmuting restores the exact prior value.
         server
             .on_volume_changed(75.0)
             .expect("on_volume_changed failed");
         assert!((server.state.read().unwrap().volume - 0.75).abs() < 0.01);
+        assert!((server.state.read().unwrap().effective_volume() - 0.75).abs() < 0.01);
 
         server.on_mute_changed(true).expect("on_mute_changed failed");
-        assert_eq!(server.state.read().unwrap().volume, 0.0);
+        assert_eq!(server.state.read().unwrap().effective_volume(), 0.0);
+        assert!((server.state.read().unwrap().volume - 0.75).abs() < 0.01);
+
+        server.on_mute_changed(false).expect("on_mute_changed failed");
+        assert!((server.state.read().unwrap().effective_volume() - 0.75).abs() < 0.01);
 
         // 4. Test seek
         server.on_seek(42.0).expect("on_seek failed");
 
-        // 5. Test shutdown
+        // 5. Test quit request via MPRIS Root.Quit
+        assert!(!server.quit_requested());
+        server.quit_requested.store(true, Ordering::Relaxed);
+        assert!(server.quit_requested());
+
+        // 6. Test shutdown
         server.shutdown().expect("shutdown failed");
+    }
+
+    #[test]
+    fn test_open_uri_scheme_allowlist() {
+        assert!(is_allowed_mpris_uri("file:///home/user/movie.mp4"));
+        assert!(is_allowed_mpris_uri("http://example.com/video.mp4"));
+        assert!(is_allowed_mpris_uri("https://example.com/stream.m3u8"));
+        assert!(is_allowed_mpris_uri("rtsp://192.168.1.100:554/live"));
+
+        assert!(!is_allowed_mpris_uri("smb://nas/share/video.mp4"));
+        assert!(!is_allowed_mpris_uri("ftp://ftp.example.com/file"));
+        assert!(!is_allowed_mpris_uri("javascript:alert(1)"));
     }
 }
