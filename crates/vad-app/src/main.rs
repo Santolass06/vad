@@ -3,6 +3,11 @@ mod panels;
 mod probe;
 mod render;
 
+#[cfg(target_os = "linux")]
+mod mpris;
+#[cfg(target_os = "linux")]
+mod screensaver;
+
 use app::VadApp;
 use clap::Parser;
 use eframe::egui;

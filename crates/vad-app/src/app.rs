@@ -7,7 +7,7 @@ use eframe::egui::{
 };
 use tracing::{error, info};
 use vad_core::{
-    create_event_channel, EventReceiver, GlProcAddressFn, Player,
+    create_event_channel, EventReceiver, GlProcAddressFn, PlatformIntegration, Player,
     PlayerEvent, SharedPlayerState, VadError,
 };
 
@@ -21,6 +21,7 @@ pub struct VadApp {
     renderer: Option<GlVideoRenderer>,
     event_rx: Option<EventReceiver>,
     shared_state: Arc<SharedPlayerState>,
+    platform_integrations: Vec<Box<dyn PlatformIntegration>>,
     hwdec_current_label: String,
     hwdec_forced_sw: bool,
     current_media_path: Option<String>,
@@ -104,11 +105,25 @@ impl VadApp {
             }
         }
 
+        let mut platform_integrations: Vec<Box<dyn PlatformIntegration>> = Vec::new();
+        #[cfg(target_os = "linux")]
+        if let Some(ref p) = player {
+            match crate::mpris::MprisServer::new(p.clone(), Arc::clone(&shared_state)) {
+                Ok(mpris) => platform_integrations.push(Box::new(mpris)),
+                Err(err) => error!("Failed to initialize MPRIS integration: {:?}", err),
+            }
+            match crate::screensaver::ScreenSaverInhibitor::new() {
+                Ok(inhibitor) => platform_integrations.push(Box::new(inhibitor)),
+                Err(err) => error!("Failed to initialize screensaver inhibitor: {:?}", err),
+            }
+        }
+
         let mut app = Self {
             player,
             renderer,
             event_rx: Some(event_rx),
             shared_state,
+            platform_integrations,
             hwdec_current_label: "A detetar...".to_string(),
             hwdec_forced_sw: false,
             current_media_path: None,
@@ -163,6 +178,16 @@ impl VadApp {
         }
 
         for event in events {
+            for integration in &mut self.platform_integrations {
+                if let Err(e) = integration.on_event(&event) {
+                    tracing::warn!(
+                        "Platform integration '{}' error handling event: {:?}",
+                        integration.name(),
+                        e
+                    );
+                }
+            }
+
             match event {
                 PlayerEvent::FileLoaded { title, duration, path } => {
                     if let Some(t) = title {
@@ -281,6 +306,32 @@ impl VadApp {
         {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+        }
+
+        // Up / Down arrow for volume adjustment (only if no text input has focus)
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            if let Some(ref p) = self.player {
+                if let Ok(v) = p.volume() {
+                    let _ = p.set_volume(v + 5.0);
+                    self.hud.poke();
+                }
+            }
+        }
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            if let Some(ref p) = self.player {
+                if let Ok(v) = p.volume() {
+                    let _ = p.set_volume(v - 5.0);
+                    self.hud.poke();
+                }
+            }
+        }
+
+        // M for mute toggle (only if no text input has focus)
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            if let Some(ref p) = self.player {
+                let _ = p.toggle_mute();
+                self.hud.poke();
+            }
         }
     }
 
@@ -595,6 +646,10 @@ impl eframe::App for VadApp {
         self.handle_drag_and_drop(&ctx);
         self.poll_events();
 
+        for integration in &mut self.platform_integrations {
+            let _ = integration.update();
+        }
+
         // If fatal error occurred during initialization, render recovery screen
         if let Some(ref fatal) = self.fatal_error {
             self.render_fatal_error_screen(ui, fatal);
@@ -719,5 +774,52 @@ impl eframe::App for VadApp {
         // Dialogs
         self.render_dependency_dialog(&ctx);
         self.render_open_modal(&ctx);
+    }
+}
+
+impl Drop for VadApp {
+    fn drop(&mut self) {
+        for integration in &mut self.platform_integrations {
+            let _ = integration.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_scheme_allowlist() {
+        assert!(VadApp::is_allowed_url_scheme("http://example.com/video.mp4"));
+        assert!(VadApp::is_allowed_url_scheme("https://example.com/stream.m3u8"));
+        assert!(VadApp::is_allowed_url_scheme("rtsp://192.168.1.100:554/live"));
+
+        // Reject non-whitelisted schemes
+        assert!(!VadApp::is_allowed_url_scheme("file:///etc/passwd"));
+        assert!(!VadApp::is_allowed_url_scheme("smb://nas/share/video.mp4"));
+        assert!(!VadApp::is_allowed_url_scheme("ftp://ftp.example.com/file"));
+        assert!(!VadApp::is_allowed_url_scheme("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn test_keyboard_focus_guard_in_context() {
+        let ctx = egui::Context::default();
+
+        // Initially with no focused widget, egui_wants_keyboard_input is false
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |_ui_ctx| {});
+        out1.textures_delta.clear();
+        assert!(!ctx.egui_wants_keyboard_input());
+
+        // When a TextEdit widget gains focus, egui_wants_keyboard_input becomes true
+        let mut text = String::new();
+        let mut out2 = ctx.run_ui(egui::RawInput::default(), |ui_ctx| {
+            egui::CentralPanel::default().show(ui_ctx, |ui| {
+                let response = ui.add(egui::TextEdit::singleline(&mut text));
+                response.request_focus();
+            });
+        });
+        out2.textures_delta.clear();
+        assert!(ctx.egui_wants_keyboard_input());
     }
 }

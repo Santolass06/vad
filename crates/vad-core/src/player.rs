@@ -208,6 +208,12 @@ impl Player {
         Ok(self.get_property_optional::<bool>("pause")?.unwrap_or(true))
     }
 
+    /// Stops playback and unloads current file/playlist.
+    pub fn stop(&self) -> Result<(), VadError> {
+        self.mpv.command("stop", &[]).map_err(VadError::Mpv)?;
+        Ok(())
+    }
+
     /// Relative seek in seconds (positive forward, negative backward).
     pub fn seek_relative(&self, delta_secs: f64) -> Result<(), VadError> {
         let delta_str = format!("{}", delta_secs);

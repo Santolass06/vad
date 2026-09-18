@@ -60,6 +60,9 @@ pub enum VadError {
 
     #[error("Model download failed: {0}")]
     ModelDownloadFailed(String),
+
+    #[error("Platform integration error: {0}")]
+    Platform(String),
 }
 
 impl VadError {
@@ -158,6 +161,14 @@ impl VadError {
                 severity: ErrorSeverity::Warning,
                 title: "Erro de E/S",
                 description: "Ocorreu um erro de entrada/saída ao aceder a um ficheiro ou recurso.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::Platform(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Erro de Integração com o Sistema",
+                description: "Falha na comunicação com serviços de sistema operativo (D-Bus/MPRIS/Screensaver).",
                 install_command: None,
                 disabled_features: &[],
                 can_ignore: true,

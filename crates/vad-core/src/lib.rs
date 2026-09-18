@@ -1,8 +1,10 @@
 pub mod error;
+pub mod platform;
 pub mod player;
 pub mod state;
 
 pub use error::{ErrorAction, ErrorSeverity, VadError};
+pub use platform::PlatformIntegration;
 pub use player::{AbLoopStatus, GlProcAddressFn, Player, TrackInfo, VideoRenderContext};
 pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
@@ -196,5 +198,132 @@ mod tests {
         let sub_tracks = player.subtitle_tracks().expect("Failed to query subtitle tracks");
         assert!(audio_tracks.is_empty());
         assert!(sub_tracks.is_empty());
+    }
+
+    #[test]
+    fn test_platform_integration_trait_dispatch() {
+        struct MockIntegration {
+            state: PlaybackState,
+            title: Option<String>,
+            last_seek: Option<f64>,
+            volume: f64,
+            muted: bool,
+            shutdown_called: bool,
+        }
+
+        impl PlatformIntegration for MockIntegration {
+            fn name(&self) -> &'static str {
+                "mock"
+            }
+
+            fn on_playback_state(&mut self, state: PlaybackState) -> Result<(), VadError> {
+                self.state = state;
+                Ok(())
+            }
+
+            fn on_file_loaded(
+                &mut self,
+                _path: &str,
+                title: Option<&str>,
+                _duration: Option<f64>,
+            ) -> Result<(), VadError> {
+                self.title = title.map(|s| s.to_string());
+                Ok(())
+            }
+
+            fn on_seek(&mut self, position_secs: f64) -> Result<(), VadError> {
+                self.last_seek = Some(position_secs);
+                Ok(())
+            }
+
+            fn on_volume_changed(&mut self, volume: f64) -> Result<(), VadError> {
+                self.volume = volume;
+                Ok(())
+            }
+
+            fn on_mute_changed(&mut self, muted: bool) -> Result<(), VadError> {
+                self.muted = muted;
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> Result<(), VadError> {
+                self.shutdown_called = true;
+                Ok(())
+            }
+        }
+
+        let mut mock = MockIntegration {
+            state: PlaybackState::Idle,
+            title: None,
+            last_seek: None,
+            volume: 100.0,
+            muted: false,
+            shutdown_called: false,
+        };
+
+        assert_eq!(mock.name(), "mock");
+
+        // Dispatch FileLoaded
+        mock.on_event(&PlayerEvent::FileLoaded {
+            path: "/path/video.mkv".to_string(),
+            title: Some("Sample Video".to_string()),
+            duration: Some(120.0),
+        })
+        .expect("on_event FileLoaded failed");
+        assert_eq!(mock.title.as_deref(), Some("Sample Video"));
+
+        // Dispatch PlaybackStateChanged
+        mock.on_event(&PlayerEvent::PlaybackStateChanged(PlaybackState::Playing))
+            .expect("on_event PlaybackStateChanged failed");
+        assert_eq!(mock.state, PlaybackState::Playing);
+
+        // Dispatch SeekOccurred
+        mock.on_event(&PlayerEvent::SeekOccurred(45.5))
+            .expect("on_event SeekOccurred failed");
+        assert_eq!(mock.last_seek, Some(45.5));
+
+        // Dispatch VolumeChanged
+        mock.on_event(&PlayerEvent::VolumeChanged(75.0))
+            .expect("on_event VolumeChanged failed");
+        assert_eq!(mock.volume, 75.0);
+
+        // Dispatch MutedChanged
+        mock.on_event(&PlayerEvent::MutedChanged(true))
+            .expect("on_event MutedChanged failed");
+        assert!(mock.muted);
+
+        // Shutdown
+        mock.shutdown().expect("shutdown failed");
+        assert!(mock.shutdown_called);
+    }
+
+    #[test]
+    fn test_concurrent_player_commands() {
+        let player = Player::new().expect("Failed to create player");
+        let player_ui = player.clone();
+        let player_mpris = player.clone();
+
+        let t1 = std::thread::spawn(move || {
+            for i in 0..50 {
+                let _ = player_ui.toggle_pause();
+                let _ = player_ui.seek_relative((i % 5) as f64 - 2.0);
+                let _ = player_ui.set_speed(1.0 + (i % 3) as f64 * 0.25);
+                let _ = player_ui.volume();
+                std::thread::yield_now();
+            }
+        });
+
+        let t2 = std::thread::spawn(move || {
+            for i in 0..50 {
+                let _ = player_mpris.pause();
+                let _ = player_mpris.seek_absolute((i % 10) as f64);
+                let _ = player_mpris.set_volume(50.0 + (i % 20) as f64);
+                let _ = player_mpris.is_paused();
+                std::thread::yield_now();
+            }
+        });
+
+        t1.join().expect("UI player thread panicked");
+        t2.join().expect("MPRIS player thread panicked");
     }
 }
