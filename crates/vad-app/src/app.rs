@@ -1,5 +1,5 @@
 use std::ffi::{c_void, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui::{
@@ -8,12 +8,23 @@ use eframe::egui::{
 use tracing::{error, info};
 use vad_core::{
     create_event_channel, EventReceiver, GlProcAddressFn, PlatformIntegration, Player,
-    PlayerEvent, SharedPlayerState, VadError,
+    PlayerEvent, Playlist, SharedPlayerState, VadError,
 };
 
-use crate::panels::HudPanel;
+use crate::panels::{
+    AudioPanel, HudAction, HudPanel, PlaylistAction, PlaylistPanel, VideoPanel,
+};
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
+
+/// Active right-hand lateral panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveSidePanel {
+    None,
+    Playlist,
+    Equalizer,
+    Video,
+}
 
 /// Main GUI application for VAD.
 pub struct VadApp {
@@ -36,6 +47,12 @@ pub struct VadApp {
     open_modal_input: String,
     hud: HudPanel,
     is_fullscreen: bool,
+    playlist: Arc<Mutex<Playlist>>,
+    active_side_panel: ActiveSidePanel,
+    video_panel: VideoPanel,
+    audio_panel: AudioPanel,
+    load_subtitles_modal_open: bool,
+    load_subtitles_input: String,
 }
 
 impl VadApp {
@@ -105,10 +122,17 @@ impl VadApp {
             }
         }
 
+        let playlist = Arc::new(Mutex::new(Playlist::new()));
+
         let mut platform_integrations: Vec<Box<dyn PlatformIntegration>> = Vec::new();
         #[cfg(target_os = "linux")]
         if let Some(ref p) = player {
-            match crate::mpris::MprisServer::new(p.clone(), Arc::clone(&shared_state), cc.egui_ctx.clone()) {
+            match crate::mpris::MprisServer::new(
+                p.clone(),
+                Arc::clone(&shared_state),
+                Arc::clone(&playlist),
+                cc.egui_ctx.clone(),
+            ) {
                 Ok(mpris) => platform_integrations.push(Box::new(mpris)),
                 Err(err) => error!("Failed to initialize MPRIS integration: {:?}", err),
             }
@@ -138,6 +162,12 @@ impl VadApp {
             open_modal_input: String::new(),
             hud: HudPanel::new(),
             is_fullscreen: false,
+            playlist,
+            active_side_panel: ActiveSidePanel::None,
+            video_panel: VideoPanel::new(),
+            audio_panel: AudioPanel::new(),
+            load_subtitles_modal_open: false,
+            load_subtitles_input: String::new(),
         };
 
         if let Some(path) = initial_file {
@@ -164,6 +194,17 @@ impl VadApp {
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_else(|| trimmed.to_string());
                 self.last_error = None;
+
+                if let Ok(mut pl) = self.playlist.lock() {
+                    let found = pl.items().iter().position(|it| it.location() == trimmed);
+                    if let Some(idx) = found {
+                        pl.set_current(idx);
+                    } else {
+                        let idx = pl.add_file(trimmed);
+                        pl.set_current(idx);
+                    }
+                }
+
                 self.hud.poke();
             }
         }
@@ -200,9 +241,32 @@ impl VadApp {
                     }
                     if let Some(dur) = duration {
                         self.shared_state.set_duration(dur);
+                        if let Ok(mut pl) = self.playlist.lock() {
+                            if let Some(idx) = pl.current_index() {
+                                if let Some(item) = pl.items_mut().get_mut(idx) {
+                                    item.set_duration(Some(dur));
+                                }
+                            }
+                        }
                     }
                     self.update_hwdec_label();
                     self.hud.poke();
+                }
+                PlayerEvent::EndOfFile => {
+                    let next_item = if let Ok(mut pl) = self.playlist.lock() {
+                        pl.next().cloned()
+                    } else {
+                        None
+                    };
+
+                    if let Some(item) = next_item {
+                        if item.is_url() {
+                            self.hud.set_notification("A reprodução de URLs requer a Sprint 05");
+                        } else {
+                            let path = item.location();
+                            self.load_media(&path);
+                        }
+                    }
                 }
                 PlayerEvent::HwdecChanged(hw) => match hw {
                     Some(val) => self.hwdec_current_label = format!("HW ({val})"),
@@ -255,6 +319,8 @@ impl VadApp {
                 self.show_dependency_dialog = false;
             } else if self.open_modal_open {
                 self.open_modal_open = false;
+            } else if self.load_subtitles_modal_open {
+                self.load_subtitles_modal_open = false;
             }
         }
 
@@ -331,6 +397,46 @@ impl VadApp {
             if let Some(ref p) = self.player {
                 let _ = p.toggle_mute();
                 self.hud.poke();
+            }
+        }
+
+        // Audio delay shortcuts (J: -50ms, K: +50ms) per PLANO_VAD.md §3 line 95
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::J)) {
+            if let Some(ref p) = self.player {
+                let cur = p.audio_delay().unwrap_or(0.0);
+                let next = cur - 0.05;
+                let _ = p.set_audio_delay(next);
+                self.video_panel.audio_delay_ms = (next * 1000.0).round() as i64;
+                self.hud.set_notification(format!("Atraso áudio: {:.0} ms", next * 1000.0));
+            }
+        }
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::K)) {
+            if let Some(ref p) = self.player {
+                let cur = p.audio_delay().unwrap_or(0.0);
+                let next = cur + 0.05;
+                let _ = p.set_audio_delay(next);
+                self.video_panel.audio_delay_ms = (next * 1000.0).round() as i64;
+                self.hud.set_notification(format!("Atraso áudio: {:.0} ms", next * 1000.0));
+            }
+        }
+
+        // Subtitle delay shortcuts (G: -50ms, H: +50ms) per PLANO_VAD.md §3 line 95
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::G)) {
+            if let Some(ref p) = self.player {
+                let cur = p.sub_delay().unwrap_or(0.0);
+                let next = cur - 0.05;
+                let _ = p.set_sub_delay(next);
+                self.video_panel.sub_delay_ms = (next * 1000.0).round() as i64;
+                self.hud.set_notification(format!("Atraso legendas: {:.0} ms", next * 1000.0));
+            }
+        }
+        if !wants_keyboard && ctx.input(|i| i.key_pressed(egui::Key::H)) {
+            if let Some(ref p) = self.player {
+                let cur = p.sub_delay().unwrap_or(0.0);
+                let next = cur + 0.05;
+                let _ = p.set_sub_delay(next);
+                self.video_panel.sub_delay_ms = (next * 1000.0).round() as i64;
+                self.hud.set_notification(format!("Atraso legendas: {:.0} ms", next * 1000.0));
             }
         }
     }
@@ -541,6 +647,73 @@ impl VadApp {
         }
     }
 
+    /// Renders modal dialog for loading external subtitle file.
+    fn render_subtitles_modal(&mut self, ctx: &egui::Context) {
+        if !self.load_subtitles_modal_open {
+            return;
+        }
+
+        let mut close_modal = false;
+        let mut load_sub = None;
+
+        egui::Window::new("Carregar Legendas Externas")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 240))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .corner_radius(14)
+                    .inner_margin(18),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(450.0);
+
+                ui.label("Introduz o caminho para o ficheiro de legendas (.srt, .ass, .vtt):");
+                ui.add_space(6.0);
+
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.load_subtitles_input)
+                        .hint_text("/caminho/para/legendas.srt")
+                        .desired_width(420.0),
+                );
+                edit.request_focus();
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let submit = ui.button("Carregar").clicked()
+                            || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+
+                        if submit {
+                            let input = self.load_subtitles_input.trim().to_string();
+                            if !input.is_empty() {
+                                load_sub = Some(input);
+                                close_modal = true;
+                            }
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+
+        if let Some(sub_path) = load_sub {
+            if let Some(ref p) = self.player {
+                if let Err(e) = p.load_subtitles(&sub_path) {
+                    self.last_error = Some(format!("Erro ao carregar legendas: {e:?}"));
+                } else {
+                    self.hud.set_notification("Legendas carregadas com sucesso");
+                }
+            }
+        }
+        if close_modal {
+            self.load_subtitles_modal_open = false;
+        }
+    }
+
     /// Renders welcome/idle screen when no media is currently opened (Task 5).
     fn render_welcome_screen(&mut self, ui: &mut egui::Ui) {
         let available_rect = ui.available_rect_before_wrap();
@@ -716,6 +889,36 @@ impl eframe::App for VadApp {
                         self.open_modal_open = true;
                         self.open_modal_input.clear();
                     }
+
+                    ui.separator();
+
+                    // Lateral Panel toggle buttons (Top Bar)
+                    let vid_active = self.active_side_panel == ActiveSidePanel::Video;
+                    if ui.selectable_label(vid_active, "🎞 Vídeo").clicked() {
+                        self.active_side_panel = if vid_active {
+                            ActiveSidePanel::None
+                        } else {
+                            ActiveSidePanel::Video
+                        };
+                    }
+
+                    let eq_active = self.active_side_panel == ActiveSidePanel::Equalizer;
+                    if ui.selectable_label(eq_active, "🎚 Equalizador").clicked() {
+                        self.active_side_panel = if eq_active {
+                            ActiveSidePanel::None
+                        } else {
+                            ActiveSidePanel::Equalizer
+                        };
+                    }
+
+                    let pl_active = self.active_side_panel == ActiveSidePanel::Playlist;
+                    if ui.selectable_label(pl_active, "📜 Playlist").clicked() {
+                        self.active_side_panel = if pl_active {
+                            ActiveSidePanel::None
+                        } else {
+                            ActiveSidePanel::Playlist
+                        };
+                    }
                 });
             });
 
@@ -723,6 +926,128 @@ impl eframe::App for VadApp {
                 ui.colored_label(Color32::RED, format!("Aviso: {err}"));
             }
         });
+
+        // --- UNIFORM RIGHT SIDE PANEL (Fixed 340px) ---
+        if self.active_side_panel != ActiveSidePanel::None {
+            egui::Panel::right("vad_uniform_side_panel")
+                .exact_size(340.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_premultiplied(20, 22, 30, 248))
+                        .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 18)))
+                        .inner_margin(14),
+                )
+                .show(ui, |ui| {
+                    // Header tabs
+                    ui.horizontal(|ui| {
+                        let accent = Color32::from_rgb(139, 124, 246);
+                        let is_pl = self.active_side_panel == ActiveSidePanel::Playlist;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Playlist")
+                                        .strong()
+                                        .color(if is_pl { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            self.active_side_panel = ActiveSidePanel::Playlist;
+                        }
+
+                        let is_eq = self.active_side_panel == ActiveSidePanel::Equalizer;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Equalizador")
+                                        .strong()
+                                        .color(if is_eq { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            self.active_side_panel = ActiveSidePanel::Equalizer;
+                        }
+
+                        let is_vid = self.active_side_panel == ActiveSidePanel::Video;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Vídeo")
+                                        .strong()
+                                        .color(if is_vid { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            self.active_side_panel = ActiveSidePanel::Video;
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                self.active_side_panel = ActiveSidePanel::None;
+                            }
+                        });
+                    });
+
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    match self.active_side_panel {
+                        ActiveSidePanel::Playlist => {
+                            let cur_time = self.shared_state.get_time_pos();
+                            let dur = self.shared_state.get_duration();
+                            let mut action = None;
+                            if let Ok(mut pl) = self.playlist.lock() {
+                                action = PlaylistPanel::ui(ui, &mut pl, cur_time, dur);
+                            }
+                            if let Some(act) = action {
+                                match act {
+                                    PlaylistAction::PlayItem(idx) => {
+                                        let item_info = if let Ok(mut pl) = self.playlist.lock() {
+                                            pl.set_current(idx).map(|it| (it.is_url(), it.location()))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((is_url, loc)) = item_info {
+                                            if is_url {
+                                                self.hud.set_notification("A reprodução de URLs requer a Sprint 05");
+                                            } else {
+                                                self.load_media(&loc);
+                                            }
+                                        }
+                                    }
+                                    PlaylistAction::AddFileRequest => {
+                                        self.open_modal_is_url = false;
+                                        self.open_modal_open = true;
+                                        self.open_modal_input.clear();
+                                    }
+                                    PlaylistAction::AddUrlRequest => {
+                                        self.open_modal_is_url = true;
+                                        self.open_modal_open = true;
+                                        self.open_modal_input.clear();
+                                    }
+                                }
+                            }
+                        }
+                        ActiveSidePanel::Equalizer => {
+                            if let Some(ref p) = self.player {
+                                self.audio_panel.ui(ui, p);
+                            }
+                        }
+                        ActiveSidePanel::Video => {
+                            if let Some(ref p) = self.player {
+                                self.video_panel.ui(ui, p);
+                            }
+                        }
+                        ActiveSidePanel::None => {}
+                    }
+                });
+        }
 
         // --- CENTRAL CANVAS ---
         egui::CentralPanel::default().show(ui, |ui| {
@@ -739,13 +1064,41 @@ impl eframe::App for VadApp {
                 if let Some(ref player) = self.player {
                     let whisper_disabled = self.is_feature_disabled("whisper");
 
-                    self.hud.show(
+                    if let Some(action) = self.hud.show(
                         ui,
                         available_rect,
                         player,
                         &self.shared_state,
                         whisper_disabled,
-                    );
+                    ) {
+                        match action {
+                            HudAction::TogglePlaylist => {
+                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Playlist {
+                                    ActiveSidePanel::None
+                                } else {
+                                    ActiveSidePanel::Playlist
+                                };
+                            }
+                            HudAction::ToggleEqualizer => {
+                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Equalizer {
+                                    ActiveSidePanel::None
+                                } else {
+                                    ActiveSidePanel::Equalizer
+                                };
+                            }
+                            HudAction::ToggleVideo => {
+                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Video {
+                                    ActiveSidePanel::None
+                                } else {
+                                    ActiveSidePanel::Video
+                                };
+                            }
+                            HudAction::OpenSubtitlesDialog => {
+                                self.load_subtitles_modal_open = true;
+                                self.load_subtitles_input.clear();
+                            }
+                        }
+                    }
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -781,6 +1134,7 @@ impl eframe::App for VadApp {
         // Dialogs
         self.render_dependency_dialog(&ctx);
         self.render_open_modal(&ctx);
+        self.render_subtitles_modal(&ctx);
     }
 }
 
@@ -828,5 +1182,42 @@ mod tests {
         });
         out2.textures_delta.clear();
         assert!(ctx.egui_wants_keyboard_input());
+    }
+
+    #[test]
+    fn test_side_panel_state_transitions() {
+        let mut panel = ActiveSidePanel::None;
+        assert_eq!(panel, ActiveSidePanel::None);
+
+        // Clicking playlist when None opens Playlist
+        panel = if panel == ActiveSidePanel::Playlist { ActiveSidePanel::None } else { ActiveSidePanel::Playlist };
+        assert_eq!(panel, ActiveSidePanel::Playlist);
+
+        // Clicking playlist again closes panel (None)
+        panel = if panel == ActiveSidePanel::Playlist { ActiveSidePanel::None } else { ActiveSidePanel::Playlist };
+        assert_eq!(panel, ActiveSidePanel::None);
+
+        // Clicking Equalizer opens Equalizer
+        panel = if panel == ActiveSidePanel::Equalizer { ActiveSidePanel::None } else { ActiveSidePanel::Equalizer };
+        assert_eq!(panel, ActiveSidePanel::Equalizer);
+
+        // Switching from Equalizer directly to Video
+        panel = if panel == ActiveSidePanel::Video { ActiveSidePanel::None } else { ActiveSidePanel::Video };
+        assert_eq!(panel, ActiveSidePanel::Video);
+    }
+
+    #[test]
+    fn test_audio_panel_presets_and_frequencies() {
+        let mut audio_panel = crate::panels::AudioPanel::new();
+        assert_eq!(crate::panels::AudioPanel::FREQ_LABELS.len(), 10);
+        assert_eq!(audio_panel.gains, [0.0; 10]);
+        assert_eq!(audio_panel.active_preset, "Plano");
+
+        audio_panel.apply_preset("Voz clara");
+        assert_eq!(audio_panel.active_preset, "Voz clara");
+        assert_ne!(audio_panel.gains, [0.0; 10]);
+
+        audio_panel.apply_preset("Plano");
+        assert_eq!(audio_panel.gains, [0.0; 10]);
     }
 }

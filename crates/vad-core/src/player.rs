@@ -29,6 +29,13 @@ pub struct TrackInfo {
     pub is_selected: bool,
 }
 
+/// Information about an audio output device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevice {
+    pub name: String,
+    pub description: String,
+}
+
 /// Status of A-B repeat loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AbLoopStatus {
@@ -128,8 +135,9 @@ impl Player {
         mpv.set_property("hwdec", "auto-safe")?;
         mpv.set_property("keep-open", "yes")?;
         mpv.set_property("video-timing-offset", 0.0_f64)?;
+        mpv.set_property("volume-max", 200.0_f64)?;
 
-        info!("Player initialized with vo=libmpv and hwdec=auto-safe");
+        info!("Player initialized with vo=libmpv, hwdec=auto-safe, volume-max=200");
         Ok(Self { mpv: Arc::new(mpv) })
     }
 
@@ -232,9 +240,9 @@ impl Player {
         Ok(())
     }
 
-    /// Sets playback volume in range 0.0..=100.0.
+    /// Sets playback volume in range 0.0..=200.0 (supports volume boost).
     pub fn set_volume(&self, volume: f64) -> Result<(), VadError> {
-        let vol = volume.clamp(0.0, 100.0);
+        let vol = volume.clamp(0.0, 200.0);
         self.mpv.set_property("volume", vol).map_err(VadError::Mpv)
     }
 
@@ -358,6 +366,179 @@ impl Player {
             }
         }
         Ok(tracks)
+    }
+
+    /// Returns current video aspect ratio override as f64 (values <= 0.0 represent Auto).
+    pub fn video_aspect_override(&self) -> Result<f64, VadError> {
+        Ok(self.get_property_optional::<f64>("video-aspect-override")?.unwrap_or(-1.0))
+    }
+
+    /// Sets video aspect ratio override (e.g. "-1", "16:9", "4:3", "21:9").
+    pub fn set_video_aspect_override(&self, aspect: &str) -> Result<(), VadError> {
+        self.mpv
+            .set_property("video-aspect-override", aspect)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Returns current video rotation angle in degrees (0, 90, 180, 270).
+    pub fn video_rotate(&self) -> Result<i64, VadError> {
+        Ok(self.get_property_optional::<i64>("video-rotate")?.unwrap_or(0))
+    }
+
+    /// Sets video rotation angle in degrees (0, 90, 180, 270).
+    pub fn set_video_rotate(&self, degrees: i64) -> Result<(), VadError> {
+        self.mpv
+            .set_property("video-rotate", degrees)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Returns current video crop geometry string.
+    pub fn video_crop(&self) -> Result<Option<String>, VadError> {
+        self.get_property_optional::<String>("video-crop")
+    }
+
+    /// Sets video crop geometry string (e.g. "" to disable or "16:9", "4:3", "WxH+X+Y").
+    pub fn set_video_crop(&self, crop: &str) -> Result<(), VadError> {
+        self.mpv
+            .set_property("video-crop", crop)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Gets current panscan value (0.0 = original aspect, 1.0 = pan-and-scan / fill).
+    pub fn panscan(&self) -> Result<f64, VadError> {
+        Ok(self.get_property_optional::<f64>("panscan")?.unwrap_or(0.0))
+    }
+
+    /// Sets panscan value (0.0 to 1.0).
+    pub fn set_panscan(&self, val: f64) -> Result<(), VadError> {
+        self.mpv
+            .set_property("panscan", val.clamp(0.0, 1.0))
+            .map_err(VadError::Mpv)
+    }
+
+    /// Gets audio delay in seconds.
+    pub fn audio_delay(&self) -> Result<f64, VadError> {
+        Ok(self.get_property_optional::<f64>("audio-delay")?.unwrap_or(0.0))
+    }
+
+    /// Sets audio delay in seconds (e.g. 0.1 for +100ms, -0.05 for -50ms).
+    pub fn set_audio_delay(&self, delay_secs: f64) -> Result<(), VadError> {
+        self.mpv
+            .set_property("audio-delay", delay_secs)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Gets subtitle delay in seconds.
+    pub fn sub_delay(&self) -> Result<f64, VadError> {
+        Ok(self.get_property_optional::<f64>("sub-delay")?.unwrap_or(0.0))
+    }
+
+    /// Sets subtitle delay in seconds.
+    pub fn set_sub_delay(&self, delay_secs: f64) -> Result<(), VadError> {
+        self.mpv
+            .set_property("sub-delay", delay_secs)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Gets subtitle visibility.
+    pub fn sub_visibility(&self) -> Result<bool, VadError> {
+        Ok(self.get_property_optional::<bool>("sub-visibility")?.unwrap_or(true))
+    }
+
+    /// Toggles or sets subtitle visibility.
+    pub fn set_sub_visibility(&self, visible: bool) -> Result<(), VadError> {
+        self.mpv
+            .set_property("sub-visibility", visible)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Loads external subtitle file using mpv sub-add.
+    pub fn load_subtitles(&self, path: &str) -> Result<(), VadError> {
+        self.mpv
+            .command("sub-add", &[path, "select"])
+            .map_err(VadError::Mpv)?;
+        Ok(())
+    }
+
+    /// Gets color adjustment properties: (brightness, contrast, saturation, gamma) in range -100..=100.
+    pub fn color_adjustments(&self) -> Result<(i64, i64, i64, i64), VadError> {
+        let b = self.get_property_optional::<i64>("brightness")?.unwrap_or(0);
+        let c = self.get_property_optional::<i64>("contrast")?.unwrap_or(0);
+        let s = self.get_property_optional::<i64>("saturation")?.unwrap_or(0);
+        let g = self.get_property_optional::<i64>("gamma")?.unwrap_or(0);
+        Ok((b, c, s, g))
+    }
+
+    /// Sets color adjustment properties in range -100..=100.
+    pub fn set_color_adjustments(&self, b: i64, c: i64, s: i64, g: i64) -> Result<(), VadError> {
+        self.mpv
+            .set_property("brightness", b.clamp(-100, 100))
+            .map_err(VadError::Mpv)?;
+        self.mpv
+            .set_property("contrast", c.clamp(-100, 100))
+            .map_err(VadError::Mpv)?;
+        self.mpv
+            .set_property("saturation", s.clamp(-100, 100))
+            .map_err(VadError::Mpv)?;
+        self.mpv
+            .set_property("gamma", g.clamp(-100, 100))
+            .map_err(VadError::Mpv)?;
+        Ok(())
+    }
+
+    /// Resets color adjustments to neutral 0.
+    pub fn reset_color_adjustments(&self) -> Result<(), VadError> {
+        self.set_color_adjustments(0, 0, 0, 0)
+    }
+
+    /// Returns the list of audio devices reported by mpv (`audio-device-list`).
+    pub fn audio_devices(&self) -> Result<Vec<AudioDevice>, VadError> {
+        let count = self.get_property_optional::<i64>("audio-device-list/count")?.unwrap_or(0);
+        let mut devices = Vec::new();
+        for i in 0..count {
+            let name = self
+                .get_property_optional::<String>(&format!("audio-device-list/{i}/name"))?
+                .unwrap_or_default();
+            let description = self
+                .get_property_optional::<String>(&format!("audio-device-list/{i}/description"))?
+                .unwrap_or_else(|| name.clone());
+            devices.push(AudioDevice { name, description });
+        }
+        Ok(devices)
+    }
+
+    /// Returns the currently active audio device name (e.g. "auto", "pipewire", etc.).
+    pub fn audio_device(&self) -> Result<String, VadError> {
+        Ok(self.get_property_optional::<String>("audio-device")?.unwrap_or_else(|| "auto".to_string()))
+    }
+
+    /// Sets the active audio device by name.
+    pub fn set_audio_device(&self, name: &str) -> Result<(), VadError> {
+        self.mpv
+            .set_property("audio-device", name)
+            .map_err(VadError::Mpv)
+    }
+
+    /// Sets the audio filter chain (`af`) combining the 10-band equalizer and RNNoise (`arnndn`).
+    /// Frequencies: 32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz.
+    pub fn set_audio_filters(&self, eq_gains: &[f64; 10], rnnoise: bool) -> Result<(), VadError> {
+        const FREQS: [u32; 10] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+        let mut parts = Vec::new();
+
+        // Check if any EQ gain differs from 0.0 dB
+        let has_eq = eq_gains.iter().any(|&g| g.abs() > 0.01);
+        if has_eq {
+            for (f, &g) in FREQS.iter().zip(eq_gains.iter()) {
+                parts.push(format!("lavfi=[equalizer=f={f}:width_type=o:w=1:g={g:.1}]"));
+            }
+        }
+
+        if rnnoise {
+            parts.push("lavfi=[arnndn]".to_string());
+        }
+
+        let af_string = parts.join(",");
+        self.mpv.set_property("af", af_string.as_str()).map_err(VadError::Mpv)
     }
 
     /// Spawns a background thread listening for mpv events and updating `SharedPlayerState`.

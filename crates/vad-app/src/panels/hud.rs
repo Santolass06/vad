@@ -6,6 +6,15 @@ use eframe::egui::{
 };
 use vad_core::{AbLoopStatus, Player, SharedPlayerState, TrackInfo};
 
+/// Actions emitted by the HUD to toggle lateral panels or open external assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudAction {
+    TogglePlaylist,
+    ToggleEqualizer,
+    ToggleVideo,
+    OpenSubtitlesDialog,
+}
+
 /// Floating HUD panel overlaying the video canvas.
 /// Complies with PLANO_VAD.md §4.29 (fixed ~92% opacity, no blur shader)
 /// and implements 2-second auto-hide with HiDPI-friendly 20px hit targets.
@@ -234,7 +243,8 @@ impl HudPanel {
         player: &Player,
         shared_state: &Arc<SharedPlayerState>,
         whisper_disabled: bool,
-    ) {
+    ) -> Option<HudAction> {
+        let mut action = None;
         let is_paused = shared_state.is_paused();
         let current_time = shared_state.get_time_pos();
         let duration = shared_state.get_duration();
@@ -260,7 +270,7 @@ impl HudPanel {
         }
 
         if !self.is_visible {
-            return;
+            return None;
         }
 
         self.update_tracks_cache(player);
@@ -423,6 +433,19 @@ impl HudPanel {
                 ui.add(active_btn)
                     .on_hover_text("Transcrição com Whisper AI (disponível no Milestone M3)");
             }
+
+            ui.separator();
+
+            // Lateral Panel toggles
+            if ui.button("📜 Playlist").clicked() {
+                action = Some(HudAction::TogglePlaylist);
+            }
+            if ui.button("🎚 Equalizador").clicked() {
+                action = Some(HudAction::ToggleEqualizer);
+            }
+            if ui.button("🎞 Vídeo").clicked() {
+                action = Some(HudAction::ToggleVideo);
+            }
         });
 
         child_ui.add_space(6.0);
@@ -524,6 +547,10 @@ impl HudPanel {
                             self.poke();
                         }
                     }
+                    ui.separator();
+                    if ui.button("➕ Carregar legendas externas...").clicked() {
+                        action = Some(HudAction::OpenSubtitlesDialog);
+                    }
                 });
 
             // Right-aligned: Volume control with slider & mute
@@ -545,5 +572,7 @@ impl HudPanel {
                 }
             });
         });
+
+        action
     }
 }

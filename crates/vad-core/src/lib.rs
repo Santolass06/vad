@@ -1,11 +1,15 @@
 pub mod error;
 pub mod platform;
 pub mod player;
+pub mod playlist;
 pub mod state;
 
 pub use error::{ErrorAction, ErrorSeverity, VadError};
 pub use platform::PlatformIntegration;
-pub use player::{AbLoopStatus, GlProcAddressFn, Player, TrackInfo, VideoRenderContext};
+pub use player::{
+    AbLoopStatus, AudioDevice, GlProcAddressFn, Player, TrackInfo, VideoRenderContext,
+};
+pub use playlist::{PlaylistItem, Playlist, RepeatMode};
 pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
 };
@@ -325,5 +329,72 @@ mod tests {
 
         t1.join().expect("UI player thread panicked");
         t2.join().expect("MPRIS player thread panicked");
+    }
+
+    #[test]
+    fn test_player_video_and_audio_properties() {
+        let player = Player::new().expect("Failed to create player");
+
+        // Aspect ratio
+        player.set_video_aspect_override("16:9").expect("Failed to set aspect");
+        let aspect = player.video_aspect_override().expect("Failed to get aspect");
+        assert!((aspect - 16.0 / 9.0).abs() < 0.01);
+
+        player.set_video_aspect_override("-1").expect("Failed to reset aspect");
+        let aspect_auto = player.video_aspect_override().expect("Failed to get aspect");
+        assert!(aspect_auto <= 0.0);
+
+        // Rotation
+        player.set_video_rotate(90).expect("Failed to set rotate");
+        assert_eq!(player.video_rotate().unwrap(), 90);
+        player.set_video_rotate(0).expect("Failed to reset rotate");
+        assert_eq!(player.video_rotate().unwrap(), 0);
+
+        // Crop & Panscan
+        player.set_panscan(0.5).expect("Failed to set panscan");
+        assert!((player.panscan().unwrap() - 0.5).abs() < 0.01);
+        player.set_panscan(0.0).expect("Failed to reset panscan");
+
+        // Delay A/V
+        player.set_audio_delay(0.12).expect("Failed to set audio delay");
+        assert!((player.audio_delay().unwrap() - 0.12).abs() < 0.01);
+        player.set_audio_delay(0.0).expect("Failed to reset audio delay");
+
+        player.set_sub_delay(-0.08).expect("Failed to set sub delay");
+        assert!((player.sub_delay().unwrap() - (-0.08)).abs() < 0.01);
+        player.set_sub_delay(0.0).expect("Failed to reset sub delay");
+
+        // Subtitle visibility
+        player.set_sub_visibility(false).expect("Failed to set sub visibility");
+        assert!(!player.sub_visibility().unwrap());
+        player.set_sub_visibility(true).expect("Failed to enable sub visibility");
+        assert!(player.sub_visibility().unwrap());
+
+        // Color adjustments
+        player.set_color_adjustments(10, -5, 15, 0).expect("Failed to set color");
+        let (b, c, s, g) = player.color_adjustments().expect("Failed to get color");
+        assert_eq!(b, 10);
+        assert_eq!(c, -5);
+        assert_eq!(s, 15);
+        assert_eq!(g, 0);
+        player.reset_color_adjustments().expect("Failed to reset color");
+        let (b, c, s, g) = player.color_adjustments().expect("Failed to get color");
+        assert_eq!((b, c, s, g), (0, 0, 0, 0));
+
+        // Audio devices
+        let devices = player.audio_devices().expect("Failed to query audio devices");
+        assert!(!devices.is_empty(), "Audio devices list must have at least auto/default device");
+        let current_dev = player.audio_device().expect("Failed to get audio device");
+        assert!(!current_dev.is_empty());
+
+        // Audio filters (10-band EQ + RNNoise)
+        let gains = [-2.0, 1.0, 3.0, 4.0, 2.0, 0.0, -1.0, 2.0, 3.0, 1.0];
+        player.set_audio_filters(&gains, true).expect("Failed to set audio filters");
+        player.set_audio_filters(&[0.0; 10], false).expect("Failed to clear audio filters");
+
+        // Volume boost up to 200%
+        player.set_volume(150.0).expect("Failed to set volume boost");
+        let vol = player.volume().unwrap();
+        assert!((vol - 150.0).abs() < 1.0);
     }
 }

@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use eframe::egui;
 use tracing::{debug, info, warn};
 use vad_core::platform::PlatformIntegration;
-use vad_core::{PlaybackState, Player, SharedPlayerState, VadError};
+use vad_core::{PlaybackState, Player, Playlist, RepeatMode, SharedPlayerState, VadError};
 
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, Value};
@@ -87,7 +87,12 @@ impl MprisRoot {
 
     #[zbus(property)]
     fn identity(&self) -> &str {
-        "VAD Video Player"
+        "VAD"
+    }
+
+    #[zbus(property)]
+    fn desktop_entry(&self) -> &str {
+        "vad"
     }
 
     #[zbus(property)]
@@ -122,10 +127,6 @@ impl MprisRoot {
     fn quit(&self) {
         info!("MPRIS Root.Quit invoked, requesting clean application shutdown");
         self.quit_requested.store(true, Ordering::Relaxed);
-        // `quit_requested` is only polled from the egui update loop, which may not
-        // be repainting (e.g. paused, no media loaded) when Quit arrives — force a
-        // frame so the request is picked up immediately instead of waiting for the
-        // next unrelated repaint.
         self.egui_ctx.request_repaint();
     }
 }
@@ -135,6 +136,7 @@ struct MprisPlayer {
     player: Player,
     shared_state: Arc<SharedPlayerState>,
     state: Arc<RwLock<MprisState>>,
+    playlist: Arc<Mutex<Playlist>>,
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
@@ -148,8 +150,23 @@ impl MprisPlayer {
     }
 
     #[zbus(property)]
-    fn loop_status(&self) -> &str {
-        "None"
+    fn loop_status(&self) -> String {
+        self.playlist
+            .lock()
+            .map(|p| p.repeat().as_mpris_str().to_string())
+            .unwrap_or_else(|_| "None".to_string())
+    }
+
+    #[zbus(property)]
+    fn set_loop_status(&self, status: &str) {
+        if let Ok(mut p) = self.playlist.lock() {
+            let mode = match status {
+                "Track" => RepeatMode::Single,
+                "Playlist" => RepeatMode::All,
+                _ => RepeatMode::Off,
+            };
+            p.set_repeat(mode);
+        }
     }
 
     #[zbus(property)]
@@ -159,7 +176,17 @@ impl MprisPlayer {
 
     #[zbus(property)]
     fn shuffle(&self) -> bool {
-        false
+        self.playlist
+            .lock()
+            .map(|p| p.shuffle())
+            .unwrap_or(false)
+    }
+
+    #[zbus(property)]
+    fn set_shuffle(&self, shuffle: bool) {
+        if let Ok(mut p) = self.playlist.lock() {
+            p.set_shuffle(shuffle);
+        }
     }
 
     #[zbus(property)]
@@ -240,21 +267,46 @@ impl MprisPlayer {
 
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        false
+        self.playlist
+            .lock()
+            .map(|p| p.has_next())
+            .unwrap_or(false)
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        false
+        let has_prev = self
+            .playlist
+            .lock()
+            .map(|p| p.has_previous())
+            .unwrap_or(false);
+        has_prev || (self.shared_state.get_time_pos() > 3.0)
     }
 
     fn next(&self) {
-        debug!("MPRIS Player.Next invoked (single-file scope: no-op)");
+        debug!("MPRIS Player.Next invoked");
+        if let Ok(mut p) = self.playlist.lock() {
+            if let Some(item) = p.next() {
+                if !item.is_url() {
+                    let path = item.location();
+                    let _ = self.player.load_file(&path);
+                }
+            }
+        }
     }
 
     fn previous(&self) {
-        debug!("MPRIS Player.Previous invoked (seeking to start)");
-        let _ = self.player.seek_absolute(0.0);
+        debug!("MPRIS Player.Previous invoked");
+        if self.shared_state.get_time_pos() > 3.0 {
+            let _ = self.player.seek_absolute(0.0);
+        } else if let Ok(mut p) = self.playlist.lock() {
+            if let Some(item) = p.previous() {
+                if !item.is_url() {
+                    let path = item.location();
+                    let _ = self.player.load_file(&path);
+                }
+            }
+        }
     }
 
     fn pause(&self) {
@@ -323,6 +375,7 @@ impl MprisServer {
     pub fn new(
         player: Player,
         shared_state: Arc<SharedPlayerState>,
+        playlist: Arc<Mutex<Playlist>>,
         egui_ctx: egui::Context,
     ) -> Result<Self, VadError> {
         let state = Arc::new(RwLock::new(MprisState::default()));
@@ -348,6 +401,7 @@ impl MprisServer {
                         player,
                         shared_state,
                         state: Arc::clone(&state),
+                        playlist,
                     },
                 )
                 .map_err(|e| VadError::Platform(format!("Failed to register MPRIS player: {e}")))?;
@@ -547,7 +601,7 @@ impl PlatformIntegration for MprisServer {
             if !self.bus_name.is_empty() {
                 let bus_name = self.bus_name.clone();
                 let conn_clone = conn.clone();
-                let _ = zbus::block_on(async move {
+                zbus::block_on(async move {
                     let _ = conn_clone.release_name(bus_name).await;
                 });
             }
@@ -568,8 +622,9 @@ mod tests {
     fn test_mpris_server_lifecycle_and_event_handling() {
         let player = Player::new().expect("Failed to initialize player");
         let shared_state = Arc::new(SharedPlayerState::new());
+        let playlist = Arc::new(Mutex::new(Playlist::new()));
 
-        let mut server = MprisServer::new(player, shared_state, egui::Context::default())
+        let mut server = MprisServer::new(player, shared_state, playlist, egui::Context::default())
             .expect("Failed to create MprisServer");
         assert_eq!(server.name(), "mpris");
 
@@ -637,5 +692,60 @@ mod tests {
         assert!(!is_allowed_mpris_uri("smb://nas/share/video.mp4"));
         assert!(!is_allowed_mpris_uri("ftp://ftp.example.com/file"));
         assert!(!is_allowed_mpris_uri("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn test_mpris_playlist_sync_and_navigation() {
+        let player = Player::new().expect("Failed to initialize player");
+        let shared_state = Arc::new(SharedPlayerState::new());
+        let playlist = Arc::new(Mutex::new(Playlist::new()));
+        let state = Arc::new(RwLock::new(MprisState::default()));
+
+        let mpris_player = MprisPlayer {
+            player,
+            shared_state: Arc::clone(&shared_state),
+            state: Arc::clone(&state),
+            playlist: Arc::clone(&playlist),
+        };
+
+        // Empty playlist
+        assert!(!mpris_player.can_go_next());
+        assert!(!mpris_player.can_go_previous());
+        assert_eq!(mpris_player.loop_status(), "None");
+        assert!(!mpris_player.shuffle());
+
+        // Set loop status via MPRIS
+        mpris_player.set_loop_status("Track");
+        assert_eq!(mpris_player.loop_status(), "Track");
+        mpris_player.set_loop_status("Playlist");
+        assert_eq!(mpris_player.loop_status(), "Playlist");
+        mpris_player.set_loop_status("None");
+        assert_eq!(mpris_player.loop_status(), "None");
+
+        // Set shuffle
+        mpris_player.set_shuffle(true);
+        assert!(mpris_player.shuffle());
+        mpris_player.set_shuffle(false);
+        assert!(!mpris_player.shuffle());
+
+        // Populate playlist
+        {
+            let mut p = playlist.lock().unwrap();
+            p.add(vad_core::PlaylistItem::from_file("/tmp/track1.mp3"));
+            p.add(vad_core::PlaylistItem::from_file("/tmp/track2.mp3"));
+            p.set_current(0);
+        }
+
+        assert!(mpris_player.can_go_next());
+        assert!(!mpris_player.can_go_previous());
+
+        // Navigation
+        mpris_player.next();
+        {
+            let p = playlist.lock().unwrap();
+            assert_eq!(p.current_index(), Some(1));
+        }
+        assert!(!mpris_player.can_go_next());
+        assert!(mpris_player.can_go_previous());
     }
 }
