@@ -169,7 +169,11 @@ impl HudPanel {
         let track_h = if is_hovered || is_dragged { 6.0 } else { 3.5 };
         let track_rect = Rect::from_center_size(rect.center(), vec2(rect.width(), track_h));
 
-        let max_vol = 100.0_f64;
+        // Player::set_volume/volume() operate on a unified 0..=200 scale (the
+        // Equalizer panel's "Volume Boost" writes the same property up to 200%),
+        // so this slider must span the same range — otherwise dragging it here
+        // would silently clamp a boosted volume back down to 100%.
+        let max_vol = 200.0_f64;
         let mut new_vol = None;
 
         let fraction = if is_dragged || response.clicked() {
