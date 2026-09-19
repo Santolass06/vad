@@ -48,9 +48,20 @@ não resultou tem valor para quem vier depois.
   - Adicionados testes de integração em `vad-app` para timeout do toast, regras de threshold de retoma e oferta de resume no arranque.
 - Bateria de testes do workspace completa: 37/37 testes aprovados.
 
+### 2026-09-19 — revisão pós-sprint (correções)
+
+- `util::is_allowed_url_scheme` fatiava a `str` por bytes (`trimmed[..n]`) e entrava em pânico com entradas cujo byte de corte cai a meio de um carácter multi-byte (ex.: `vad éééé.mp4`). Passou a comparar bytes; teste de regressão em `test_url_scheme_allowlist`.
+- Ecrã de boas-vindas: o título recente era truncado com `&title[..35]` (mesmo pânico com títulos acentuados). Passou a truncar por caracteres.
+- Resume: "Continuar"/"Começar do início" no arranque chamavam `load_media` e faziam `seek` logo a seguir — o `loadfile` é assíncrono, por isso o seek era descartado e o toast de retoma reaparecia (o `load_media` voltava a oferecê-lo). Novo `load_media_at` + `pending_seek` aplicado no evento `FileLoaded`; o clique num recente do ecrã de boas-vindas usa o mesmo caminho.
+- Equalizador/RNNoise restaurados de `config.toml` só apareciam na UI; o filtro `af` do mpv não era aplicado até o utilizador mexer no painel. Aplicado no arranque.
+- Predicado de retoma (`> 3s` e fora dos últimos 5s) estava copiado em 4 sítios (dois deles nos testes, que o reescreviam em vez de chamar o código real); passou a `RecentEntry::is_resumable`, com teste próprio.
+- `test_mpv_config_isolation`: restaura o `mpv.conf` original byte a byte (antes um ficheiro não-UTF-8 ficava substituído pela sentinela), remove o diretório que criou, e falha se `speed`/`volume` não puderem ser lidos (antes o `unwrap_or` fazia o teste passar sem verificar nada).
+
 ## Desvios face ao Sprint_Planning_05.md
 
-Nenhum. Todas as 4 tarefas planeadas foram integralmente implementadas de acordo com as especificações técnicas de `PLANO_VAD.md`.
+Nenhum no âmbito das 4 tarefas. Uma revisão pós-sprint encontrou defeitos de implementação (ver a entrada «revisão pós-sprint» no registo acima), já corrigidos.
+
+**Por verificar:** a reprodução real de um URL de YouTube via `yt-dlp` (critério de saída de M2) não foi exercitada — ver `Sprint_Report_05.md`.
 
 ## Problemas encontrados
 

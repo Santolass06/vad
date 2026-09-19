@@ -8,7 +8,7 @@
 
 ## Resumo
 
-A Sprint 05 encerra oficialmente o **Milestone M2 (Player completo e robusto)** do VAD. Todas as metas delineadas no planeamento e nas diretrizes de arquitetura do `PLANO_VAD.md` (§3, §4.6, §4.13, §4.22, §4.27, §4.30, §5, §7, §9, §11) foram rigorosamente implementadas e testadas.
+A Sprint 05 completa as tarefas do **Milestone M2 (Player completo e robusto)** do VAD; o fecho formal depende de um teste manual de reprodução real por URL (ver «Critério de saída»). As metas do planeamento e do `PLANO_VAD.md` (§3, §4.6, §4.13, §4.22, §4.27, §4.30, §5, §7, §9, §11) estão implementadas e cobertas por testes automáticos, com a exceção indicada.
 
 Os desenvolvimentos centraram-se em quatro eixos essenciais:
 1. **Isolamento de configuração e reprodução online:** A biblioteca `libmpv` foi configurada de forma estritamente isolada do ambiente do utilizador, definindo `config-dir` para uma diretoria exclusiva (`~/.config/vad/mpv`) e passando `--no-config` (`config=false`). Foram ativados explicitamente os scripts internos e o gancho do `yt-dlp` (`load-scripts=true` e `ytdl=true`) acompanhados de um `network-timeout=30` (§4.22). Todo o carregamento de URLs passa agora por uma validação estrita de esquema permitindo apenas `http://`, `https://` e `rtsp://`, rejeitando peremptoriamente esquemas locais ou inseguros como `file://` ou `smb://` (§4.27). O isolamento foi comprovado através de teste unitário/integração que cria uma configuração sentinela em `~/.config/mpv/mpv.conf` e atesta a sua não-herança.
@@ -31,12 +31,12 @@ Os desenvolvimentos centraram-se em quatro eixos essenciais:
 
 ## Critério de saída — cumprido?
 
-**Sim. Todos os critérios de saída do Milestone M2 foram integralmente cumpridos:**
+**Parcialmente verificado.** Isolamento de configuração, esquema de URL, retoma e escrita atómica estão cobertos por testes ou por leitura de código; **a reprodução real de um stream (YouTube via `yt-dlp`) ainda não foi exercitada** — nesta máquina não há `mpv` instalado nem `~/.config/mpv` pessoal, pelo que o critério «testar numa máquina com config mpv pessoal existente» foi simulado com um `mpv.conf` sentinela. Fechar M2 fica condicionado a esse teste manual (ver §10 do plano).
 
 1. **Isolamento de configuração do `libmpv` confirmado:**
    - Foi desenvolvido o teste de regressão `test_mpv_config_isolation` que escreve um ficheiro sentinela em `~/.config/mpv/mpv.conf` (com valores agressivos como `speed=2.5` e `volume=42`).
    - A inicialização do `Player` do VAD ignora completamente essas opções, mantendo `speed=1.0` e `volume=100.0`.
-   - A reprodução via `yt-dlp` e scripts internos opera exclusivamente dentro do ambiente segregado de `~/.config/vad/mpv`.
+   - O teste falha (confirmado) quando o isolamento é desativado, pelo que mede de facto a não-herança. A configuração é feita para que a reprodução via `yt-dlp` e os scripts internos usem `~/.config/vad/mpv`, mas isto **não foi observado com um stream real**.
 2. **Reabertura da aplicação com proposta de continuidade:**
    - Ao iniciar a aplicação com histórico existente em `recentes.json` (progresso superior a 3 segundos e fora da margem de conclusão do vídeo), surge de imediato o *toast* de resume.
    - O utilizador pode optar por saltar para a posição registada, começar do início ou ignorar (fecho automático decorridos 8 segundos ou pressionando `Escape`).
@@ -76,7 +76,11 @@ Com o fecho do Milestone M2, o reprodutor multimédia está plenamente estabelec
 
 ---
 
+## Revisão pós-sprint
+
+Corrigidos após revisão (detalhe em `Sprint_05.md`): pânico em `is_allowed_url_scheme` e no truncamento de títulos com carácter multi-byte; seek de retoma descartado e toast repetido no arranque; equalizador restaurado sem ser aplicado ao mpv; segurança e utilidade do `test_mpv_config_isolation`. Sem cobertura automática: a ordem `loadfile` → `FileLoaded` → seek (exige uma janela eframe).
+
 ## Conclusão
 
-O **Milestone M2 está formalmente CONCLUÍDO e FECHADO**.
-Total de testes automatizados no workspace: **37 aprovados** (24 em `vad-core`, 13 em `vad-app`), com compilação limpa e cobertura abrangente das regras arquiteturais.
+O **Milestone M2 está funcionalmente completo, com um critério por verificar manualmente** (reprodução real de YouTube via `yt-dlp`).
+Total de testes automatizados no workspace: **37 aprovados** (25 em `vad-core`, 12 em `vad-app`), com compilação limpa e cobertura abrangente das regras arquiteturais.

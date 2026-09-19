@@ -68,6 +68,8 @@ pub struct VadApp {
     recents: RecentsStore,
     config: VadConfig,
     resume_toast: Option<ResumeToastState>,
+    /// Position to seek to once mpv reports the file as loaded (`loadfile` is asynchronous).
+    pending_seek: Option<f64>,
     last_saved_time_pos: f64,
     last_saved_instant: Instant,
 }
@@ -171,6 +173,11 @@ impl VadApp {
 
         if let Some(ref p) = player {
             let _ = p.set_volume(config.player.volume);
+            // The panel only pushes filters to mpv on interaction; without this the restored
+            // gains/RNNoise show in the UI while the audio stays flat.
+            if audio_panel.rnnoise || audio_panel.gains != [0.0; 10] {
+                let _ = p.set_audio_filters(&audio_panel.gains, audio_panel.rnnoise);
+            }
             if let Some(ref dev) = config.player.audio_device {
                 let _ = p.set_audio_device(dev);
             }
@@ -182,9 +189,7 @@ impl VadApp {
         let mut resume_toast = None;
         if initial_file.is_none() && config.recents.resume_enabled {
             if let Some(recent) = recents.most_recent() {
-                if recent.timestamp > 3.0
-                    && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0)
-                {
+                if recent.is_resumable() {
                     resume_toast = Some(ResumeToastState {
                         location: recent.location.clone(),
                         title: recent.title.clone(),
@@ -226,6 +231,7 @@ impl VadApp {
             recents,
             config,
             resume_toast,
+            pending_seek: None,
             last_saved_time_pos: 0.0,
             last_saved_instant: Instant::now(),
         };
@@ -237,19 +243,24 @@ impl VadApp {
         app
     }
 
-    pub fn load_media(&mut self, path: &str) {
+    /// Loads `path` into mpv. Returns whether mpv accepted it.
+    pub fn load_media(&mut self, path: &str) -> bool {
         let trimmed = path.trim();
         if trimmed.is_empty() {
-            return;
+            return false;
         }
 
+        // A seek queued for the previous file must not leak onto this one.
+        self.pending_seek = None;
         let is_url = is_allowed_url_scheme(trimmed);
+        let mut loaded = false;
 
         if let Some(ref player) = self.player {
             info!("Loading media: {}", trimmed);
             if let Err(e) = player.load_file(trimmed) {
                 self.last_error = Some(format!("Erro ao carregar mídia: {e:?}"));
             } else {
+                loaded = true;
                 self.current_media_path = Some(trimmed.to_string());
                 self.current_title = if is_url {
                     trimmed.to_string()
@@ -278,9 +289,7 @@ impl VadApp {
                 // Check recents for resume toast dialog (§4.6, design/Dialogs.dc.html)
                 if self.config.recents.resume_enabled {
                     if let Some(recent) = self.recents.get(trimmed) {
-                        if recent.timestamp > 3.0
-                            && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0)
-                        {
+                        if recent.is_resumable() {
                             self.resume_toast = Some(ResumeToastState {
                                 location: trimmed.to_string(),
                                 title: self.current_title.clone(),
@@ -295,6 +304,17 @@ impl VadApp {
 
                 self.hud.poke();
             }
+        }
+        loaded
+    }
+
+    /// Loads `path` and seeks to `start` once mpv reports it loaded — a seek issued right after
+    /// `loadfile` runs before the file is open and is silently dropped. The caller has already
+    /// chosen where to play from (resume / start over), so no resume toast is offered.
+    fn load_media_at(&mut self, path: &str, start: f64) {
+        if self.load_media(path) {
+            self.resume_toast = None;
+            self.pending_seek = (start > 0.0).then_some(start);
         }
     }
 
@@ -335,6 +355,11 @@ impl VadApp {
                                     item.set_duration(Some(dur));
                                 }
                             }
+                        }
+                    }
+                    if let Some(ts) = self.pending_seek.take() {
+                        if let Some(ref p) = self.player {
+                            let _ = p.seek_absolute(ts);
                         }
                     }
                     self.update_hwdec_label();
@@ -891,8 +916,9 @@ impl VadApp {
                     recents_ui.horizontal(|ui| {
                         let icon = if entry.is_url { "🌐 " } else { "🎬 " };
                         let summary = entry.formatted_summary();
-                        let title_display = if entry.title.len() > 38 {
-                            format!("{icon}{}...", &entry.title[..35])
+                        let title_display = if entry.title.chars().count() > 38 {
+                            let head: String = entry.title.chars().take(35).collect();
+                            format!("{icon}{head}...")
                         } else {
                             format!("{icon}{}", entry.title)
                         };
@@ -905,12 +931,7 @@ impl VadApp {
                     });
                 }
                 if let Some((loc, ts)) = open_item {
-                    self.load_media(&loc);
-                    if ts > 0.0 {
-                        if let Some(ref p) = self.player {
-                            let _ = p.seek_absolute(ts);
-                        }
-                    }
+                    self.load_media_at(&loc, ts);
                 }
             }
         });
@@ -1109,20 +1130,12 @@ impl VadApp {
                     });
             });
 
-        if action_continue {
+        if action_continue || action_start_over {
+            let start = if action_continue { toast.timestamp } else { 0.0 };
             if toast.is_startup_resume {
-                self.load_media(&toast.location);
-            }
-            if let Some(ref p) = self.player {
-                let _ = p.seek_absolute(toast.timestamp);
-                let _ = p.play();
-            }
-        } else if action_start_over {
-            if toast.is_startup_resume {
-                self.load_media(&toast.location);
-            }
-            if let Some(ref p) = self.player {
-                let _ = p.seek_absolute(0.0);
+                self.load_media_at(&toast.location, start);
+            } else if let Some(ref p) = self.player {
+                let _ = p.seek_absolute(start);
                 let _ = p.play();
             }
         } else if !action_close {
@@ -1582,32 +1595,6 @@ mod tests {
         // Advance beyond 8 seconds -> expires
         toast.time_left -= 5.5;
         assert!(toast.time_left <= 0.0);
-    }
-
-    #[test]
-    fn test_startup_resume_threshold_logic() {
-        // Entry with < 3.0s should NOT trigger resume toast
-        let mut recents = RecentsStore::new();
-        recents.add_or_update("/short.mp4", "Short", 2.0, Some(100.0), false);
-        let recent = recents.most_recent().unwrap();
-        let should_resume = recent.timestamp > 3.0
-            && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0);
-        assert!(!should_resume);
-
-        // Entry with finished video (within 5s of duration) should NOT trigger resume
-        recents.add_or_update("/done.mp4", "Done", 98.0, Some(100.0), false);
-        let recent_done = recents.most_recent().unwrap();
-        let should_resume_done = recent_done.timestamp > 3.0
-            && recent_done.duration.is_none_or(|dur| recent_done.timestamp < dur - 5.0);
-        assert!(!should_resume_done);
-
-        // Meaningful progress (>3s and before end) SHOULD trigger resume
-        recents.add_or_update("/video.mp4", "Video", 2052.0, Some(5400.0), false);
-        let recent_valid = recents.most_recent().unwrap();
-        let should_resume_valid = recent_valid.timestamp > 3.0
-            && recent_valid.duration.is_none_or(|dur| recent_valid.timestamp < dur - 5.0);
-        assert!(should_resume_valid);
-        assert_eq!(recent_valid.formatted_summary(), "00:34:12 de 01:30:00");
     }
 
     #[test]

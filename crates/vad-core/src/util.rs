@@ -45,11 +45,14 @@ pub fn vad_config_path() -> PathBuf {
 /// Only `http://`, `https://`, and `rtsp://` are permitted.
 /// Rejects `file://`, `smb://`, `ftp://`, and other arbitrary schemes.
 pub fn is_allowed_url_scheme(input: &str) -> bool {
-    let trimmed = input.trim();
+    let trimmed = input.trim().as_bytes();
     const ALLOWED_SCHEMES: [&str; 3] = ["http://", "https://", "rtsp://"];
-    ALLOWED_SCHEMES
-        .iter()
-        .any(|scheme| trimmed.len() >= scheme.len() && trimmed[..scheme.len()].eq_ignore_ascii_case(scheme))
+    // Compare bytes: slicing the `str` would panic when the cut lands inside a multi-byte char.
+    ALLOWED_SCHEMES.iter().any(|scheme| {
+        trimmed
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme.as_bytes()))
+    })
 }
 
 /// Atomic file writer adhering to PLANO_VAD.md §4.30.
@@ -121,6 +124,10 @@ mod tests {
         assert!(!is_allowed_url_scheme("javascript:alert(1)"));
         assert!(!is_allowed_url_scheme("/local/path/to/movie.mp4"));
         assert!(!is_allowed_url_scheme(""));
+
+        // Multi-byte input must be rejected, not panic on a non-char-boundary slice
+        assert!(!is_allowed_url_scheme("éééé.mp4"));
+        assert!(!is_allowed_url_scheme("日本語日本語://x"));
     }
 
     #[test]

@@ -423,12 +423,9 @@ mod tests {
         };
 
         let conf_file = home_mpv_dir.join("mpv.conf");
-        let already_existed = conf_file.exists();
-        let original_content = if already_existed {
-            std::fs::read_to_string(&conf_file).ok()
-        } else {
-            None
-        };
+        // Raw bytes: a non-UTF-8 personal config must be restored byte-for-byte, not dropped.
+        let original_content = std::fs::read(&conf_file).ok();
+        let dir_existed = home_mpv_dir.exists();
 
         let _ = std::fs::create_dir_all(&home_mpv_dir);
         let sentinel_content = "speed=2.5\nvolume=42\n";
@@ -438,17 +435,21 @@ mod tests {
         let player_res = Player::new();
 
         // Restore original state immediately to guarantee cleanup even if assertions fail
-        if already_existed {
-            if let Some(content) = original_content {
+        match original_content {
+            Some(content) => {
                 let _ = std::fs::write(&conf_file, content);
             }
-        } else {
-            let _ = std::fs::remove_file(&conf_file);
+            None => {
+                let _ = std::fs::remove_file(&conf_file);
+                if !dir_existed {
+                    let _ = std::fs::remove_dir(&home_mpv_dir);
+                }
+            }
         }
 
         let player = player_res.expect("Failed to initialize Player");
-        let speed = player.speed().unwrap_or(1.0);
-        let vol = player.volume().unwrap_or(100.0);
+        let speed = player.speed().expect("Failed to read speed");
+        let vol = player.volume().expect("Failed to read volume");
 
         // Speed must be 1.0 (default), NOT 2.5
         assert_eq!(

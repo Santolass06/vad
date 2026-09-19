@@ -43,6 +43,12 @@ impl RecentEntry {
         format!("{h:02}:{m:02}:{s:02}")
     }
 
+    /// Whether there is enough progress to offer "continuar de onde parou" (§4.6):
+    /// more than 3s in and not within the last 5s of a known duration.
+    pub fn is_resumable(&self) -> bool {
+        self.timestamp > 3.0 && self.duration.is_none_or(|dur| self.timestamp < dur - 5.0)
+    }
+
     /// Formatted current timestamp (e.g. "00:34:12").
     pub fn formatted_timestamp(&self) -> String {
         Self::format_seconds(self.timestamp)
@@ -294,6 +300,23 @@ mod tests {
         assert_eq!(entry.formatted_summary(), "00:34:12 de 01:30:00");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_recent_entry_is_resumable() {
+        let mut store = RecentsStore::new();
+        store.add_or_update("/short.mp4", "Short", 2.0, Some(100.0), false);
+        assert!(!store.most_recent().unwrap().is_resumable());
+
+        store.add_or_update("/done.mp4", "Done", 98.0, Some(100.0), false);
+        assert!(!store.most_recent().unwrap().is_resumable());
+
+        store.add_or_update("/video.mp4", "Video", 2052.0, Some(5400.0), false);
+        assert!(store.most_recent().unwrap().is_resumable());
+
+        // Unknown duration (e.g. live/URL) still resumes once past the 3s threshold
+        store.add_or_update("https://example.com/s", "Stream", 60.0, None, true);
+        assert!(store.most_recent().unwrap().is_resumable());
     }
 
     #[test]
