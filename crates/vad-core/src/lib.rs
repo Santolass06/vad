@@ -410,44 +410,58 @@ mod tests {
         assert!((vol - 150.0).abs() < 1.0);
     }
 
+    /// Plants a sentinel `~/.config/mpv/mpv.conf` for the lifetime of the guard and restores the
+    /// user's original file (byte-for-byte, raw bytes so a non-UTF-8 config survives) on drop —
+    /// also when an assertion panics. Serialised: both tests below share the same file.
+    struct SentinelMpvConf {
+        conf_file: std::path::PathBuf,
+        dir: std::path::PathBuf,
+        original: Option<Vec<u8>>,
+        dir_existed: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SentinelMpvConf {
+        fn create(content: &str) -> Option<Self> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty())?;
+            let dir = std::path::PathBuf::from(home).join(".config").join("mpv");
+            let conf_file = dir.join("mpv.conf");
+            let original = std::fs::read(&conf_file).ok();
+            let dir_existed = dir.exists();
+            std::fs::create_dir_all(&dir).expect("Failed to create ~/.config/mpv");
+            std::fs::write(&conf_file, content).expect("Failed to write sentinel mpv.conf");
+            Some(Self { conf_file, dir, original, dir_existed, _lock })
+        }
+    }
+
+    impl Drop for SentinelMpvConf {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(content) => {
+                    let _ = std::fs::write(&self.conf_file, content);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.conf_file);
+                    if !self.dir_existed {
+                        let _ = std::fs::remove_dir(&self.dir);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_mpv_config_isolation() {
         // Exit criterion verification (§9, Sprint_Planning_05):
         // Ensure VAD's libmpv instance does NOT inherit user's ~/.config/mpv.
-        // We temporarily create a sentinel setting (speed=2.5, volume=42) in ~/.config/mpv/mpv.conf.
-        let home_mpv_dir = match std::env::var("HOME") {
-            Ok(home) if !home.trim().is_empty() => {
-                std::path::PathBuf::from(home).join(".config").join("mpv")
-            }
-            _ => return,
+        let Some(_sentinel) = SentinelMpvConf::create("speed=2.5\nvolume=42\n") else {
+            return;
         };
 
-        let conf_file = home_mpv_dir.join("mpv.conf");
-        // Raw bytes: a non-UTF-8 personal config must be restored byte-for-byte, not dropped.
-        let original_content = std::fs::read(&conf_file).ok();
-        let dir_existed = home_mpv_dir.exists();
-
-        let _ = std::fs::create_dir_all(&home_mpv_dir);
-        let sentinel_content = "speed=2.5\nvolume=42\n";
-        std::fs::write(&conf_file, sentinel_content).expect("Failed to write sentinel mpv.conf");
-
         // Initialize Player using Player::new() with isolated config-dir and --no-config
-        let player_res = Player::new();
-
-        // Restore original state immediately to guarantee cleanup even if assertions fail
-        match original_content {
-            Some(content) => {
-                let _ = std::fs::write(&conf_file, content);
-            }
-            None => {
-                let _ = std::fs::remove_file(&conf_file);
-                if !dir_existed {
-                    let _ = std::fs::remove_dir(&home_mpv_dir);
-                }
-            }
-        }
-
-        let player = player_res.expect("Failed to initialize Player");
+        let player = Player::new().expect("Failed to initialize Player");
         let speed = player.speed().expect("Failed to read speed");
         let vol = player.volume().expect("Failed to read volume");
 
@@ -461,6 +475,95 @@ mod tests {
             vol, 100.0,
             "mpv must not inherit volume=42 from user ~/.config/mpv/mpv.conf"
         );
+    }
+
+    /// M2 exit criterion (§9): a YouTube URL plays through yt-dlp while a personal
+    /// `~/.config/mpv/mpv.conf` exists. The sentinel `ytdl-format` matches no format, so if it
+    /// were inherited yt-dlp would fail to resolve the stream.
+    /// Network-dependent, hence ignored by default: `cargo test -p vad-core -- --ignored`.
+    #[test]
+    #[ignore = "needs network access and yt-dlp"]
+    fn test_youtube_url_playback_ignores_user_mpv_config() {
+        let Some(_sentinel) = SentinelMpvConf::create("ytdl-format=vad-nonexistent-format\n")
+        else {
+            return;
+        };
+
+        let player = Player::new().expect("Failed to initialize Player");
+        // "Me at the zoo", the first YouTube upload (19s)
+        player
+            .load_url("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+            .expect("Failed to load URL");
+
+        let start = std::time::Instant::now();
+        let mut duration = None;
+        while start.elapsed() < std::time::Duration::from_secs(60) {
+            if let Ok(Some(d)) = player.duration() {
+                duration = Some(d);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let duration = duration.expect("yt-dlp did not resolve the stream within 60s");
+        assert!(
+            (18.0..=20.0).contains(&duration),
+            "unexpected duration {duration}"
+        );
+    }
+
+    /// Premise behind `VadApp::load_media_at`: `loadfile` is asynchronous, so a seek issued right
+    /// after it is not applied — the seek has to wait until the file is loaded.
+    #[test]
+    fn test_seek_applies_only_after_file_loaded() {
+        let test_file = "/tmp/vad_test_seek_after_load.mp4";
+        let generated = std::path::Path::new(test_file).exists()
+            || std::process::Command::new("ffmpeg")
+                .args([
+                    "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=6",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "30",
+                    "-c:a", "aac", "-shortest", test_file,
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        if !generated {
+            eprintln!("Skipping seek test: ffmpeg unavailable or failed to generate fixture");
+            return;
+        }
+
+        let player = Player::new().expect("Failed to create player");
+        player.load_file(test_file).expect("Failed to load file");
+
+        // Right after `loadfile` nothing is open yet: the seek must not take effect.
+        let early = player.seek_absolute(4.0);
+        let early_pos = player.time_pos().ok().flatten().unwrap_or(0.0);
+        assert!(
+            early.is_err() || early_pos < 1.0,
+            "seek right after loadfile unexpectedly applied (pos {early_pos})"
+        );
+
+        // Once the duration is known the file is loaded and the seek works.
+        let start = std::time::Instant::now();
+        while player.duration().ok().flatten().is_none() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "file never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        player.seek_absolute(4.0).expect("seek after load failed");
+        let start = std::time::Instant::now();
+        loop {
+            let pos = player.time_pos().ok().flatten().unwrap_or(0.0);
+            if pos >= 3.9 {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "seek after load not applied (pos {pos})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let _ = std::fs::remove_file(test_file);
     }
 
     #[test]

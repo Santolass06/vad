@@ -57,11 +57,19 @@ não resultou tem valor para quem vier depois.
 - Predicado de retoma (`> 3s` e fora dos últimos 5s) estava copiado em 4 sítios (dois deles nos testes, que o reescreviam em vez de chamar o código real); passou a `RecentEntry::is_resumable`, com teste próprio.
 - `test_mpv_config_isolation`: restaura o `mpv.conf` original byte a byte (antes um ficheiro não-UTF-8 ficava substituído pela sentinela), remove o diretório que criou, e falha se `speed`/`volume` não puderem ser lidos (antes o `unwrap_or` fazia o teste passar sem verificar nada).
 
+### 2026-09-19 — verificação do critério de saída
+
+- Novo `test_youtube_url_playback_ignores_user_mpv_config` (`#[ignore]`, rede): `~/.config/mpv/mpv.conf` sentinela com `ytdl-format=vad-nonexistent-format`, `Player::new()` + `load_url` a «Me at the zoo» (YouTube). Resultado: `yt-dlp` resolve, duração 19 s, mpv abre o áudio; «Video: no video» porque o teste não tem contexto OpenGL (não é falha do stream).
+- Controlo negativo (alteração temporária, revertida): com `config=true` e `config-dir=~/.config/mpv` o `ytdl_hook` falha com «Requested format is not available» e o teste falha após 60 s. Prova que o isolamento é o que impede a herança — ao contrário do teste `speed`/`volume`, que passaria sempre porque a libmpv não carrega config por omissão.
+- `SentinelMpvConf` (guarda RAII com `Drop` e trava): substitui o código de backup/restauro do `mpv.conf` duplicado; restaura também quando uma asserção falha e serializa os dois testes que partilham o ficheiro.
+- Novo `test_seek_applies_only_after_file_loaded`: confirma a premissa do `load_media_at` (seek antes de carregar não se aplica; depois sim).
+- `yt-dlp` avisa que não encontra runtime JavaScript (só `deno` por omissão) — registado como dívida técnica no relatório.
+
 ## Desvios face ao Sprint_Planning_05.md
 
 Nenhum no âmbito das 4 tarefas. Uma revisão pós-sprint encontrou defeitos de implementação (ver a entrada «revisão pós-sprint» no registo acima), já corrigidos.
 
-**Por verificar:** a reprodução real de um URL de YouTube via `yt-dlp` (critério de saída de M2) não foi exercitada — ver `Sprint_Report_05.md`.
+O critério de saída de M2 (URL do YouTube com config mpv pessoal presente) foi verificado depois — ver a entrada «verificação do critério de saída» acima e `Sprint_Report_05.md`.
 
 ## Problemas encontrados
 
