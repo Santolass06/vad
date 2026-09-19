@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
@@ -12,6 +13,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::error::VadError;
 use crate::state::{EventSender, PlaybackState, PlayerEvent, SharedPlayerState};
+use crate::util::{is_allowed_url_scheme, vad_mpv_config_dir};
 
 /// Function pointer type for OpenGL procedure address lookup (`glXGetProcAddress` / `eglGetProcAddress`).
 pub type GlProcAddressFn = Arc<dyn Fn(&str) -> *mut c_void + Send + Sync>;
@@ -123,9 +125,35 @@ pub struct Player {
 }
 
 impl Player {
-    /// Initializes libmpv with `hwdec=auto-safe` and minimal default configuration.
+    /// Initializes libmpv with isolated config-dir, --no-config, yt-dlp enabled, and hwdec=auto-safe.
     pub fn new() -> Result<Self, VadError> {
-        let mpv = Mpv::new()?;
+        Self::with_options(None)
+    }
+
+    /// Initializes libmpv with an optional custom isolated config directory.
+    /// Explicitly sets:
+    /// 1. `config-dir` to VAD's isolated path (never `~/.config/mpv`, §3)
+    /// 2. `config=no` (--no-config) to prevent reading user configs
+    /// 3. `load-scripts=yes` to enable internal lua scripts like `ytdl_hook`
+    /// 4. `ytdl=yes` to enable yt-dlp URL playback
+    /// 5. `network-timeout=30` explicit timeout for network streams (§4.22)
+    pub fn with_options(custom_config_dir: Option<&Path>) -> Result<Self, VadError> {
+        let vad_dir = match custom_config_dir {
+            Some(p) => p.to_path_buf(),
+            None => vad_mpv_config_dir(),
+        };
+        let _ = std::fs::create_dir_all(&vad_dir);
+
+        let mpv = Mpv::with_initializer(|init| {
+            let dir_str = vad_dir.to_string_lossy();
+            init.set_option("config-dir", dir_str.as_ref())?;
+            init.set_option("config", false)?;
+            init.set_option("load-scripts", true)?;
+            init.set_option("ytdl", true)?;
+            init.set_option("network-timeout", 30_i64)?;
+            Ok(())
+        })
+        .map_err(|e| VadError::PlayerInitFailed(format!("{e:?}")))?;
 
         // Configure player options per PLANO_VAD.md §4.3 and §6
         if cfg!(debug_assertions) {
@@ -137,7 +165,10 @@ impl Player {
         mpv.set_property("video-timing-offset", 0.0_f64)?;
         mpv.set_property("volume-max", 200.0_f64)?;
 
-        info!("Player initialized with vo=libmpv, hwdec=auto-safe, volume-max=200");
+        info!(
+            "Player initialized with vo=libmpv, hwdec=auto-safe, volume-max=200, isolated config-dir={:?}, --no-config, ytdl=true",
+            vad_dir
+        );
         Ok(Self { mpv: Arc::new(mpv) })
     }
 
@@ -186,13 +217,26 @@ impl Player {
         Ok(())
     }
 
-    /// Loads and opens a media file (replaces current playback).
+    /// Loads and opens a media file or URL (replaces current playback).
+    /// If the target is an online URL, validates against the allowlisted schemes (§4.27).
     pub fn load_file(&self, path: &str) -> Result<(), VadError> {
-        info!("Loading file: {}", path);
+        let trimmed = path.trim();
+        if trimmed.contains("://") && !is_allowed_url_scheme(trimmed) {
+            return Err(VadError::InvalidUrlScheme(format!(
+                "Esquema de URL não permitido: '{trimmed}'. Apenas http://, https:// e rtsp:// são suportados (§4.27)."
+            )));
+        }
+
+        info!("Loading media: {}", trimmed);
         self.mpv
-            .command("loadfile", &[path, "replace"])
+            .command("loadfile", &[trimmed, "replace"])
             .map_err(VadError::Mpv)?;
         Ok(())
+    }
+
+    /// Explicitly loads an online stream URL with scheme validation (§4.27).
+    pub fn load_url(&self, url: &str) -> Result<(), VadError> {
+        self.load_file(url)
     }
 
     /// Starts or resumes playback.

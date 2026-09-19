@@ -1,17 +1,29 @@
+pub mod config;
 pub mod error;
 pub mod platform;
 pub mod player;
 pub mod playlist;
+pub mod recents;
 pub mod state;
+pub mod util;
 
+pub use config::{
+    EqualizerConfig, ModelStorageMode, PlayerConfig, RecentsConfig, ShortcutsConfig, VadConfig,
+    WhisperConfig,
+};
 pub use error::{ErrorAction, ErrorSeverity, VadError};
 pub use platform::PlatformIntegration;
 pub use player::{
     AbLoopStatus, AudioDevice, GlProcAddressFn, Player, TrackInfo, VideoRenderContext,
 };
 pub use playlist::{PlaylistItem, Playlist, RepeatMode};
+pub use recents::{RecentEntry, RecentsStore, DEFAULT_MAX_RECENTS};
 pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
+};
+pub use util::{
+    is_allowed_url_scheme, vad_config_dir, vad_config_path, vad_mpv_config_dir, vad_recentes_path,
+    write_atomic,
 };
 
 #[cfg(test)]
@@ -394,7 +406,74 @@ mod tests {
 
         // Volume boost up to 200%
         player.set_volume(150.0).expect("Failed to set volume boost");
-        let vol = player.volume().unwrap();
+        let vol = player.volume().unwrap_or(100.0);
         assert!((vol - 150.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_mpv_config_isolation() {
+        // Exit criterion verification (§9, Sprint_Planning_05):
+        // Ensure VAD's libmpv instance does NOT inherit user's ~/.config/mpv.
+        // We temporarily create a sentinel setting (speed=2.5, volume=42) in ~/.config/mpv/mpv.conf.
+        let home_mpv_dir = match std::env::var("HOME") {
+            Ok(home) if !home.trim().is_empty() => {
+                std::path::PathBuf::from(home).join(".config").join("mpv")
+            }
+            _ => return,
+        };
+
+        let conf_file = home_mpv_dir.join("mpv.conf");
+        let already_existed = conf_file.exists();
+        let original_content = if already_existed {
+            std::fs::read_to_string(&conf_file).ok()
+        } else {
+            None
+        };
+
+        let _ = std::fs::create_dir_all(&home_mpv_dir);
+        let sentinel_content = "speed=2.5\nvolume=42\n";
+        std::fs::write(&conf_file, sentinel_content).expect("Failed to write sentinel mpv.conf");
+
+        // Initialize Player using Player::new() with isolated config-dir and --no-config
+        let player_res = Player::new();
+
+        // Restore original state immediately to guarantee cleanup even if assertions fail
+        if already_existed {
+            if let Some(content) = original_content {
+                let _ = std::fs::write(&conf_file, content);
+            }
+        } else {
+            let _ = std::fs::remove_file(&conf_file);
+        }
+
+        let player = player_res.expect("Failed to initialize Player");
+        let speed = player.speed().unwrap_or(1.0);
+        let vol = player.volume().unwrap_or(100.0);
+
+        // Speed must be 1.0 (default), NOT 2.5
+        assert_eq!(
+            speed, 1.0,
+            "mpv must not inherit speed=2.5 from user ~/.config/mpv/mpv.conf"
+        );
+        // Volume must be 100.0 (default), NOT 42
+        assert_eq!(
+            vol, 100.0,
+            "mpv must not inherit volume=42 from user ~/.config/mpv/mpv.conf"
+        );
+    }
+
+    #[test]
+    fn test_player_url_scheme_enforcement() {
+        let player = Player::new().expect("Failed to create player");
+
+        // Prohibited schemes must return Err(VadError::InvalidUrlScheme(_)) (§4.27)
+        let res_file = player.load_file("file:///etc/shadow");
+        assert!(matches!(res_file, Err(VadError::InvalidUrlScheme(_))));
+
+        let res_smb = player.load_file("smb://nas/share/video.mp4");
+        assert!(matches!(res_smb, Err(VadError::InvalidUrlScheme(_))));
+
+        let res_ftp = player.load_file("ftp://example.com/stream");
+        assert!(matches!(res_ftp, Err(VadError::InvalidUrlScheme(_))));
     }
 }

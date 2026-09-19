@@ -63,6 +63,12 @@ pub enum VadError {
 
     #[error("Platform integration error: {0}")]
     Platform(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Invalid URL scheme: {0}")]
+    InvalidUrlScheme(String),
 }
 
 impl VadError {
@@ -169,6 +175,22 @@ impl VadError {
                 severity: ErrorSeverity::Warning,
                 title: "Erro de Integração com o Sistema",
                 description: "Falha na comunicação com serviços de sistema operativo (D-Bus/MPRIS/Screensaver).",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::Config(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Erro de Configuração",
+                description: "Falha ao ler, escrever ou serializar ficheiro de configuração/histórico.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::InvalidUrlScheme(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "URL Inválido",
+                description: "Esquema de URL não permitido. Apenas http://, https:// e rtsp:// são suportados.",
                 install_command: None,
                 disabled_features: &[],
                 can_ignore: true,

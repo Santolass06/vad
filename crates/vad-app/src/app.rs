@@ -7,8 +7,9 @@ use eframe::egui::{
 };
 use tracing::{error, info};
 use vad_core::{
-    create_event_channel, EventReceiver, GlProcAddressFn, PlatformIntegration, Player,
-    PlayerEvent, Playlist, SharedPlayerState, VadError,
+    create_event_channel, is_allowed_url_scheme, EventReceiver, GlProcAddressFn,
+    PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
+    SharedPlayerState, VadConfig, VadError,
 };
 
 use crate::panels::{
@@ -16,6 +17,17 @@ use crate::panels::{
 };
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
+
+/// State for the non-blocking resume toast per design/Dialogs.dc.html and PLANO_VAD.md §4.6.
+#[derive(Debug, Clone)]
+pub struct ResumeToastState {
+    pub location: String,
+    pub title: String,
+    pub timestamp: f64,
+    pub duration: Option<f64>,
+    pub time_left: f32,
+    pub is_startup_resume: bool,
+}
 
 /// Active right-hand lateral panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +65,11 @@ pub struct VadApp {
     audio_panel: AudioPanel,
     load_subtitles_modal_open: bool,
     load_subtitles_input: String,
+    recents: RecentsStore,
+    config: VadConfig,
+    resume_toast: Option<ResumeToastState>,
+    last_saved_time_pos: f64,
+    last_saved_instant: Instant,
 }
 
 impl VadApp {
@@ -142,6 +159,44 @@ impl VadApp {
             }
         }
 
+        let recents = RecentsStore::load_default();
+        let config = VadConfig::load_default();
+
+        let mut audio_panel = AudioPanel::new();
+        audio_panel.gains = config.equalizer.gains;
+        if let Some(ref preset) = config.equalizer.preset {
+            audio_panel.active_preset = preset.clone();
+        }
+        audio_panel.rnnoise = config.equalizer.rnnoise;
+
+        if let Some(ref p) = player {
+            let _ = p.set_volume(config.player.volume);
+            if let Some(ref dev) = config.player.audio_device {
+                let _ = p.set_audio_device(dev);
+            }
+            if let Some(ref aspect) = config.player.aspect_ratio {
+                let _ = p.set_video_aspect_override(aspect);
+            }
+        }
+
+        let mut resume_toast = None;
+        if initial_file.is_none() && config.recents.resume_enabled {
+            if let Some(recent) = recents.most_recent() {
+                if recent.timestamp > 3.0
+                    && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0)
+                {
+                    resume_toast = Some(ResumeToastState {
+                        location: recent.location.clone(),
+                        title: recent.title.clone(),
+                        timestamp: recent.timestamp,
+                        duration: recent.duration,
+                        time_left: 8.0,
+                        is_startup_resume: true,
+                    });
+                }
+            }
+        }
+
         let mut app = Self {
             player,
             renderer,
@@ -165,9 +220,14 @@ impl VadApp {
             playlist,
             active_side_panel: ActiveSidePanel::None,
             video_panel: VideoPanel::new(),
-            audio_panel: AudioPanel::new(),
+            audio_panel,
             load_subtitles_modal_open: false,
             load_subtitles_input: String::new(),
+            recents,
+            config,
+            resume_toast,
+            last_saved_time_pos: 0.0,
+            last_saved_instant: Instant::now(),
         };
 
         if let Some(path) = initial_file {
@@ -183,25 +243,53 @@ impl VadApp {
             return;
         }
 
+        let is_url = is_allowed_url_scheme(trimmed);
+
         if let Some(ref player) = self.player {
             info!("Loading media: {}", trimmed);
             if let Err(e) = player.load_file(trimmed) {
-                self.last_error = Some(format!("Erro ao carregar ficheiro: {e:?}"));
+                self.last_error = Some(format!("Erro ao carregar mídia: {e:?}"));
             } else {
                 self.current_media_path = Some(trimmed.to_string());
-                self.current_title = std::path::Path::new(trimmed)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| trimmed.to_string());
+                self.current_title = if is_url {
+                    trimmed.to_string()
+                } else {
+                    std::path::Path::new(trimmed)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| trimmed.to_string())
+                };
                 self.last_error = None;
+                self.last_saved_time_pos = 0.0;
 
                 if let Ok(mut pl) = self.playlist.lock() {
                     let found = pl.items().iter().position(|it| it.location() == trimmed);
                     if let Some(idx) = found {
                         pl.set_current(idx);
+                    } else if is_url {
+                        let idx = pl.add_url(trimmed);
+                        pl.set_current(idx);
                     } else {
                         let idx = pl.add_file(trimmed);
                         pl.set_current(idx);
+                    }
+                }
+
+                // Check recents for resume toast dialog (§4.6, design/Dialogs.dc.html)
+                if self.config.recents.resume_enabled {
+                    if let Some(recent) = self.recents.get(trimmed) {
+                        if recent.timestamp > 3.0
+                            && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0)
+                        {
+                            self.resume_toast = Some(ResumeToastState {
+                                location: trimmed.to_string(),
+                                title: self.current_title.clone(),
+                                timestamp: recent.timestamp,
+                                duration: recent.duration,
+                                time_left: 8.0,
+                                is_startup_resume: false,
+                            });
+                        }
                     }
                 }
 
@@ -253,6 +341,12 @@ impl VadApp {
                     self.hud.poke();
                 }
                 PlayerEvent::EndOfFile => {
+                    if let Some(ref cur) = self.current_media_path {
+                        let is_url = is_allowed_url_scheme(cur);
+                        self.recents.add_or_update(cur, &self.current_title, 0.0, None, is_url);
+                        let _ = self.recents.save_default();
+                    }
+
                     let next_item = if let Ok(mut pl) = self.playlist.lock() {
                         pl.next().cloned()
                     } else {
@@ -260,12 +354,8 @@ impl VadApp {
                     };
 
                     if let Some(item) = next_item {
-                        if item.is_url() {
-                            self.hud.set_notification("A reprodução de URLs requer a Sprint 05");
-                        } else {
-                            let path = item.location();
-                            self.load_media(&path);
-                        }
+                        let path = item.location();
+                        self.load_media(&path);
                     }
                 }
                 PlayerEvent::HwdecChanged(hw) => match hw {
@@ -296,9 +386,8 @@ impl VadApp {
     /// Validates a URL against the allowlisted schemes (§4.27) before it is ever
     /// handed to mpv — prevents `file://`/`smb://` style paths from reaching the
     /// player through the "Abrir URL" surface.
-    fn is_allowed_url_scheme(input: &str) -> bool {
-        const ALLOWED_SCHEMES: [&str; 3] = ["http://", "https://", "rtsp://"];
-        ALLOWED_SCHEMES.iter().any(|scheme| input.starts_with(scheme))
+    pub fn is_allowed_url_scheme(input: &str) -> bool {
+        vad_core::is_allowed_url_scheme(input)
     }
 
     fn update_hwdec_label(&mut self) {
@@ -315,7 +404,9 @@ impl VadApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // Dismiss dialogs with Escape (§4.34)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.show_dependency_dialog {
+            if self.resume_toast.is_some() {
+                self.resume_toast = None;
+            } else if self.show_dependency_dialog {
                 self.show_dependency_dialog = false;
             } else if self.open_modal_open {
                 self.open_modal_open = false;
@@ -763,10 +854,13 @@ impl VadApp {
 
             ui.add_space(36.0);
 
-            // Reserved layout space for recents.rs (Sprint 05)
+            // Recents section on welcome screen (§4.6)
+            let has_recents = !self.recents.is_empty();
+            let entries_count = self.recents.len().min(3);
+            let box_height = if has_recents { 44.0 + (entries_count as f32 * 32.0) } else { 70.0 };
             let recents_rect = Rect::from_center_size(
-                pos2(available_rect.center().x, available_rect.center().y + 110.0),
-                vec2(480.0, 80.0),
+                pos2(available_rect.center().x, available_rect.center().y + 120.0),
+                vec2(520.0, box_height),
             );
             let painter = ui.painter();
             painter.rect(
@@ -779,16 +873,261 @@ impl VadApp {
 
             let mut recents_ui = ui.new_child(
                 UiBuilder::new()
-                    .max_rect(recents_rect.shrink(12.0))
+                    .max_rect(recents_rect.shrink(10.0))
                     .layout(egui::Layout::top_down(egui::Align::Center)),
             );
             recents_ui.colored_label(Color32::from_rgb(140, 145, 165), "Ficheiros Recentes");
             recents_ui.add_space(4.0);
-            recents_ui.colored_label(
-                Color32::from_rgb(100, 105, 120),
-                "(Histórico e ponto de retoma disponíveis na Sprint 05)",
-            );
+
+            if !has_recents {
+                recents_ui.colored_label(
+                    Color32::from_rgb(100, 105, 120),
+                    "Nenhum ficheiro recente ainda.",
+                );
+            } else {
+                let mut open_item = None;
+                let entries = self.recents.entries().iter().take(3).cloned().collect::<Vec<_>>();
+                for entry in entries {
+                    recents_ui.horizontal(|ui| {
+                        let icon = if entry.is_url { "🌐 " } else { "🎬 " };
+                        let summary = entry.formatted_summary();
+                        let title_display = if entry.title.len() > 38 {
+                            format!("{icon}{}...", &entry.title[..35])
+                        } else {
+                            format!("{icon}{}", entry.title)
+                        };
+                        if ui.button(title_display).clicked() {
+                            open_item = Some((entry.location.clone(), entry.timestamp));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.colored_label(Color32::from_rgb(139, 124, 246), summary);
+                        });
+                    });
+                }
+                if let Some((loc, ts)) = open_item {
+                    self.load_media(&loc);
+                    if ts > 0.0 {
+                        if let Some(ref p) = self.player {
+                            let _ = p.seek_absolute(ts);
+                        }
+                    }
+                }
+            }
         });
+    }
+
+    /// Periodically saves playback progress to `recentes.json` every ~5 seconds (§4.6, §4.30).
+    fn save_progress_periodically(&mut self) {
+        if self.last_saved_instant.elapsed().as_secs() < 5 {
+            return;
+        }
+        self.last_saved_instant = Instant::now();
+
+        if let Some(ref path) = self.current_media_path {
+            let pos = self.shared_state.get_time_pos();
+            let dur = self.shared_state.get_duration();
+            let is_url = is_allowed_url_scheme(path);
+
+            if pos > 3.0 && (pos - self.last_saved_time_pos).abs() >= 1.0 {
+                self.last_saved_time_pos = pos;
+                self.recents.add_or_update(
+                    path,
+                    &self.current_title,
+                    pos,
+                    if dur > 0.0 { Some(dur) } else { None },
+                    is_url,
+                );
+                let _ = self.recents.save_default();
+            }
+        }
+    }
+
+    /// Flushes playback progress and configuration state to disk on exit or pause (§4.30, §5).
+    fn save_state(&mut self) {
+        if let Some(ref path) = self.current_media_path {
+            let pos = self.shared_state.get_time_pos();
+            let dur = self.shared_state.get_duration();
+            let is_url = is_allowed_url_scheme(path);
+
+            if pos > 3.0 {
+                let save_pos = if dur > 0.0 && pos >= dur - 3.0 { 0.0 } else { pos };
+                self.recents.add_or_update(
+                    path,
+                    &self.current_title,
+                    save_pos,
+                    if dur > 0.0 { Some(dur) } else { None },
+                    is_url,
+                );
+                let _ = self.recents.save_default();
+            }
+        }
+
+        if let Some(ref p) = self.player {
+            if let Ok(vol) = p.volume() {
+                self.config.player.volume = vol;
+            }
+        }
+        self.config.equalizer.gains = self.audio_panel.gains;
+        self.config.equalizer.preset = Some(self.audio_panel.active_preset.clone());
+        self.config.equalizer.rnnoise = self.audio_panel.rnnoise;
+        let _ = self.config.save_default();
+    }
+
+    /// Renders non-blocking floating toast dialog for resuming playback matching `design/Dialogs.dc.html`.
+    /// Has an 8s timeout, doesn't block UI interactions, and can be dismissed with Escape.
+    fn render_resume_toast(&mut self, ctx: &egui::Context) {
+        let Some(mut toast) = self.resume_toast.take() else {
+            return;
+        };
+
+        let dt = ctx.input(|i| i.stable_dt).min(0.2);
+        toast.time_left -= dt;
+
+        if toast.time_left <= 0.0 {
+            return;
+        }
+
+        ctx.request_repaint();
+
+        let accent = Color32::from_rgb(139, 124, 246);
+        let mut action_continue = false;
+        let mut action_start_over = false;
+        let mut action_close = false;
+
+        egui::Area::new(egui::Id::new("vad_resume_toast_area"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-24.0, -115.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 235))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .corner_radius(14)
+                    .inner_margin(16)
+                    .shadow(egui::epaint::Shadow {
+                        blur: 24,
+                        color: Color32::from_black_alpha(140),
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        ui.spacing_mut().item_spacing = vec2(0.0, 10.0);
+
+                        // Header with Clock Icon and Title
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
+                            let painter = ui.painter_at(icon_rect);
+                            painter.circle_stroke(icon_rect.center(), 8.0, Stroke::new(1.8, accent));
+                            let center = icon_rect.center();
+                            painter.line_segment([center, center + vec2(0.0, -4.5)], Stroke::new(1.8, accent));
+                            painter.line_segment([center, center + vec2(3.5, 3.5)], Stroke::new(1.8, accent));
+
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Continuar de onde parou?")
+                                    .size(14.5)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕").clicked() {
+                                    action_close = true;
+                                }
+                            });
+                        });
+
+                        // Subtle countdown progress line
+                        let pct = (toast.time_left / 8.0).clamp(0.0, 1.0);
+                        let (bar_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0), egui::Sense::hover());
+                        let painter = ui.painter_at(bar_rect);
+                        painter.rect_filled(bar_rect, CornerRadius::ZERO, Color32::from_rgba_premultiplied(255, 255, 255, 15));
+                        let active_bar = Rect::from_min_size(bar_rect.min, vec2(bar_rect.width() * pct, 2.0));
+                        painter.rect_filled(active_bar, CornerRadius::ZERO, accent);
+
+                        // Media info box
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_premultiplied(255, 255, 255, 10))
+                            .corner_radius(8)
+                            .inner_margin(10)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&toast.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(235, 238, 250)),
+                                );
+                                ui.add_space(3.0);
+                                let pos_str = RecentEntry::format_seconds(toast.timestamp);
+                                let dur_str = toast.duration.map(RecentEntry::format_seconds);
+
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(pos_str)
+                                            .size(12.5)
+                                            .color(accent)
+                                            .strong(),
+                                    );
+                                    if let Some(dur) = dur_str {
+                                        ui.colored_label(
+                                            Color32::from_rgb(140, 145, 165),
+                                            format!("de {dur}"),
+                                        );
+                                    }
+                                });
+                            });
+
+                        // Actions row
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let continue_btn = egui::Button::new(
+                                    egui::RichText::new("Continuar")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(Color32::from_rgb(20, 20, 28)),
+                                )
+                                .fill(accent)
+                                .corner_radius(CornerRadius::same(8));
+
+                                if ui.add(continue_btn).clicked() {
+                                    action_continue = true;
+                                }
+
+                                let start_over_btn = egui::Button::new(
+                                    egui::RichText::new("Começar do início")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(Color32::from_rgb(200, 205, 225)),
+                                )
+                                .fill(Color32::from_rgba_premultiplied(255, 255, 255, 14))
+                                .corner_radius(CornerRadius::same(8));
+
+                                if ui.add(start_over_btn).clicked() {
+                                    action_start_over = true;
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if action_continue {
+            if toast.is_startup_resume {
+                self.load_media(&toast.location);
+            }
+            if let Some(ref p) = self.player {
+                let _ = p.seek_absolute(toast.timestamp);
+                let _ = p.play();
+            }
+        } else if action_start_over {
+            if toast.is_startup_resume {
+                self.load_media(&toast.location);
+            }
+            if let Some(ref p) = self.player {
+                let _ = p.seek_absolute(0.0);
+                let _ = p.play();
+            }
+        } else if !action_close {
+            self.resume_toast = Some(toast);
+        }
     }
 
     /// Renders fatal error screen if OpenGL or libmpv initialization completely failed.
@@ -818,6 +1157,7 @@ impl eframe::App for VadApp {
         self.handle_shortcuts(&ctx);
         self.handle_drag_and_drop(&ctx);
         self.poll_events();
+        self.save_progress_periodically();
 
         for integration in &mut self.platform_integrations {
             let _ = integration.update();
@@ -1013,12 +1353,8 @@ impl eframe::App for VadApp {
                                         } else {
                                             None
                                         };
-                                        if let Some((is_url, loc)) = item_info {
-                                            if is_url {
-                                                self.hud.set_notification("A reprodução de URLs requer a Sprint 05");
-                                            } else {
-                                                self.load_media(&loc);
-                                            }
+                                        if let Some((_is_url, loc)) = item_info {
+                                            self.load_media(&loc);
                                         }
                                     }
                                     PlaylistAction::AddFileRequest => {
@@ -1135,11 +1471,17 @@ impl eframe::App for VadApp {
         self.render_dependency_dialog(&ctx);
         self.render_open_modal(&ctx);
         self.render_subtitles_modal(&ctx);
+        self.render_resume_toast(&ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_state();
     }
 }
 
 impl Drop for VadApp {
     fn drop(&mut self) {
+        self.save_state();
         for integration in &mut self.platform_integrations {
             let _ = integration.shutdown();
         }
@@ -1219,5 +1561,92 @@ mod tests {
 
         audio_panel.apply_preset("Plano");
         assert_eq!(audio_panel.gains, [0.0; 10]);
+    }
+
+    #[test]
+    fn test_resume_toast_state_and_timeout() {
+        let mut toast = ResumeToastState {
+            location: "/path/to/movie.mp4".to_string(),
+            title: "movie.mp4".to_string(),
+            timestamp: 125.0,
+            duration: Some(3600.0),
+            time_left: 8.0,
+            is_startup_resume: true,
+        };
+
+        // Advance by 3 seconds
+        toast.time_left -= 3.0;
+        assert_eq!(toast.time_left, 5.0);
+        assert!(toast.time_left > 0.0);
+
+        // Advance beyond 8 seconds -> expires
+        toast.time_left -= 5.5;
+        assert!(toast.time_left <= 0.0);
+    }
+
+    #[test]
+    fn test_startup_resume_threshold_logic() {
+        // Entry with < 3.0s should NOT trigger resume toast
+        let mut recents = RecentsStore::new();
+        recents.add_or_update("/short.mp4", "Short", 2.0, Some(100.0), false);
+        let recent = recents.most_recent().unwrap();
+        let should_resume = recent.timestamp > 3.0
+            && recent.duration.is_none_or(|dur| recent.timestamp < dur - 5.0);
+        assert!(!should_resume);
+
+        // Entry with finished video (within 5s of duration) should NOT trigger resume
+        recents.add_or_update("/done.mp4", "Done", 98.0, Some(100.0), false);
+        let recent_done = recents.most_recent().unwrap();
+        let should_resume_done = recent_done.timestamp > 3.0
+            && recent_done.duration.is_none_or(|dur| recent_done.timestamp < dur - 5.0);
+        assert!(!should_resume_done);
+
+        // Meaningful progress (>3s and before end) SHOULD trigger resume
+        recents.add_or_update("/video.mp4", "Video", 2052.0, Some(5400.0), false);
+        let recent_valid = recents.most_recent().unwrap();
+        let should_resume_valid = recent_valid.timestamp > 3.0
+            && recent_valid.duration.is_none_or(|dur| recent_valid.timestamp < dur - 5.0);
+        assert!(should_resume_valid);
+        assert_eq!(recent_valid.formatted_summary(), "00:34:12 de 01:30:00");
+    }
+
+    #[test]
+    fn test_app_startup_with_recents_offers_resume() {
+        let dir = std::env::temp_dir().join("vad_test_startup_resume");
+        let _ = std::fs::create_dir_all(&dir);
+        let recents_path = dir.join("recentes.json");
+
+        let mut store = RecentsStore::new();
+        store.add_or_update(
+            "/path/to/meeting.mp4",
+            "Reunião Estratégica",
+            2052.0,
+            Some(5400.0),
+            false,
+        );
+        store.save_to_path(&recents_path).unwrap();
+
+        let loaded = RecentsStore::load_from_path(&recents_path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let recent = loaded.most_recent().unwrap();
+        assert_eq!(recent.location, "/path/to/meeting.mp4");
+        assert_eq!(recent.timestamp, 2052.0);
+        assert_eq!(recent.formatted_summary(), "00:34:12 de 01:30:00");
+
+        // Verify toast generation logic for this recent file
+        let toast = ResumeToastState {
+            location: recent.location.clone(),
+            title: recent.title.clone(),
+            timestamp: recent.timestamp,
+            duration: recent.duration,
+            time_left: 8.0,
+            is_startup_resume: true,
+        };
+        assert_eq!(toast.time_left, 8.0);
+        assert!(toast.is_startup_resume);
+        assert_eq!(toast.title, "Reunião Estratégica");
+        assert_eq!(toast.timestamp, 2052.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

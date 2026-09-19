@@ -287,10 +287,8 @@ impl MprisPlayer {
         debug!("MPRIS Player.Next invoked");
         if let Ok(mut p) = self.playlist.lock() {
             if let Some(item) = p.next() {
-                if !item.is_url() {
-                    let path = item.location();
-                    let _ = self.player.load_file(&path);
-                }
+                let loc = item.location();
+                let _ = self.player.load_file(&loc);
             }
         }
     }
@@ -301,10 +299,8 @@ impl MprisPlayer {
             let _ = self.player.seek_absolute(0.0);
         } else if let Ok(mut p) = self.playlist.lock() {
             if let Some(item) = p.previous() {
-                if !item.is_url() {
-                    let path = item.location();
-                    let _ = self.player.load_file(&path);
-                }
+                let loc = item.location();
+                let _ = self.player.load_file(&loc);
             }
         }
     }
