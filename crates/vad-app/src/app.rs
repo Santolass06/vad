@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui::{
-    self, pos2, vec2, Color32, CornerRadius, Rect, Stroke, StrokeKind, UiBuilder,
+    self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Stroke, StrokeKind, UiBuilder,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use vad_ai::{AudioExtractor, ExtractionHandle, ExtractionStatus, PcmAudio, TranscriptionSegment};
+use vad_audio_tools::{WaveformPyramid, TARGET_VISIBLE_POINTS};
 use vad_core::{
     create_event_channel, is_allowed_url_scheme, EventReceiver, GlProcAddressFn,
     PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
@@ -14,6 +16,7 @@ use vad_core::{
 
 use crate::panels::{
     AudioPanel, HudAction, HudPanel, PlaylistAction, PlaylistPanel, VideoPanel,
+    WhisperAction, WhisperPanel,
 };
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
@@ -36,6 +39,7 @@ pub enum ActiveSidePanel {
     Playlist,
     Equalizer,
     Video,
+    Whisper,
 }
 
 /// Main GUI application for VAD.
@@ -63,6 +67,15 @@ pub struct VadApp {
     active_side_panel: ActiveSidePanel,
     video_panel: VideoPanel,
     audio_panel: AudioPanel,
+    whisper_panel: WhisperPanel,
+    audio_extractor: AudioExtractor,
+    extraction_handle: Option<ExtractionHandle>,
+    extraction_rx: Option<crossbeam_channel::Receiver<ExtractionStatus>>,
+    extraction_progress_pct: Option<f32>,
+    current_audio: Option<PcmAudio>,
+    waveform_pyramid: Option<WaveformPyramid>,
+    waveform_zoom_window: Option<(f64, f64)>,
+    meeting_mode_view: bool,
     load_subtitles_modal_open: bool,
     load_subtitles_input: String,
     recents: RecentsStore,
@@ -202,6 +215,10 @@ impl VadApp {
             }
         }
 
+        let mut whisper_panel = WhisperPanel::new();
+        whisper_panel.init_from_config(&config);
+        let audio_extractor = AudioExtractor::new();
+
         let mut app = Self {
             player,
             renderer,
@@ -226,6 +243,15 @@ impl VadApp {
             active_side_panel: ActiveSidePanel::None,
             video_panel: VideoPanel::new(),
             audio_panel,
+            whisper_panel,
+            audio_extractor,
+            extraction_handle: None,
+            extraction_rx: None,
+            extraction_progress_pct: None,
+            current_audio: None,
+            waveform_pyramid: None,
+            waveform_zoom_window: None,
+            meeting_mode_view: false,
             load_subtitles_modal_open: false,
             load_subtitles_input: String::new(),
             recents,
@@ -302,6 +328,8 @@ impl VadApp {
                     }
                 }
 
+                // Start non-blocking background audio extraction for waveform & Whisper (§4.17)
+                self.start_audio_extraction(trimmed);
                 self.hud.poke();
             }
         }
@@ -345,7 +373,7 @@ impl VadApp {
                         self.current_title = std::path::Path::new(&path)
                             .file_name()
                             .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or(path);
+                            .unwrap_or(path.clone());
                     }
                     if let Some(dur) = duration {
                         self.shared_state.set_duration(dur);
@@ -356,6 +384,9 @@ impl VadApp {
                                 }
                             }
                         }
+                    }
+                    if self.waveform_pyramid.is_none() && self.extraction_rx.is_none() && !path.is_empty() {
+                        self.start_audio_extraction(&path);
                     }
                     if let Some(ts) = self.pending_seek.take() {
                         if let Some(ref p) = self.player {
@@ -1161,6 +1192,406 @@ impl VadApp {
             });
         });
     }
+
+    /// Starts non-blocking audio extraction for waveform and Whisper transcription.
+    /// Never blocks playback or UI (§4.17).
+    pub fn start_audio_extraction(&mut self, path: &str) {
+        self.cancel_extraction();
+
+        // Check in-memory cache first (§4.12, §4.18)
+        if let Some(cached) = self.audio_extractor.get_cached(path) {
+            info!("Reusing in-memory cached PCM audio for {}", path);
+            let pyramid = WaveformPyramid::from_pcm(&cached);
+            self.waveform_pyramid = Some(pyramid);
+            self.current_audio = Some(cached);
+            self.waveform_zoom_window = None;
+            self.extraction_progress_pct = None;
+            return;
+        }
+
+        let dur = self.shared_state.get_duration();
+        let dur_hint = if dur > 0.0 { Some(dur) } else { None };
+        let (rx, handle) = self.audio_extractor.extract_async(path.to_string(), dur_hint);
+        self.extraction_handle = Some(handle);
+        self.extraction_rx = Some(rx);
+        self.extraction_progress_pct = Some(0.0);
+        self.waveform_pyramid = None;
+        self.current_audio = None;
+        self.waveform_zoom_window = None;
+    }
+
+    /// Cancels active audio extraction subprocess immediately (§4.17).
+    pub fn cancel_extraction(&mut self) {
+        if let Some(handle) = self.extraction_handle.take() {
+            handle.cancel();
+        }
+        self.extraction_rx = None;
+        self.extraction_progress_pct = None;
+    }
+
+    /// Polls asynchronous audio extraction status without blocking (§4.17).
+    fn poll_audio_extraction(&mut self) {
+        if let Some(ref rx) = self.extraction_rx {
+            while let Ok(status) = rx.try_recv() {
+                match status {
+                    ExtractionStatus::Progress(prog) => {
+                        self.extraction_progress_pct = Some(prog.percent);
+                    }
+                    ExtractionStatus::Completed(pcm) => {
+                        info!(
+                            "Audio extraction complete: duration={:.1}s, samples={}",
+                            pcm.duration_seconds,
+                            pcm.samples.len()
+                        );
+                        let pyramid = WaveformPyramid::from_pcm(&pcm);
+                        self.waveform_pyramid = Some(pyramid);
+                        self.current_audio = Some(pcm);
+                        self.extraction_progress_pct = None;
+                        self.extraction_handle = None;
+                        self.extraction_rx = None;
+                        break;
+                    }
+                    ExtractionStatus::Failed(err) => {
+                        warn!("Audio extraction failed: {}", err);
+                        self.last_error = Some(format!("Falha na extração de áudio: {}", err));
+                        self.extraction_progress_pct = None;
+                        self.extraction_handle = None;
+                        self.extraction_rx = None;
+                        break;
+                    }
+                    ExtractionStatus::Cancelled => {
+                        info!("Audio extraction cancelled");
+                        self.extraction_progress_pct = None;
+                        self.extraction_handle = None;
+                        self.extraction_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adjusts waveform zoom window based on mouse wheel scroll (§5).
+    fn apply_waveform_zoom(&mut self, scroll_y: f32, current_time: f64, duration: f64) {
+        if duration <= 1.0 {
+            return;
+        }
+
+        let (cur_start, cur_end) = self.waveform_zoom_window.unwrap_or((0.0, duration));
+        let cur_span = cur_end - cur_start;
+
+        if scroll_y > 0.0 {
+            // Zoom in: decrease time window (down to 3s minimum)
+            let new_span = (cur_span * 0.65).max(3.0);
+            let center = current_time.clamp(0.0, duration);
+            let new_start = (center - new_span / 2.0).max(0.0);
+            let new_end = (new_start + new_span).min(duration);
+            self.waveform_zoom_window = Some((new_start, new_end));
+        } else if scroll_y < 0.0 {
+            // Zoom out: expand time window up to total duration
+            let new_span = cur_span * 1.5;
+            if new_span >= duration {
+                self.waveform_zoom_window = None;
+            } else {
+                let center = (cur_start + cur_end) / 2.0;
+                let new_start = (center - new_span / 2.0).max(0.0);
+                let new_end = (new_start + new_span).min(duration);
+                self.waveform_zoom_window = Some((new_start, new_end));
+            }
+        }
+    }
+
+    /// Renders Meeting Mode view per PLANO_VAD.md §6 and Sprint_Planning_06 Task 6.
+    /// Features:
+    /// - Multi-resolution WaveformPyramid rendering (capped at ~1000 points visible in single batch, §5)
+    /// - Mouse wheel zooming (§5)
+    /// - Clickable/draggable playhead seeking directly on waveform
+    /// - Mini-player transport bar below waveform ([⏪5s], [▶/⏸], [5s⏩], pos, speed, vol)
+    fn render_meeting_mode(&mut self, ui: &mut egui::Ui, available_rect: Rect) {
+        let current_time = self.shared_state.get_time_pos();
+        let duration = self.shared_state.get_duration();
+
+        ui.vertical(|ui| {
+            // Title & View Toggle
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Visualizador de Forma de Onda (Waveform da Reunião com MIP-Mapping)")
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::from_rgb(180, 185, 205)),
+                );
+
+                if let Some(ref p) = self.player {
+                    if p.has_video() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("🎞 Alternar para Vídeo").clicked() {
+                                self.meeting_mode_view = false;
+                            }
+                        });
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // --- WAVEFORM DISPLAY AREA ---
+            let waveform_h = 190.0_f32.min(available_rect.height() * 0.42);
+            let waveform_size = vec2(ui.available_width(), waveform_h);
+            let (response, painter) = ui.allocate_painter(waveform_size, egui::Sense::click_and_drag());
+            let rect = response.rect;
+
+            // Waveform background card
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(8),
+                Color32::from_rgb(18, 20, 26),
+            );
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(8),
+                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
+                StrokeKind::Inside,
+            );
+
+            // Waveform midline
+            let mid_y = rect.center().y;
+            painter.line_segment(
+                [pos2(rect.left(), mid_y), pos2(rect.right(), mid_y)],
+                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)),
+            );
+
+            let (view_start, view_end) = self.waveform_zoom_window.unwrap_or((0.0, duration.max(0.1)));
+
+            if let Some(ref mut pyramid) = self.waveform_pyramid {
+                let points = pyramid.get_visible_points(view_start, view_end, TARGET_VISIBLE_POINTS);
+                let num_pts = points.len();
+
+                if num_pts > 0 {
+                    let wave_color = Color32::from_rgb(139, 124, 246);
+                    let half_h = (rect.height() * 0.44).max(5.0);
+                    let col_w = (rect.width() / num_pts as f32).max(1.0);
+
+                    for (i, pt) in points.iter().enumerate() {
+                        let frac = i as f32 / num_pts as f32;
+                        let x = rect.left() + frac * rect.width();
+                        let top_y = mid_y - (pt.max * half_h);
+                        let bot_y = mid_y - (pt.min * half_h);
+                        let y_min = top_y.min(bot_y);
+                        let y_max = top_y.max(bot_y).max(y_min + 1.0);
+
+                        painter.rect_filled(
+                            Rect::from_min_max(pos2(x, y_min), pos2(x + col_w, y_max)),
+                            CornerRadius::ZERO,
+                            wave_color,
+                        );
+                    }
+                }
+
+                // Playhead indicator [▲]
+                let span = (view_end - view_start).max(0.001);
+                let pos_fraction = ((current_time - view_start) / span).clamp(0.0, 1.0);
+                let playhead_x = rect.left() + pos_fraction as f32 * rect.width();
+                let playhead_color = Color32::from_rgb(250, 204, 21); // Yellow/Gold
+
+                painter.line_segment(
+                    [pos2(playhead_x, rect.top()), pos2(playhead_x, rect.bottom())],
+                    Stroke::new(2.0, playhead_color),
+                );
+
+                // Playhead cursor [▲]
+                let tri_h = 8.0;
+                let tri_w = 6.0;
+                painter.line_segment(
+                    [pos2(playhead_x - tri_w, rect.bottom()), pos2(playhead_x + tri_w, rect.bottom())],
+                    Stroke::new(2.0, playhead_color),
+                );
+                painter.line_segment(
+                    [pos2(playhead_x - tri_w, rect.bottom()), pos2(playhead_x, rect.bottom() - tri_h)],
+                    Stroke::new(2.0, playhead_color),
+                );
+                painter.line_segment(
+                    [pos2(playhead_x + tri_w, rect.bottom()), pos2(playhead_x, rect.bottom() - tri_h)],
+                    Stroke::new(2.0, playhead_color),
+                );
+
+                // Click and drag seeking directly on waveform (§6)
+                if response.clicked() || response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let u = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        let target_secs = view_start + u as f64 * span;
+                        if let Some(ref p) = self.player {
+                            let _ = p.seek_absolute(target_secs);
+                        }
+                    }
+                }
+
+                // Mouse wheel zooming (§5)
+                if response.hovered() {
+                    let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll_y.abs() > 0.5 {
+                        self.apply_waveform_zoom(scroll_y, current_time, duration);
+                    }
+                }
+            } else if let Some(pct) = self.extraction_progress_pct {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("A extrair áudio e a gerar waveform: {:.0}%...", pct),
+                    egui::FontId::proportional(15.0),
+                    Color32::from_rgb(217, 158, 66),
+                );
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Sem dados de áudio extraídos",
+                    egui::FontId::proportional(14.0),
+                    Color32::from_rgb(140, 145, 165),
+                );
+            }
+
+            ui.add_space(8.0);
+
+            // --- MINI-PLAYER DE TRANSPORTE (§6, Task 6) ---
+            ui.horizontal(|ui| {
+                // [⏪ 5s]
+                if ui.button("⏪ 5s").on_hover_text("Retroceder 5 segundos").clicked() {
+                    if let Some(ref p) = self.player {
+                        let _ = p.seek_relative(-5.0);
+                    }
+                }
+
+                // [▶ / ⏸]
+                let is_paused = self.shared_state.is_paused();
+                let play_btn_text = if is_paused { "▶ Play" } else { "⏸ Pausa" };
+                if ui.button(play_btn_text).clicked() {
+                    if let Some(ref p) = self.player {
+                        let _ = p.toggle_pause();
+                    }
+                }
+
+                // [5s ⏩]
+                if ui.button("5s ⏩").on_hover_text("Avançar 5 segundos").clicked() {
+                    if let Some(ref p) = self.player {
+                        let _ = p.seek_relative(5.0);
+                    }
+                }
+
+                ui.separator();
+
+                // Position / Duration
+                let time_text = format!(
+                    "{} / {}",
+                    HudPanel::format_time(current_time),
+                    HudPanel::format_time(duration)
+                );
+                ui.monospace(RichText::new(time_text).strong());
+
+                ui.separator();
+
+                // Speed control
+                if let Some(ref p) = self.player {
+                    let cur_speed = p.speed().unwrap_or(1.0);
+                    egui::ComboBox::from_id_salt("mini_player_speed_combo")
+                        .selected_text(format!("{:.2}x", cur_speed))
+                        .show_ui(ui, |ui| {
+                            for &spd in &[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                                if ui.selectable_label((cur_speed - spd).abs() < 0.01, format!("{:.2}x", spd)).clicked() {
+                                    let _ = p.set_speed(spd);
+                                }
+                            }
+                        });
+                }
+
+                ui.separator();
+
+                // Volume control
+                if let Some(ref p) = self.player {
+                    let mut vol = p.volume().unwrap_or(100.0);
+                    ui.label("🔊");
+                    if ui.add(egui::Slider::new(&mut vol, 0.0..=150.0).show_value(false)).changed() {
+                        let _ = p.set_volume(vol);
+                    }
+                    ui.label(format!("{:.0}%", vol));
+                }
+
+                // Zoom reset & info
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some((s, e)) = self.waveform_zoom_window {
+                        let span = e - s;
+                        let span_str = if span < 60.0 {
+                            format!("Zoom: {:.0}s", span)
+                        } else {
+                            format!("Zoom: {:.1}m", span / 60.0)
+                        };
+                        ui.colored_label(Color32::from_rgb(139, 124, 246), span_str);
+                        if ui.small_button("Reset Zoom").on_hover_text("Voltar ao nível global completo").clicked() {
+                            self.waveform_zoom_window = None;
+                        }
+                    } else {
+                        ui.colored_label(Color32::from_rgb(140, 145, 165), "Zoom: Global");
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // --- CONTROLOS RÁPIDOS DE REUNIÃO (PLANO_VAD.md §6) ---
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_rgb(160, 165, 185), "Controlos Rápidos de Reunião:");
+                ui.add_enabled(false, egui::Button::new("Saltar Silêncios: Sprint 07"))
+                    .on_disabled_hover_text("Previsto para o Sprint 07 (§11)");
+                ui.add_enabled(false, egui::Button::new("Redução de Ruído: Sprint 07"))
+                    .on_disabled_hover_text("Previsto para o Sprint 07 (§11)");
+
+                if self.whisper_panel.is_transcribing() {
+                    let prog = self.whisper_panel.transcribe_progress().unwrap_or(0);
+                    ui.spinner();
+                    ui.colored_label(Color32::from_rgb(139, 124, 246), format!("A transcrever: {}%", prog));
+                } else if ui.button("🎙 Abrir Whisper AI").on_hover_text("Abrir painel lateral de Transcrição Whisper AI").clicked() {
+                    self.active_side_panel = ActiveSidePanel::Whisper;
+                }
+            });
+
+            ui.add_space(8.0);
+
+            // Recent Transcription Segments preview
+            let segments = self.whisper_panel.transcription_segments();
+            if !segments.is_empty() {
+                ui.label(RichText::new("Marcadores da Reunião (Transcrição Whisper):").size(12.0).strong());
+                ui.add_space(4.0);
+
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .corner_radius(6.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        let cur_ms = (current_time * 1000.0) as i64;
+                        for seg in segments.iter().take(5) {
+                            let is_current = cur_ms >= seg.start_ms && cur_ms <= seg.end_ms;
+                            ui.horizontal(|ui| {
+                                let time_lbl = format!("[{}]", TranscriptionSegment::format_timestamp(seg.start_ms));
+                                let color = if is_current {
+                                    Color32::from_rgb(250, 204, 21)
+                                } else {
+                                    Color32::from_rgb(139, 124, 246)
+                                };
+
+                                if ui.link(RichText::new(time_lbl).color(color).monospace()).clicked() {
+                                    if let Some(ref p) = self.player {
+                                        let _ = p.seek_absolute(seg.start_ms as f64 / 1000.0);
+                                    }
+                                }
+                                ui.label(&seg.text);
+                            });
+                            ui.add_space(2.0);
+                        }
+                    });
+            }
+        });
+    }
 }
 
 impl eframe::App for VadApp {
@@ -1170,6 +1601,7 @@ impl eframe::App for VadApp {
         self.handle_shortcuts(&ctx);
         self.handle_drag_and_drop(&ctx);
         self.poll_events();
+        self.poll_audio_extraction();
         self.save_progress_periodically();
 
         for integration in &mut self.platform_integrations {
@@ -1200,6 +1632,20 @@ impl eframe::App for VadApp {
                     ui.label(title);
                 } else {
                     ui.colored_label(Color32::from_rgb(150, 155, 175), "Nenhum ficheiro aberto");
+                }
+
+                // Task 5: Non-blocking top bar progress indicator (§4.17)
+                if let Some(pct) = self.extraction_progress_pct {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            Color32::from_rgb(217, 158, 66),
+                            format!("🎙 A indexar áudio: {:.0}%", pct),
+                        );
+                        if ui.small_button("✕").on_hover_text("Cancelar indexação de áudio").clicked() {
+                            self.cancel_extraction();
+                        }
+                    });
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1246,6 +1692,24 @@ impl eframe::App for VadApp {
                     ui.separator();
 
                     // Lateral Panel toggle buttons (Top Bar)
+                    let whisper_active = self.active_side_panel == ActiveSidePanel::Whisper;
+                    if ui.selectable_label(whisper_active, "🎙 Whisper").clicked() {
+                        self.active_side_panel = if whisper_active {
+                            ActiveSidePanel::None
+                        } else {
+                            ActiveSidePanel::Whisper
+                        };
+                    }
+
+                    if let Some(ref p) = self.player {
+                        if p.has_video() {
+                            let is_meeting = self.meeting_mode_view;
+                            if ui.selectable_label(is_meeting, "📊 Modo Reunião").clicked() {
+                                self.meeting_mode_view = !self.meeting_mode_view;
+                            }
+                        }
+                    }
+
                     let vid_active = self.active_side_panel == ActiveSidePanel::Video;
                     if ui.selectable_label(vid_active, "🎞 Vídeo").clicked() {
                         self.active_side_panel = if vid_active {
@@ -1340,6 +1804,21 @@ impl eframe::App for VadApp {
                             self.active_side_panel = ActiveSidePanel::Video;
                         }
 
+                        let is_wh = self.active_side_panel == ActiveSidePanel::Whisper;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Whisper")
+                                        .strong()
+                                        .color(if is_wh { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            self.active_side_panel = ActiveSidePanel::Whisper;
+                        }
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✕").clicked() {
                                 self.active_side_panel = ActiveSidePanel::None;
@@ -1393,6 +1872,18 @@ impl eframe::App for VadApp {
                                 self.video_panel.ui(ui, p);
                             }
                         }
+                        ActiveSidePanel::Whisper => {
+                            if let Some(act) = self.whisper_panel.ui(ui, self.current_audio.as_ref()) {
+                                match act {
+                                    WhisperAction::SeekTo(secs) => {
+                                        if let Some(ref p) = self.player {
+                                            let _ = p.seek_absolute(secs);
+                                        }
+                                    }
+                                    WhisperAction::SaveConfig => {}
+                                }
+                            }
+                        }
                         ActiveSidePanel::None => {}
                     }
                 });
@@ -1405,54 +1896,68 @@ impl eframe::App for VadApp {
             if self.current_media_path.is_none() {
                 // Show Welcome Screen with dropzone
                 self.render_welcome_screen(ui);
-            } else if let Some(ref mut renderer) = self.renderer {
-                // Paint OpenGL video frame
-                renderer.paint_to_rect(ui, available_rect);
+            } else {
+                let has_video = self.player.as_ref().map(|p| p.has_video()).unwrap_or(false);
+                let show_meeting_mode = !has_video || self.meeting_mode_view;
 
-                // Overlay Floating HUD over the video canvas
-                if let Some(ref player) = self.player {
-                    let whisper_disabled = self.is_feature_disabled("whisper");
+                if show_meeting_mode {
+                    self.render_meeting_mode(ui, available_rect);
+                } else if let Some(ref mut renderer) = self.renderer {
+                    // Paint OpenGL video frame
+                    renderer.paint_to_rect(ui, available_rect);
 
-                    if let Some(action) = self.hud.show(
-                        ui,
-                        available_rect,
-                        player,
-                        &self.shared_state,
-                        whisper_disabled,
-                    ) {
-                        match action {
-                            HudAction::TogglePlaylist => {
-                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Playlist {
-                                    ActiveSidePanel::None
-                                } else {
-                                    ActiveSidePanel::Playlist
-                                };
-                            }
-                            HudAction::ToggleEqualizer => {
-                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Equalizer {
-                                    ActiveSidePanel::None
-                                } else {
-                                    ActiveSidePanel::Equalizer
-                                };
-                            }
-                            HudAction::ToggleVideo => {
-                                self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Video {
-                                    ActiveSidePanel::None
-                                } else {
-                                    ActiveSidePanel::Video
-                                };
-                            }
-                            HudAction::OpenSubtitlesDialog => {
-                                self.load_subtitles_modal_open = true;
-                                self.load_subtitles_input.clear();
+                    // Overlay Floating HUD over the video canvas
+                    if let Some(ref player) = self.player {
+                        let whisper_disabled = self.is_feature_disabled("whisper");
+
+                        if let Some(action) = self.hud.show(
+                            ui,
+                            available_rect,
+                            player,
+                            &self.shared_state,
+                            whisper_disabled,
+                        ) {
+                            match action {
+                                HudAction::TogglePlaylist => {
+                                    self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Playlist {
+                                        ActiveSidePanel::None
+                                    } else {
+                                        ActiveSidePanel::Playlist
+                                    };
+                                }
+                                HudAction::ToggleEqualizer => {
+                                    self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Equalizer {
+                                        ActiveSidePanel::None
+                                    } else {
+                                        ActiveSidePanel::Equalizer
+                                    };
+                                }
+                                HudAction::ToggleVideo => {
+                                    self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Video {
+                                        ActiveSidePanel::None
+                                    } else {
+                                        ActiveSidePanel::Video
+                                    };
+                                }
+                                HudAction::ToggleWhisper => {
+                                    self.active_side_panel = if self.active_side_panel == ActiveSidePanel::Whisper {
+                                        ActiveSidePanel::None
+                                    } else {
+                                        ActiveSidePanel::Whisper
+                                    };
+                                }
+                                HudAction::OpenSubtitlesDialog => {
+                                    self.load_subtitles_modal_open = true;
+                                    self.load_subtitles_input.clear();
+                                }
                             }
                         }
                     }
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Renderer OpenGL indisponível");
+                    });
                 }
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Renderer OpenGL indisponível");
-                });
             }
 
             // Visual indicator when hovering files over window for drop
@@ -1636,4 +2141,81 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_side_panel_whisper_toggle() {
+        let mut panel = ActiveSidePanel::None;
+        // Toggle Whisper from None -> Whisper
+        panel = if panel == ActiveSidePanel::Whisper { ActiveSidePanel::None } else { ActiveSidePanel::Whisper };
+        assert_eq!(panel, ActiveSidePanel::Whisper);
+
+        // Toggle again Whisper -> None
+        panel = if panel == ActiveSidePanel::Whisper { ActiveSidePanel::None } else { ActiveSidePanel::Whisper };
+        assert_eq!(panel, ActiveSidePanel::None);
+
+        // Toggle from Video -> Whisper
+        panel = ActiveSidePanel::Video;
+        panel = if panel == ActiveSidePanel::Whisper { ActiveSidePanel::None } else { ActiveSidePanel::Whisper };
+        assert_eq!(panel, ActiveSidePanel::Whisper);
+    }
+
+    #[test]
+    fn test_waveform_zoom_calculations() {
+        let duration: f64 = 3600.0; // 1 hour
+        let current_time: f64 = 1800.0; // 30 minutes in
+        let mut zoom_window: Option<(f64, f64)> = None;
+
+        // Helper replicating apply_waveform_zoom logic
+        let apply_zoom = |window: &mut Option<(f64, f64)>, scroll_y: f32| {
+            let (cur_start, cur_end) = window.unwrap_or((0.0, duration));
+            let cur_span = cur_end - cur_start;
+            if scroll_y > 0.0 {
+                let new_span = (cur_span * 0.65).max(3.0);
+                let center = current_time.clamp(0.0, duration);
+                let new_start = (center - new_span / 2.0).max(0.0);
+                let new_end = (new_start + new_span).min(duration);
+                *window = Some((new_start, new_end));
+            } else if scroll_y < 0.0 {
+                let new_span = cur_span * 1.5;
+                if new_span >= duration {
+                    *window = None;
+                } else {
+                    let center = (cur_start + cur_end) / 2.0;
+                    let new_start = (center - new_span / 2.0).max(0.0);
+                    let new_end = (new_start + new_span).min(duration);
+                    *window = Some((new_start, new_end));
+                }
+            }
+        };
+
+        // Initially global view (None)
+        assert!(zoom_window.is_none());
+
+        // Zoom in once
+        apply_zoom(&mut zoom_window, 1.0);
+        assert!(zoom_window.is_some());
+        let (s, e) = zoom_window.unwrap();
+        assert!(e - s < duration);
+        assert!(s >= 0.0);
+        assert!(e <= duration);
+
+        // Zoom out enough times to restore global overview (None)
+        apply_zoom(&mut zoom_window, -1.0);
+        apply_zoom(&mut zoom_window, -1.0);
+        apply_zoom(&mut zoom_window, -1.0);
+        assert!(zoom_window.is_none());
+    }
+
+    #[test]
+    fn test_whisper_panel_defaults_and_storage_tooltips() {
+        use vad_ai::{DISK_TOOLTIP, RAM_ONLY_TOOLTIP};
+        let panel = crate::panels::WhisperPanel::new();
+        assert!(!panel.has_active_model());
+        assert_eq!(panel.active_model_id(), None);
+        assert!(!DISK_TOOLTIP.is_empty());
+        assert!(!RAM_ONLY_TOOLTIP.is_empty());
+        assert!(DISK_TOOLTIP.contains("disco"));
+        assert!(RAM_ONLY_TOOLTIP.contains("RAM"));
+    }
 }
+

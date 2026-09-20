@@ -22,8 +22,8 @@ pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
 };
 pub use util::{
-    is_allowed_url_scheme, vad_config_dir, vad_config_path, vad_mpv_config_dir, vad_recentes_path,
-    write_atomic,
+    is_allowed_url_scheme, vad_config_dir, vad_config_path, vad_models_dir, vad_mpv_config_dir,
+    vad_recentes_path, write_atomic,
 };
 
 #[cfg(test)]

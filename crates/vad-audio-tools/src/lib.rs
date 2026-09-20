@@ -1,2 +1,5 @@
-//! VAD Audio Tools stub crate (FFmpeg clip export, Waveform pyramid).
-//! Active development starts in Sprint 06 (M3/M4).
+//! VAD Audio Tools crate (Waveform pyramid, Clip export).
+
+pub mod waveform_pyramid;
+
+pub use waveform_pyramid::{MinMaxPoint, WaveformPyramid, ZoomLevel, TARGET_VISIBLE_POINTS};

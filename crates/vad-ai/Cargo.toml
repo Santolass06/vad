@@ -2,6 +2,22 @@
 name = "vad-ai"
 version = "0.1.0"
 edition = "2021"
-description = "VAD AI crate (Whisper, VAD, Summarization, Translation) - stub for M3/M5"
+description = "VAD AI crate (Whisper, VAD, LLM providers, Summarization) - Milestone M3/M5"
 
 [dependencies]
+vad-core = { path = "../vad-core" }
+whisper-rs = "0.16.0"
+whisper-rs-sys = "0.15.0"
+num_cpus = "1.16"
+tracing = "0.1"
+thiserror = "2.0"
+crossbeam-channel = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]

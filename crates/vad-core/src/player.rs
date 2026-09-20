@@ -448,6 +448,14 @@ impl Player {
             .map_err(VadError::Mpv)
     }
 
+    /// Checks if the currently playing media has an active video track.
+    pub fn has_video(&self) -> bool {
+        self.get_property_optional::<String>("video-format")
+            .ok()
+            .flatten()
+            .is_some_and(|fmt| !fmt.trim().is_empty())
+    }
+
     /// Gets current panscan value (0.0 = original aspect, 1.0 = pan-and-scan / fill).
     pub fn panscan(&self) -> Result<f64, VadError> {
         Ok(self.get_property_optional::<f64>("panscan")?.unwrap_or(0.0))

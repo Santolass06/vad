@@ -12,6 +12,7 @@ pub enum HudAction {
     TogglePlaylist,
     ToggleEqualizer,
     ToggleVideo,
+    ToggleWhisper,
     OpenSubtitlesDialog,
 }
 
@@ -434,8 +435,13 @@ impl HudPanel {
                     .on_disabled_hover_text("Desativado: Requer FFmpeg (`sudo apt install ffmpeg`)");
             } else {
                 let active_btn = whisper_btn.fill(Color32::from_rgba_premultiplied(217, 158, 66, 45));
-                ui.add(active_btn)
-                    .on_hover_text("Transcrição com Whisper AI (disponível no Milestone M3)");
+                if ui
+                    .add(active_btn)
+                    .on_hover_text("Abrir painel de Transcrição Whisper AI")
+                    .clicked()
+                {
+                    action = Some(HudAction::ToggleWhisper);
+                }
             }
 
             ui.separator();

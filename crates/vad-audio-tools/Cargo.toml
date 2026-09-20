@@ -2,6 +2,11 @@
 name = "vad-audio-tools"
 version = "0.1.0"
 edition = "2021"
-description = "VAD Audio Tools crate (Clip export, Waveform pyramid) - stub for M3/M4"
+description = "VAD Audio Tools crate (Clip export, Waveform pyramid) - Milestone M3/M4"
 
 [dependencies]
+vad-core = { path = "../vad-core" }
+vad-ai = { path = "../vad-ai" }
+tracing = "0.1"
+
+[dev-dependencies]

@@ -41,6 +41,30 @@ pub fn vad_config_path() -> PathBuf {
     vad_config_dir().join("config.toml")
 }
 
+/// Returns the models directory for VAD (`~/.local/share/vad/models` or `$XDG_DATA_HOME/vad/models`, §4.13).
+pub fn vad_models_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.trim().is_empty() {
+            return PathBuf::from(xdg).join("vad").join("models");
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("vad")
+                .join("models");
+        }
+    }
+
+    PathBuf::from(".local")
+        .join("share")
+        .join("vad")
+        .join("models")
+}
+
 /// Validates a URL against the allowlisted schemes per PLANO_VAD.md §4.27.
 /// Only `http://`, `https://`, and `rtsp://` are permitted.
 /// Rejects `file://`, `smb://`, `ftp://`, and other arbitrary schemes.

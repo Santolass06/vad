@@ -69,6 +69,12 @@ pub enum VadError {
 
     #[error("Invalid URL scheme: {0}")]
     InvalidUrlScheme(String),
+
+    #[error("Whisper error: {0}")]
+    Whisper(String),
+
+    #[error("Whisper callback panic caught: {0}")]
+    WhisperCallbackPanic(String),
 }
 
 impl VadError {
@@ -191,6 +197,22 @@ impl VadError {
                 severity: ErrorSeverity::Warning,
                 title: "URL Inválido",
                 description: "Esquema de URL não permitido. Apenas http://, https:// e rtsp:// são suportados.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::Whisper(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Erro no Whisper AI",
+                description: "Ocorreu um erro durante o processamento ou transcrição com o Whisper.",
+                install_command: None,
+                disabled_features: &["whisper"],
+                can_ignore: true,
+            },
+            VadError::WhisperCallbackPanic(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Pânico no Callback do Whisper",
+                description: "Um pânico no callback FFI do Whisper foi capturado com segurança.",
                 install_command: None,
                 disabled_features: &[],
                 can_ignore: true,

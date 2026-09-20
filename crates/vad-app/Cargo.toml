@@ -6,12 +6,15 @@ description = "VAD video player desktop application with egui and OpenGL"
 
 [dependencies]
 vad-core = { path = "../vad-core" }
+vad-ai = { path = "../vad-ai" }
+vad-audio-tools = { path = "../vad-audio-tools" }
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui_glow = "0.36.2"
 crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
+num_cpus = "1.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
