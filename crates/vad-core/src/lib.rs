@@ -25,7 +25,7 @@ pub use state::{
 };
 pub use util::{
     get_process_rss_bytes, is_allowed_url_scheme, vad_bookmarks_dir, vad_config_dir,
-    vad_config_path, vad_data_dir, vad_models_dir, vad_mpv_config_dir, vad_recentes_path, write_atomic,
+    vad_config_path, vad_data_dir, vad_models_dir, vad_mpv_config_dir, vad_recentes_path, vad_rnnoise_model_path, write_atomic,
 };
 
 #[cfg(test)]
@@ -403,7 +403,15 @@ mod tests {
 
         // Audio filters (10-band EQ + RNNoise)
         let gains = [-2.0, 1.0, 3.0, 4.0, 2.0, 0.0, -1.0, 2.0, 3.0, 1.0];
-        player.set_audio_filters(&gains, true).expect("Failed to set audio filters");
+        player.set_audio_filters(&gains, false).expect("Failed to set equalizer");
+        // RNNoise needs a model file: without it the call must say so (it used to return Ok while
+        // mpv silently failed to build the chain).
+        let with_rnnoise = player.set_audio_filters(&gains, true);
+        if vad_rnnoise_model_path().is_file() {
+            with_rnnoise.expect("Failed to set equalizer + RNNoise");
+        } else {
+            assert!(matches!(with_rnnoise, Err(VadError::RnnoiseModelMissing(_))), "{with_rnnoise:?}");
+        }
         player.set_audio_filters(&[0.0; 10], false).expect("Failed to clear audio filters");
 
         // Volume boost up to 200%

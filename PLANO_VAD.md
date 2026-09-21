@@ -424,6 +424,18 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     anel de foco visível (`2px`, cor de acento) — parte da configuração de
     `egui::Visuals` em `theme.rs` (Sprint_15), aplicada a diálogos já existentes
     desde a Sprint_02.
+35. **`arnndn` (RNNoise) não traz modelo.** O filtro está compilado no `libavfilter`, mas
+    sem `m=<ficheiro.rnnn>` falha a inicializar (medido com libmpv: "Audio filter
+    initialized failed!") e, como o mpv aceita a string `af` sem validar, o `af` inteiro
+    (equalizador incluído) deixa de funcionar em silêncio. **Decisão:** o modelo é um
+    ficheiro `.rnnn` em `<data dir>/models/rnnoise.rnnn` (`vad_rnnoise_model_path()`),
+    colocado pelo utilizador — não é descarregado nem incluído sem ação explícita
+    (§4.13/§4.14). Sem ele o toggle volta a "inativo" e a UI diz onde pôr o ficheiro;
+    `set_audio_filters` devolve `RnnoiseModelMissing` em vez de `Ok`.
+36. **A exportação de clips nunca sobrescreve nem apaga ficheiros do utilizador.** O
+    caminho de saída é escolhido em runtime pelo utilizador e a limpeza pós-falha/cancelamento
+    apaga a saída. **Decisão:** `validate_options` recusa uma saída que já exista (incluindo
+    a própria entrada); o ffmpeg corre com `-n`; só se apaga o que a própria exportação criou.
 
 ### Fora de âmbito, por decisão deliberada
 

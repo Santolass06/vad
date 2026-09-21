@@ -1,7 +1,7 @@
 use eframe::egui::{
     self, pos2, vec2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui,
 };
-use vad_core::{AudioDevice, Player};
+use vad_core::{AudioDevice, Player, VadError};
 
 /// Equalizer and audio configuration panel corresponding to `design/Equalizer.dc.html`.
 /// Features a 10-band graphic equalizer with continuous spectral curve, 0 dB baseline,
@@ -11,6 +11,8 @@ pub struct AudioPanel {
     pub active_preset: String,
     pub volume_boost: f64,
     pub rnnoise: bool,
+    /// Why the last filter update could not be fully applied (shown next to the RNNoise toggle).
+    pub filter_error: Option<String>,
     pub cached_devices: Vec<AudioDevice>,
     pub selected_device: String,
     last_device_query: Option<std::time::Instant>,
@@ -32,9 +34,25 @@ impl AudioPanel {
             active_preset: "Plano".to_string(),
             volume_boost: 100.0,
             rnnoise: false,
+            filter_error: None,
             cached_devices: Vec::new(),
             selected_device: "auto".to_string(),
             last_device_query: None,
+        }
+    }
+
+    /// Pushes the equalizer + RNNoise state to mpv. If RNNoise cannot run (no model file), the
+    /// toggle is switched back off and the reason is kept in `filter_error`; the equalizer is
+    /// applied regardless. Every caller goes through here so a failure is never swallowed.
+    pub fn apply_filters(&mut self, player: &Player) {
+        self.filter_error = None;
+        match player.set_audio_filters(&self.gains, self.rnnoise) {
+            Ok(()) => {}
+            Err(err @ VadError::RnnoiseModelMissing(_)) => {
+                self.rnnoise = false;
+                self.filter_error = Some(err.to_string());
+            }
+            Err(err) => self.filter_error = Some(format!("Filtros de áudio: {err}")),
         }
     }
 
@@ -91,7 +109,7 @@ impl AudioPanel {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Repor").clicked() {
                         self.apply_preset("Plano");
-                        let _ = player.set_audio_filters(&self.gains, self.rnnoise);
+                        self.apply_filters(player);
                     }
                 });
             });
@@ -116,7 +134,7 @@ impl AudioPanel {
 
                     if cols[i].add_sized(vec2(cols[i].available_width(), 26.0), btn).clicked() {
                         self.apply_preset(p);
-                        let _ = player.set_audio_filters(&self.gains, self.rnnoise);
+                        self.apply_filters(player);
                     }
                 }
             });
@@ -279,7 +297,7 @@ impl AudioPanel {
             }
 
             if band_changed {
-                let _ = player.set_audio_filters(&self.gains, self.rnnoise);
+                self.apply_filters(player);
             }
         });
 
@@ -309,9 +327,12 @@ impl AudioPanel {
 
             let chk = ui.checkbox(&mut self.rnnoise, rn_label);
             if chk.changed() {
-                let _ = player.set_audio_filters(&self.gains, self.rnnoise);
+                self.apply_filters(player);
             }
         });
+        if let Some(ref err) = self.filter_error {
+            ui.colored_label(Color32::from_rgb(239, 68, 68), egui::RichText::new(err).size(10.5));
+        }
 
         // --- SECTION: DISPOSITIVO DE SAÍDA ---
         ui.vertical(|ui| {

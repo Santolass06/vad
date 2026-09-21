@@ -75,6 +75,9 @@ pub enum VadError {
 
     #[error("Whisper callback panic caught: {0}")]
     WhisperCallbackPanic(String),
+
+    #[error("Modelo RNNoise em falta: coloca um ficheiro .rnnn em {0}")]
+    RnnoiseModelMissing(String),
 }
 
 impl VadError {
@@ -207,6 +210,14 @@ impl VadError {
                 description: "Ocorreu um erro durante o processamento ou transcrição com o Whisper.",
                 install_command: None,
                 disabled_features: &["whisper"],
+                can_ignore: true,
+            },
+            VadError::RnnoiseModelMissing(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Modelo RNNoise em falta",
+                description: "O filtro arnndn não traz modelo próprio; a redução de ruído fica desligada até existir um ficheiro .rnnn na pasta de modelos.",
+                install_command: None,
+                disabled_features: &["rnnoise"],
                 can_ignore: true,
             },
             VadError::WhisperCallbackPanic(_) => ErrorAction {

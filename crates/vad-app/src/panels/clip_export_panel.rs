@@ -4,7 +4,7 @@ use std::time::Instant;
 use eframe::egui::{
     self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
 };
-use vad_audio_tools::WaveformPyramid;
+use vad_audio_tools::{keyframe_at_or_before, WaveformPyramid};
 
 
 /// Action emitted by the Clip Export interface.
@@ -23,6 +23,34 @@ pub enum ClipExportAction {
     },
     PauseSelection,
     SeekTo(f64),
+    CancelExport,
+}
+
+/// Selection preview in progress: pause once the playhead reaches `end`.
+///
+/// The playhead only counts once it has been seen *before* `end`. Right after the seek the shared
+/// position can still be the old one (e.g. 200 s for a 10–20 s selection); without this guard that
+/// stale value read as "already past the end" and the preview paused itself instantly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionPlayback {
+    end: f64,
+    armed: bool,
+}
+
+impl SelectionPlayback {
+    pub fn new(end: f64) -> Self {
+        Self { end, armed: false }
+    }
+
+    /// Feeds the current playhead position; true when the preview must stop now.
+    pub fn reached_end(&mut self, current_time: f64) -> bool {
+        if current_time < self.end {
+            self.armed = true;
+            false
+        } else {
+            self.armed
+        }
+    }
 }
 
 /// Identifies which waveform handle is currently being dragged.
@@ -44,6 +72,10 @@ pub struct ClipExportPanel {
     pub export_status: Option<(String, bool, Instant)>, // (message, is_error, timestamp)
     active_drag: Option<ActiveDragHandle>,
     last_media_path: Option<String>,
+    /// Keyframe times of the current media: `None` while unknown/being probed, empty for
+    /// audio-only files.
+    keyframes: Option<Vec<f64>>,
+    keyframes_for: Option<String>,
 }
 
 impl Default for ClipExportPanel {
@@ -65,6 +97,8 @@ impl ClipExportPanel {
             export_status: None,
             active_drag: None,
             last_media_path: None,
+            keyframes: None,
+            keyframes_for: None,
         }
     }
 
@@ -135,10 +169,51 @@ impl ClipExportPanel {
         self.end_input_text = Self::format_hms(end);
         self.filename_input = default_output;
         self.exact_cut = false;
-        self.is_exporting = false;
+        // `is_exporting` belongs to the export task, not to the media: an export that is still
+        // running must keep the button locked (its result clears the flag).
         self.export_status = None;
         self.active_drag = None;
         self.last_media_path = Some(media_path.to_string());
+    }
+
+    /// Initialises the panel for `media_path` unless it already is: reopening the panel, or
+    /// marking `I`/`O` before opening it, must not throw the selection away.
+    pub fn ensure_media(&mut self, media_path: &str, duration: f64) {
+        if self.last_media_path.as_deref() != Some(media_path) {
+            self.reset_for_media(media_path, duration);
+        }
+    }
+
+    /// Drops the per-media state; the next `ensure_media` re-initialises it with the real duration.
+    pub fn forget_media(&mut self) {
+        self.last_media_path = None;
+        self.keyframes = None;
+        self.keyframes_for = None;
+    }
+
+    /// Whether keyframes for `media_path` were already probed (or are being probed).
+    pub fn has_keyframes_for(&self, media_path: &str) -> bool {
+        self.keyframes_for.as_deref() == Some(media_path)
+    }
+
+    /// Marks the keyframe probe of `media_path` as started.
+    pub fn begin_keyframes(&mut self, media_path: &str) {
+        self.keyframes_for = Some(media_path.to_string());
+        self.keyframes = None;
+    }
+
+    /// Stores the probe result (ignored if the panel has moved on to other media).
+    pub fn set_keyframes(&mut self, media_path: &str, keyframes: Vec<f64>) {
+        if self.has_keyframes_for(media_path) {
+            self.keyframes = Some(keyframes);
+        }
+    }
+
+    /// Applies a typed time to `current` only when the text differs from what is displayed:
+    /// the box shows whole seconds, so re-parsing an untouched box would round a dragged handle.
+    fn typed_time(text: &str, current: f64) -> Option<f64> {
+        let secs = Self::parse_hms(text)?;
+        (Self::format_hms(current) != Self::format_hms(secs)).then_some(secs)
     }
 
     /// Sets the In-point (start) from current playhead position (`I` shortcut).
@@ -174,28 +249,14 @@ impl ClipExportPanel {
         let mut action = None;
         let duration_safe = duration.max(0.1);
 
-        // Auto-initialize if media changed
-        if self.last_media_path.as_deref() != Some(media_path) {
-            self.reset_for_media(media_path, duration_safe);
-        }
-
-        // Keyboard shortcuts
-        ui.input(|i| {
-            if i.key_pressed(egui::Key::Escape) {
-                action = Some(ClipExportAction::Close);
-            }
-            if i.key_pressed(egui::Key::I) && !i.modifiers.command && !i.modifiers.ctrl {
-                self.set_in_point(current_time);
-            }
-            if i.key_pressed(egui::Key::O) && !i.modifiers.command && !i.modifiers.ctrl {
-                self.set_out_point(current_time, duration_safe);
-            }
-        });
-
+        // Auto-initialize if media changed. Keyboard shortcuts (I/O/C/Escape) live in
+        // `VadApp::handle_shortcuts`, behind the "is a text field focused?" guard; a second copy
+        // here fired while typing a file name such as "intro_clip.mp4".
+        self.ensure_media(media_path, duration_safe);
 
         let accent = Color32::from_rgb(139, 124, 246); // #8b7cf6
         let bg_card = Color32::from_rgba_premultiplied(32, 34, 46, 220);
-        let border_color = Color32::from_rgba_premultiplied(255, 255, 255, 18);
+        let border_color = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
 
         // --- ROOT CONTAINER (ClipExport.dc.html) ---
         ui.vertical(|ui| {
@@ -217,27 +278,13 @@ impl ClipExportPanel {
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(RichText::new("✕ Fechar").size(12.0)).clicked() {
+                    if ui.button(RichText::new("Fechar").size(12.0)).clicked() {
                         action = Some(ClipExportAction::Close);
                     }
                 });
             });
 
             ui.separator();
-
-            // Status notification banner if active
-            if let Some((ref msg, is_err, timestamp)) = self.export_status {
-                if timestamp.elapsed().as_secs() < 8 {
-                    let col = if is_err {
-                        Color32::from_rgb(239, 68, 68)
-                    } else {
-                        Color32::from_rgb(34, 197, 94)
-                    };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(col, RichText::new(msg).strong());
-                    });
-                }
-            }
 
             ui.add_space(8.0);
 
@@ -279,7 +326,7 @@ impl ClipExportPanel {
                     let bar_color = if in_sel {
                         accent
                     } else {
-                        Color32::from_rgba_premultiplied(255, 255, 255, 30)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 30)
                     };
 
                     let half_h = (wave_h * 0.44).max(3.0);
@@ -303,7 +350,7 @@ impl ClipExportPanel {
                     let bar_color = if in_sel {
                         accent
                     } else {
-                        Color32::from_rgba_premultiplied(255, 255, 255, 30)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 30)
                     };
                     let h_pct = seed[i % seed.len()] / 100.0;
                     let bh = (wave_h * 0.85 * h_pct).max(4.0);
@@ -324,7 +371,7 @@ impl ClipExportPanel {
             painter.rect_filled(
                 sel_rect,
                 CornerRadius::same(4),
-                Color32::from_rgba_premultiplied(139, 124, 246, 35),
+                Color32::from_rgba_unmultiplied(139, 124, 246, 35),
             );
 
             // Left In Handle
@@ -401,21 +448,26 @@ impl ClipExportPanel {
             }
 
 
-            // Keyframe tick marks track below waveform (lines 53-61 in ClipExport.dc.html)
+            // Keyframe ticks (real ones, from ffprobe). A fast cut can only start on one of them.
             let kf_y = wave_rect.bottom() + 10.0;
-            let n_kf_slots = 60;
-            let kf_step = wave_rect.width() / n_kf_slots as f32;
-            for i in 0..=n_kf_slots {
-                if i % 6 == 0 {
-                    let kf_x = wave_rect.left() + i as f32 * kf_step;
+            if let Some(ref keyframes) = self.keyframes {
+                let mut last_x = f32::NEG_INFINITY;
+                for &kf in keyframes {
+                    let kf_x = wave_rect.left()
+                        + (kf / duration_safe).clamp(0.0, 1.0) as f32 * wave_rect.width();
+                    // dense GOPs would paint a solid bar: keep ticks at least 3 px apart
+                    if kf_x - last_x < 3.0 {
+                        continue;
+                    }
+                    last_x = kf_x;
                     painter.line_segment(
                         [pos2(kf_x, kf_y), pos2(kf_x, kf_y + 6.0)],
-                        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 70)),
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)),
                     );
                 }
             }
 
-            // Time labels row (00:00:00 | marcas = keyframes | duration)
+            // Time labels row (00:00:00 | keyframes note | duration)
             let labels_y = kf_y + 10.0;
             painter.text(
                 pos2(wave_rect.left(), labels_y),
@@ -424,10 +476,15 @@ impl ClipExportPanel {
                 egui::FontId::monospace(10.5),
                 Color32::from_rgb(140, 145, 165),
             );
+            let kf_note = match self.keyframes {
+                None => "a analisar keyframes…",
+                Some(ref k) if k.is_empty() => "sem vídeo: não há keyframes",
+                Some(_) => "| marcas = keyframes",
+            };
             painter.text(
                 pos2(wave_rect.center().x, labels_y),
                 egui::Align2::CENTER_TOP,
-                "| marcas = keyframes",
+                kf_note,
                 egui::FontId::proportional(10.5),
                 Color32::from_rgb(120, 125, 145),
             );
@@ -461,12 +518,10 @@ impl ClipExportPanel {
                                     .desired_width(90.0),
                             );
                             if resp.lost_focus() {
-                                if let Some(secs) = Self::parse_hms(&self.start_input_text) {
-                                    self.start_seconds = secs.min(self.end_seconds - 0.1);
-                                    self.start_input_text = Self::format_hms(self.start_seconds);
-                                } else {
-                                    self.start_input_text = Self::format_hms(self.start_seconds);
+                                if let Some(secs) = Self::typed_time(&self.start_input_text, self.start_seconds) {
+                                    self.start_seconds = secs.min(self.end_seconds - 0.1).max(0.0);
                                 }
+                                self.start_input_text = Self::format_hms(self.start_seconds);
                             }
                         });
 
@@ -479,12 +534,10 @@ impl ClipExportPanel {
                                     .desired_width(90.0),
                             );
                             if resp.lost_focus() {
-                                if let Some(secs) = Self::parse_hms(&self.end_input_text) {
+                                if let Some(secs) = Self::typed_time(&self.end_input_text, self.end_seconds) {
                                     self.end_seconds = secs.max(self.start_seconds + 0.1).min(duration_safe);
-                                    self.end_input_text = Self::format_hms(self.end_seconds);
-                                } else {
-                                    self.end_input_text = Self::format_hms(self.end_seconds);
                                 }
+                                self.end_input_text = Self::format_hms(self.end_seconds);
                             }
                         });
 
@@ -526,6 +579,25 @@ impl ClipExportPanel {
                             });
                         });
                     });
+
+                    // Where the fast cut really starts (told before exporting, §8 risk note)
+                    if !self.exact_cut {
+                        let hint = match self.keyframes.as_deref() {
+                            Some([]) => Some("Sem vídeo: não há keyframes; o corte rápido segue os limites dos pacotes de áudio.".to_string()),
+                            Some(kf) => keyframe_at_or_before(kf, self.start_seconds)
+                                .filter(|k| self.start_seconds - k >= 0.5)
+                                .map(|k| format!(
+                                    "Corte rápido: o clip começa no keyframe anterior, {} (e não em {}). Liga «Corte exato» para começar mesmo em {}.",
+                                    Self::format_hms(k),
+                                    Self::format_hms(self.start_seconds),
+                                    Self::format_hms(self.start_seconds),
+                                )),
+                            None => None,
+                        };
+                        if let Some(hint) = hint {
+                            ui.colored_label(Color32::from_rgb(250, 204, 21), RichText::new(hint).size(10.5));
+                        }
+                    }
 
                     // Botão "▶ Reproduzir Seleção" / "⏸ Pausa"
                     let play_label = if is_playing_selection {
@@ -595,6 +667,26 @@ impl ClipExportPanel {
                             output_filename: self.filename_input.trim().to_string(),
                         });
                     }
+                    if self.is_exporting && ui.button("Cancelar exportação").clicked() {
+                        action = Some(ClipExportAction::CancelExport);
+                    }
+
+                    // Result of the last export, under the button so nothing above it shifts.
+                    if let Some((ref msg, is_err, at)) = self.export_status {
+                        const SHOWN_FOR: std::time::Duration = std::time::Duration::from_secs(8);
+                        // an error stays until the next attempt; a success fades out
+                        if is_err || at.elapsed() < SHOWN_FOR {
+                            let col = if is_err {
+                                Color32::from_rgb(239, 68, 68)
+                            } else {
+                                Color32::from_rgb(34, 197, 94)
+                            };
+                            ui.colored_label(col, RichText::new(msg).size(11.5).strong());
+                            if !is_err {
+                                ui.ctx().request_repaint_after(SHOWN_FOR.saturating_sub(at.elapsed()));
+                            }
+                        }
+                    }
                 });
             });
         });
@@ -656,6 +748,63 @@ mod tests {
         assert!(panel.end_seconds > 0.0);
         assert!(!panel.is_exporting);
         assert!(panel.export_status.is_none());
+    }
+
+    #[test]
+    fn test_ensure_media_keeps_the_selection_of_the_same_media() {
+        let mut panel = ClipExportPanel::new();
+        panel.ensure_media("/tmp/a.mp4", 100.0);
+        panel.set_in_point(12.0);
+        panel.set_out_point(40.0, 100.0);
+        panel.exact_cut = true;
+
+        // Reopening (or pressing I/O before the panel was ever shown) must not reset it
+        panel.ensure_media("/tmp/a.mp4", 100.0);
+        assert_eq!((panel.start_seconds, panel.end_seconds, panel.exact_cut), (12.0, 40.0, true));
+
+        // Another file starts from its own defaults
+        panel.ensure_media("/tmp/b.mkv", 200.0);
+        assert_eq!((panel.start_seconds, panel.end_seconds, panel.exact_cut), (0.0, 50.0, false));
+        assert_eq!(panel.filename_input, "b_clip.mkv");
+    }
+
+    #[test]
+    fn test_running_export_stays_locked_when_media_changes() {
+        let mut panel = ClipExportPanel::new();
+        panel.is_exporting = true;
+        panel.forget_media();
+        panel.ensure_media("/tmp/next.mp4", 60.0);
+        assert!(panel.is_exporting);
+    }
+
+    #[test]
+    fn test_keyframes_for_other_media_are_ignored() {
+        let mut panel = ClipExportPanel::new();
+        panel.begin_keyframes("/tmp/a.mp4");
+        panel.set_keyframes("/tmp/old.mp4", vec![1.0]);
+        assert!(panel.keyframes.is_none());
+        panel.set_keyframes("/tmp/a.mp4", vec![0.0, 2.0]);
+        assert_eq!(panel.keyframes, Some(vec![0.0, 2.0]));
+        panel.forget_media();
+        assert!(!panel.has_keyframes_for("/tmp/a.mp4"));
+    }
+
+    #[test]
+    fn test_typed_time_ignores_untouched_box() {
+        // A dragged handle at 3.7 s shows "00:00:04"; re-reading that text must not round it.
+        assert_eq!(ClipExportPanel::typed_time("00:00:04", 3.7), None);
+        assert_eq!(ClipExportPanel::typed_time("00:00:09", 3.7), Some(9.0));
+        assert_eq!(ClipExportPanel::typed_time("lixo", 3.7), None);
+    }
+
+    #[test]
+    fn test_selection_playback_ignores_stale_position_after_seek() {
+        // Selection 10–20 s, playhead was at 200 s when the preview started.
+        let mut preview = SelectionPlayback::new(20.0);
+        assert!(!preview.reached_end(200.0), "stale position must not stop the preview");
+        assert!(!preview.reached_end(10.1));
+        assert!(!preview.reached_end(19.9));
+        assert!(preview.reached_end(20.02));
     }
 
     #[test]

@@ -63,6 +63,13 @@ pub fn vad_models_dir() -> PathBuf {
     vad_data_dir().join("models")
 }
 
+/// Returns where the RNNoise model (`.rnnn`) must be placed for the `arnndn` filter.
+/// The filter has no built-in model (`af=arnndn` alone fails to initialise), so noise reduction
+/// only works once the user has put a model here.
+pub fn vad_rnnoise_model_path() -> PathBuf {
+    vad_models_dir().join("rnnoise.rnnn")
+}
+
 /// Returns the meeting-bookmarks directory for VAD (`<data dir>/bookmarks`).
 pub fn vad_bookmarks_dir() -> PathBuf {
     vad_data_dir().join("bookmarks")

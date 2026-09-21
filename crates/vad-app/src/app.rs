@@ -13,18 +13,19 @@ use vad_ai::{
     VadDetectionResult, VadDetector, WhisperEngine,
 };
 use vad_audio_tools::{
-    export_clip_async, ClipExportHandle, ClipExportOptions, ClipExportStatus, WaveformPyramid,
-    TARGET_VISIBLE_POINTS,
+    export_clip_async, probe_keyframes_async, resolve_output_path, ClipExportHandle,
+    ClipExportOptions, ClipExportStatus, KeyframeProbe, WaveformPyramid, TARGET_VISIBLE_POINTS,
 };
 use vad_core::{
-    create_event_channel, is_allowed_url_scheme, vad_data_dir, BookmarkStore, EventReceiver,
+    create_event_channel, is_allowed_url_scheme, BookmarkStore, EventReceiver,
     GlProcAddressFn, PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
     SharedPlayerState, VadConfig, VadError,
 };
 
 use crate::panels::{
     AudioPanel, ClipExportAction, ClipExportPanel, HudAction, HudPanel, PlaylistAction,
-    PlaylistPanel, VideoPanel, WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT,
+    PlaylistPanel, SelectionPlayback, VideoPanel, WhisperAction, WhisperPanel,
+    IDLE_UNLOAD_TIMEOUT,
 };
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
@@ -115,7 +116,8 @@ pub struct VadApp {
     clip_export_open: bool,
     clip_export_handle: Option<ClipExportHandle>,
     clip_export_rx: Option<crossbeam_channel::Receiver<ClipExportStatus>>,
-    selection_playback_target: Option<f64>,
+    selection_playback: Option<SelectionPlayback>,
+    keyframes_rx: Option<crossbeam_channel::Receiver<KeyframeProbe>>,
 }
 
 
@@ -221,7 +223,7 @@ impl VadApp {
             // The panel only pushes filters to mpv on interaction; without this the restored
             // gains/RNNoise show in the UI while the audio stays flat.
             if audio_panel.rnnoise || audio_panel.gains != [0.0; 10] {
-                let _ = p.set_audio_filters(&audio_panel.gains, audio_panel.rnnoise);
+                audio_panel.apply_filters(p);
             }
             if let Some(ref dev) = config.player.audio_device {
                 let _ = p.set_audio_device(dev);
@@ -307,7 +309,8 @@ impl VadApp {
             clip_export_open: false,
             clip_export_handle: None,
             clip_export_rx: None,
-            selection_playback_target: None,
+            selection_playback: None,
+            keyframes_rx: None,
         };
 
 
@@ -388,8 +391,9 @@ impl VadApp {
                 self.editing_bookmark_id = None;
                 self.bookmark_input_text.clear();
                 self.whisper_panel.reset_for_new_media();
-                self.selection_playback_target = None;
-                self.clip_export_panel.reset_for_media(trimmed, 0.0);
+                self.selection_playback = None;
+                self.clip_export_panel.forget_media();
+                self.keyframes_rx = None;
 
                 // Start non-blocking background audio extraction for waveform & Whisper (§4.17)
                 self.start_audio_extraction(trimmed);
@@ -525,7 +529,7 @@ impl VadApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.clip_export_open {
                 self.clip_export_open = false;
-                self.selection_playback_target = None;
+                self.selection_playback = None;
             } else if self.resume_toast.is_some() {
                 self.resume_toast = None;
             } else if self.show_dependency_dialog {
@@ -661,7 +665,7 @@ impl VadApp {
         {
             if self.clip_export_open {
                 self.clip_export_open = false;
-                self.selection_playback_target = None;
+                self.selection_playback = None;
             } else {
                 self.open_clip_export();
             }
@@ -673,6 +677,9 @@ impl VadApp {
             && ctx.input(|i| i.key_pressed(egui::Key::I))
         {
             let cur = self.shared_state.get_time_pos();
+            if let Some(ref path) = self.current_media_path {
+                self.clip_export_panel.ensure_media(path, self.shared_state.get_duration());
+            }
             self.clip_export_panel.set_in_point(cur);
             self.hud.set_notification(format!("Ponto de Início definido (I): {}", ClipExportPanel::format_hms(self.clip_export_panel.start_seconds)));
         }
@@ -684,6 +691,9 @@ impl VadApp {
         {
             let cur = self.shared_state.get_time_pos();
             let dur = self.shared_state.get_duration();
+            if let Some(ref path) = self.current_media_path {
+                self.clip_export_panel.ensure_media(path, dur);
+            }
             self.clip_export_panel.set_out_point(cur, dur);
             self.hud.set_notification(format!("Ponto de Fim definido (O): {}", ClipExportPanel::format_hms(self.clip_export_panel.end_seconds)));
         }
@@ -1436,14 +1446,27 @@ impl VadApp {
         }
     }
 
-    /// Opens the Clip Export interface for the current media file.
+    /// Opens the Clip Export interface for the current media file. The selection and options are
+    /// kept when the panel is reopened for the same file.
     pub fn open_clip_export(&mut self) {
-        if let Some(ref path) = self.current_media_path {
-            let dur = self.shared_state.get_duration();
-            self.clip_export_panel.reset_for_media(path, dur);
-            self.clip_export_open = true;
-            self.hud.poke();
+        let Some(path) = self.current_media_path.clone() else {
+            return;
+        };
+        // ffmpeg cuts a file on disk; a stream URL has nothing to cut.
+        if !Path::new(&path).is_file() {
+            let msg = "Cortar clips só está disponível para ficheiros locais".to_string();
+            self.hud.set_notification(msg.clone());
+            self.export_notification = Some((msg, Instant::now()));
+            return;
         }
+        self.clip_export_panel
+            .ensure_media(&path, self.shared_state.get_duration());
+        if !self.clip_export_panel.has_keyframes_for(&path) {
+            self.clip_export_panel.begin_keyframes(&path);
+            self.keyframes_rx = Some(probe_keyframes_async(path));
+        }
+        self.clip_export_open = true;
+        self.hud.poke();
     }
 
     /// Starts asynchronous clip export using the FFmpeg CLI subprocess (§4.26).
@@ -1459,22 +1482,9 @@ impl VadApp {
             None => return,
         };
 
-        let path_buf = Path::new(&output_filename);
-        let output_path = if path_buf.is_absolute() {
-            output_filename
-        } else {
-            let parent = Path::new(&input_path).parent().unwrap_or(Path::new("."));
-            let target_dir = if parent.is_dir() && !parent.as_os_str().is_empty() {
-                parent.to_path_buf()
-            } else {
-                vad_data_dir().join("clips")
-            };
-            let _ = std::fs::create_dir_all(&target_dir);
-            target_dir
-                .join(&output_filename)
-                .to_string_lossy()
-                .to_string()
-        };
+        let output_path = resolve_output_path(&input_path, &output_filename)
+            .to_string_lossy()
+            .to_string();
 
         let options = ClipExportOptions {
             input_path,
@@ -1491,8 +1501,38 @@ impl VadApp {
         self.clip_export_panel.set_status("A exportar clip...", false);
     }
 
-    /// Polls clip export completion or error without blocking the UI thread.
+    /// Aborts a running clip export (kills ffmpeg, §4.17); its result arrives as `Cancelled`.
+    fn cancel_clip_export(&mut self) {
+        if let Some(ref handle) = self.clip_export_handle {
+            handle.cancel();
+        }
+    }
+
+    /// Polls the keyframe probe and the clip export without blocking the UI thread. The window is
+    /// not repainted by itself while idle, so while either is pending it schedules its own wake-up.
     fn poll_clip_export(&mut self, ctx: &egui::Context) {
+        if let Some(ref rx) = self.keyframes_rx {
+            match rx.try_recv() {
+                Ok((path, result)) => {
+                    self.keyframes_rx = None;
+                    match result {
+                        Ok(keyframes) => self.clip_export_panel.set_keyframes(&path, keyframes),
+                        Err(err) => {
+                            warn!("Keyframe probe failed for {path}: {err}");
+                            self.clip_export_panel.set_keyframes(&path, Vec::new());
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.keyframes_rx = None,
+            }
+        }
+        if self.clip_export_rx.is_some() && self.clip_export_panel.is_exporting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         if let Some(ref rx) = self.clip_export_rx {
             while let Ok(status) = rx.try_recv() {
                 match status {
@@ -1538,13 +1578,12 @@ impl VadApp {
 
     /// Manages playback when previewing a selection, stopping when the out-point is reached.
     fn handle_selection_playback(&mut self) {
-        if let Some(target) = self.selection_playback_target {
-            let cur = self.shared_state.get_time_pos();
-            if cur >= target {
+        if let Some(ref mut preview) = self.selection_playback {
+            if preview.reached_end(self.shared_state.get_time_pos()) {
                 if let Some(ref p) = self.player {
                     let _ = p.pause();
                 }
-                self.selection_playback_target = None;
+                self.selection_playback = None;
             }
         }
     }
@@ -1557,7 +1596,7 @@ impl VadApp {
         };
         let duration = self.shared_state.get_duration();
         let current_time = self.shared_state.get_time_pos();
-        let is_playing_sel = self.selection_playback_target.is_some();
+        let is_playing_sel = self.selection_playback.is_some();
 
         let mut maybe_action = None;
         ui.vertical(|ui| {
@@ -1575,7 +1614,7 @@ impl VadApp {
             match action {
                 ClipExportAction::Close => {
                     self.clip_export_open = false;
-                    self.selection_playback_target = None;
+                    self.selection_playback = None;
                 }
                 ClipExportAction::PlaySelection {
                     start_seconds,
@@ -1584,15 +1623,16 @@ impl VadApp {
                     if let Some(ref p) = self.player {
                         let _ = p.seek_absolute(start_seconds);
                         let _ = p.play();
-                        self.selection_playback_target = Some(end_seconds);
+                        self.selection_playback = Some(SelectionPlayback::new(end_seconds));
                     }
                 }
                 ClipExportAction::PauseSelection => {
                     if let Some(ref p) = self.player {
                         let _ = p.pause();
                     }
-                    self.selection_playback_target = None;
+                    self.selection_playback = None;
                 }
+                ClipExportAction::CancelExport => self.cancel_clip_export(),
                 ClipExportAction::SeekTo(secs) => {
                     if let Some(ref p) = self.player {
                         let _ = p.seek_absolute(secs);
@@ -1927,8 +1967,11 @@ impl VadApp {
                 {
                     self.audio_panel.rnnoise = !self.audio_panel.rnnoise;
                     if let Some(ref p) = self.player {
-                        let _ = p.set_audio_filters(&self.audio_panel.gains, self.audio_panel.rnnoise);
+                        self.audio_panel.apply_filters(p);
                     }
+                }
+                if let Some(ref err) = self.audio_panel.filter_error {
+                    ui.colored_label(Color32::from_rgb(239, 68, 68), RichText::new(err).size(11.0));
                 }
 
                 // Botão: Cortar Clip - Task 3
@@ -2410,7 +2453,7 @@ impl eframe::App for VadApp {
                         if ui.selectable_label(clip_active, "✂ Cortar Clip").clicked() {
                             if clip_active {
                                 self.clip_export_open = false;
-                                self.selection_playback_target = None;
+                                self.selection_playback = None;
                             } else {
                                 self.open_clip_export();
                             }
@@ -2663,7 +2706,7 @@ impl eframe::App for VadApp {
                                 HudAction::ToggleClipExport => {
                                     if self.clip_export_open {
                                         self.clip_export_open = false;
-                                        self.selection_playback_target = None;
+                                        self.selection_playback = None;
                                     } else {
                                         self.open_clip_export();
                                     }
@@ -2716,6 +2759,8 @@ impl eframe::App for VadApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Do not leave an ffmpeg encode running (and a half-written clip) behind the window (§4.17)
+        self.cancel_clip_export();
         self.save_state();
     }
 }

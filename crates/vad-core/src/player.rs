@@ -13,7 +13,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::error::VadError;
 use crate::state::{EventSender, PlaybackState, PlayerEvent, SharedPlayerState};
-use crate::util::{is_allowed_url_scheme, vad_mpv_config_dir};
+use crate::util::{is_allowed_url_scheme, vad_mpv_config_dir, vad_rnnoise_model_path};
 
 /// Function pointer type for OpenGL procedure address lookup (`glXGetProcAddress` / `eglGetProcAddress`).
 pub type GlProcAddressFn = Arc<dyn Fn(&str) -> *mut c_void + Send + Sync>;
@@ -116,6 +116,46 @@ impl VideoRenderContext {
             .map_err(VadError::Mpv)
     }
 
+}
+
+/// Escapes `value` so it survives libavfilter's two parsing levels (filtergraph, then option
+/// string) when used as an option value, e.g. a model path containing `:` or `,`.
+fn escape_filter_value(value: &str) -> String {
+    let level1: String = value.chars().fold(String::new(), |mut acc, c| {
+        if matches!(c, '\\' | '\'' | ':') {
+            acc.push('\\');
+        }
+        acc.push(c);
+        acc
+    });
+    level1.chars().fold(String::new(), |mut acc, c| {
+        if matches!(c, '\\' | '\'' | '[' | ']' | ',' | ';') {
+            acc.push('\\');
+        }
+        acc.push(c);
+        acc
+    })
+}
+
+/// Builds the mpv `af` string: the 10-band equalizer (only when a gain is non-zero) followed by
+/// `arnndn` loaded from `rnnoise_model` (only when given).
+pub fn build_audio_filter_chain(eq_gains: &[f64; 10], rnnoise_model: Option<&Path>) -> String {
+    const FREQS: [u32; 10] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+    let mut parts = Vec::new();
+
+    if eq_gains.iter().any(|&g| g.abs() > 0.01) {
+        for (f, &g) in FREQS.iter().zip(eq_gains.iter()) {
+            parts.push(format!("lavfi=[equalizer=f={f}:width_type=o:w=1:g={g:.1}]"));
+        }
+    }
+
+    if let Some(model) = rnnoise_model {
+        // mpv's `%len%value` form carries the graph verbatim, so no mpv-level escaping is needed.
+        let graph = format!("arnndn=m={}", escape_filter_value(&model.to_string_lossy()));
+        parts.push(format!("lavfi=graph=%{}%{}", graph.len(), graph));
+    }
+
+    parts.join(",")
 }
 
 /// Core player controlling playback and observing mpv events.
@@ -573,24 +613,20 @@ impl Player {
 
     /// Sets the audio filter chain (`af`) combining the 10-band equalizer and RNNoise (`arnndn`).
     /// Frequencies: 32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz.
+    ///
+    /// `arnndn` needs a model file. When RNNoise is requested and the model is missing, the
+    /// equalizer is still applied but `Err(RnnoiseModelMissing)` is returned, so the caller can
+    /// switch the toggle off and tell the user. (mpv itself accepts a broken `af` string and only
+    /// logs "Audio filter initialized failed!", which used to leave the whole chain dead.)
     pub fn set_audio_filters(&self, eq_gains: &[f64; 10], rnnoise: bool) -> Result<(), VadError> {
-        const FREQS: [u32; 10] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-        let mut parts = Vec::new();
-
-        // Check if any EQ gain differs from 0.0 dB
-        let has_eq = eq_gains.iter().any(|&g| g.abs() > 0.01);
-        if has_eq {
-            for (f, &g) in FREQS.iter().zip(eq_gains.iter()) {
-                parts.push(format!("lavfi=[equalizer=f={f}:width_type=o:w=1:g={g:.1}]"));
-            }
+        let model = vad_rnnoise_model_path();
+        let model_present = model.is_file();
+        let af_string = build_audio_filter_chain(eq_gains, rnnoise.then_some(model.as_path()).filter(|_| model_present));
+        self.mpv.set_property("af", af_string.as_str()).map_err(VadError::Mpv)?;
+        if rnnoise && !model_present {
+            return Err(VadError::RnnoiseModelMissing(model.display().to_string()));
         }
-
-        if rnnoise {
-            parts.push("lavfi=[arnndn]".to_string());
-        }
-
-        let af_string = parts.join(",");
-        self.mpv.set_property("af", af_string.as_str()).map_err(VadError::Mpv)
+        Ok(())
     }
 
     /// Spawns a background thread listening for mpv events and updating `SharedPlayerState`.
@@ -720,5 +756,68 @@ impl Player {
             .map_err(|e| VadError::Playback(format!("Failed to spawn event loop thread: {e}")))?;
 
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_filter_chain_flat_and_empty() {
+        assert_eq!(build_audio_filter_chain(&[0.0; 10], None), "");
+    }
+
+    #[test]
+    fn test_audio_filter_chain_never_emits_arnndn_without_a_model() {
+        // `arnndn` alone fails to initialise and kills the whole chain (checked against libmpv).
+        let mut gains = [0.0; 10];
+        gains[5] = 6.0;
+        let chain = build_audio_filter_chain(&gains, None);
+        assert!(chain.contains("equalizer=f=1000:width_type=o:w=1:g=6.0"));
+        assert!(!chain.contains("arnndn"));
+    }
+
+    #[test]
+    fn test_audio_filter_chain_with_model_escapes_path() {
+        let chain = build_audio_filter_chain(&[0.0; 10], Some(Path::new("/m/a:b,c d/rnnoise.rnnn")));
+        let graph = r"arnndn=m=/m/a\\:b\,c d/rnnoise.rnnn";
+        assert_eq!(chain, format!("lavfi=graph=%{}%{}", graph.len(), graph));
+    }
+
+    /// Loads `af` into a real libmpv and reports whether mpv logged "initialized failed".
+    /// (`set_property("af")` returns Ok either way, so the log is the only signal.)
+    fn af_init_failed(media: &str, af: &str, tag: &str) -> bool {
+        let cfg = std::env::temp_dir().join(format!("vad_af_test_{}_{tag}", std::process::id()));
+        let log_file = cfg.join("mpv.log");
+        let player = Player::with_options(Some(&cfg)).unwrap();
+        player.mpv().set_property("vo", "null").unwrap();
+        player.mpv().set_property("ao", "null").unwrap();
+        player.mpv().set_property("msg-level", "all=warn").unwrap();
+        player.mpv().set_property("log-file", log_file.to_string_lossy().as_ref()).unwrap();
+        player.mpv().command("loadfile", &[media]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        player.mpv().set_property("af", af).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&cfg);
+        log.contains("initialized failed")
+    }
+
+    /// Needs a real `.rnnn` and an audio file. The model-less control proves the check can fail.
+    #[test]
+    #[ignore = "needs a real RNNoise model and an audio file (VAD_TEST_RNNOISE_MODEL, VAD_TEST_AUDIO)"]
+    fn test_real_mpv_arnndn_needs_a_model_and_accepts_ours() {
+        let model = std::env::var("VAD_TEST_RNNOISE_MODEL").expect("VAD_TEST_RNNOISE_MODEL");
+        let media = std::env::var("VAD_TEST_AUDIO").expect("VAD_TEST_AUDIO");
+        let mut gains = [0.0; 10];
+        gains[5] = 6.0;
+
+        let good = build_audio_filter_chain(&gains, Some(Path::new(&model)));
+        assert!(!af_init_failed(&media, &good, "good"), "chain with model must initialise: {good}");
+        assert!(
+            af_init_failed(&media, "lavfi=[arnndn]", "control"),
+            "control: arnndn without a model is expected to fail to initialise"
+        );
     }
 }
