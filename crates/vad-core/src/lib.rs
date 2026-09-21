@@ -1,3 +1,4 @@
+pub mod bookmarks;
 pub mod config;
 pub mod error;
 pub mod platform;
@@ -7,6 +8,7 @@ pub mod recents;
 pub mod state;
 pub mod util;
 
+pub use bookmarks::{format_timestamp_secs, Bookmark, BookmarkStore};
 pub use config::{
     EqualizerConfig, ModelStorageMode, PlayerConfig, RecentsConfig, ShortcutsConfig, VadConfig,
     WhisperConfig,
@@ -22,8 +24,8 @@ pub use state::{
     create_event_channel, EventReceiver, EventSender, PlaybackState, PlayerEvent, SharedPlayerState,
 };
 pub use util::{
-    is_allowed_url_scheme, vad_config_dir, vad_config_path, vad_models_dir, vad_mpv_config_dir,
-    vad_recentes_path, write_atomic,
+    get_process_rss_bytes, is_allowed_url_scheme, vad_bookmarks_dir, vad_config_dir,
+    vad_config_path, vad_data_dir, vad_models_dir, vad_mpv_config_dir, vad_recentes_path, write_atomic,
 };
 
 #[cfg(test)]

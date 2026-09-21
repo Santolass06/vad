@@ -41,28 +41,52 @@ pub fn vad_config_path() -> PathBuf {
     vad_config_dir().join("config.toml")
 }
 
-/// Returns the models directory for VAD (`~/.local/share/vad/models` or `$XDG_DATA_HOME/vad/models`, §4.13).
-pub fn vad_models_dir() -> PathBuf {
+/// Returns the data directory for VAD (`~/.local/share/vad` or `$XDG_DATA_HOME/vad`).
+pub fn vad_data_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.trim().is_empty() {
-            return PathBuf::from(xdg).join("vad").join("models");
+            return PathBuf::from(xdg).join("vad");
         }
     }
 
     if let Ok(home) = std::env::var("HOME") {
         if !home.trim().is_empty() {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("vad")
-                .join("models");
+            return PathBuf::from(home).join(".local").join("share").join("vad");
         }
     }
 
-    PathBuf::from(".local")
-        .join("share")
-        .join("vad")
-        .join("models")
+    PathBuf::from(".local").join("share").join("vad")
+}
+
+/// Returns the models directory for VAD (`<data dir>/models`, §4.13).
+pub fn vad_models_dir() -> PathBuf {
+    vad_data_dir().join("models")
+}
+
+/// Returns the meeting-bookmarks directory for VAD (`<data dir>/bookmarks`).
+pub fn vad_bookmarks_dir() -> PathBuf {
+    vad_data_dir().join("bookmarks")
+}
+
+/// Reads the current process Resident Set Size (RSS) in bytes on Linux.
+/// Returns None if unsupported or if `/proc/self/status` is unreadable.
+pub fn get_process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if let Some(kb_str) = parts.first() {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            return Some(kb * 1024);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Validates a URL against the allowlisted schemes per PLANO_VAD.md §4.27.

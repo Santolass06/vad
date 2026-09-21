@@ -5,21 +5,27 @@ use std::time::Instant;
 use eframe::egui::{
     self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Stroke, StrokeKind, UiBuilder,
 };
-use tracing::{error, info, warn};
-use vad_ai::{AudioExtractor, ExtractionHandle, ExtractionStatus, PcmAudio, TranscriptionSegment};
+use tracing::{debug, error, info, warn};
+use vad_ai::{
+    AudioExtractor, ExtractionHandle, ExtractionStatus, PcmAudio, TranscriptionSegment,
+    VadDetectionResult, VadDetector, WhisperEngine,
+};
 use vad_audio_tools::{WaveformPyramid, TARGET_VISIBLE_POINTS};
 use vad_core::{
-    create_event_channel, is_allowed_url_scheme, EventReceiver, GlProcAddressFn,
+    create_event_channel, is_allowed_url_scheme, BookmarkStore, EventReceiver, GlProcAddressFn,
     PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
     SharedPlayerState, VadConfig, VadError,
 };
 
 use crate::panels::{
     AudioPanel, HudAction, HudPanel, PlaylistAction, PlaylistPanel, VideoPanel,
-    WhisperAction, WhisperPanel,
+    WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT,
 };
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
+
+/// Text of a freshly added meeting note until the user types their own.
+const DEFAULT_NOTE_TEXT: &str = "Nova nota";
 
 /// State for the non-blocking resume toast per design/Dialogs.dc.html and PLANO_VAD.md §4.6.
 #[derive(Debug, Clone)]
@@ -87,6 +93,18 @@ pub struct VadApp {
     pending_seek: Option<f64>,
     last_saved_time_pos: f64,
     last_saved_instant: Instant,
+    bookmark_store: BookmarkStore,
+    vad_detector: VadDetector,
+    vad_result: Option<VadDetectionResult>,
+    /// Pending background VAD analysis (a 4 h file takes seconds in a debug build: never on the UI thread).
+    vad_rx: Option<crossbeam_channel::Receiver<VadDetectionResult>>,
+    skip_silence_enabled: bool,
+    editing_bookmark_id: Option<u64>,
+    bookmark_input_text: String,
+    /// Give the inline note editor keyboard focus on the next frame (set when editing starts).
+    focus_bookmark_edit: bool,
+    export_notification: Option<(String, Instant)>,
+    last_skip_time: Instant,
 }
 
 impl VadApp {
@@ -263,6 +281,16 @@ impl VadApp {
             pending_seek: None,
             last_saved_time_pos: 0.0,
             last_saved_instant: Instant::now(),
+            bookmark_store: BookmarkStore::default(),
+            vad_detector: VadDetector::new(),
+            vad_result: None,
+            vad_rx: None,
+            skip_silence_enabled: false,
+            editing_bookmark_id: None,
+            bookmark_input_text: String::new(),
+            focus_bookmark_edit: false,
+            export_notification: None,
+            last_skip_time: Instant::now(),
         };
 
         if let Some(path) = initial_file {
@@ -330,6 +358,18 @@ impl VadApp {
                         }
                     }
                 }
+
+                // Save previous bookmarks and load bookmarks for the new media
+                if let Err(err) = self.bookmark_store.save_to_disk() {
+                    warn!("Could not save bookmarks of the previous media: {err}");
+                }
+                self.bookmark_store = BookmarkStore::load_from_disk(trimmed).unwrap_or_else(|err| {
+                    warn!("Could not read saved bookmarks for {trimmed}: {err}");
+                    BookmarkStore::new(trimmed)
+                });
+                self.editing_bookmark_id = None;
+                self.bookmark_input_text.clear();
+                self.whisper_panel.reset_for_new_media();
 
                 // Start non-blocking background audio extraction for waveform & Whisper (§4.17)
                 self.start_audio_extraction(trimmed);
@@ -1015,6 +1055,7 @@ impl VadApp {
                 );
                 let _ = self.recents.save_default();
             }
+            self.save_bookmarks();
         }
 
         if let Some(ref p) = self.player {
@@ -1202,6 +1243,7 @@ impl VadApp {
         self.cancel_extraction();
         self.waveform_pyramid = None;
         self.current_audio = None;
+        self.clear_vad();
         self.waveform_zoom_window = None;
         self.extraction_error = None;
 
@@ -1221,6 +1263,7 @@ impl VadApp {
         if let Some(cached) = self.audio_extractor.get_cached(path) {
             info!("Reusing in-memory cached PCM audio for {}", path);
             self.waveform_pyramid = Some(WaveformPyramid::from_pcm(&cached));
+            self.start_vad_analysis(&cached);
             self.current_audio = Some(cached);
             return;
         }
@@ -1243,6 +1286,50 @@ impl VadApp {
         }
         self.extraction_rx = None;
         self.extraction_progress_pct = None;
+        self.clear_vad();
+    }
+
+    /// Drops the VAD result and ignores any analysis still running for the previous media.
+    fn clear_vad(&mut self) {
+        self.vad_result = None;
+        self.vad_rx = None;
+    }
+
+    /// Runs silence detection on a worker thread (samples are an `Arc`, so the clone is cheap).
+    fn start_vad_analysis(&mut self, pcm: &PcmAudio) {
+        let detector = self.vad_detector.clone();
+        let pcm = pcm.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(detector.detect(&pcm));
+        });
+        self.vad_result = None;
+        self.vad_rx = Some(rx);
+    }
+
+    /// Collects the background VAD result without blocking; keeps repainting while it is pending.
+    fn poll_vad_analysis(&mut self, ctx: &egui::Context) {
+        let Some(ref rx) = self.vad_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                info!(
+                    "VAD analysis done: {} speech / {} silence segments",
+                    result.speech_segments.len(),
+                    result.silence_segments.len()
+                );
+                self.vad_result = Some(result);
+                self.vad_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                warn!("VAD analysis thread ended without a result");
+                self.vad_rx = None;
+            }
+        }
     }
 
     /// Polls asynchronous audio extraction status without blocking (§4.17).
@@ -1261,6 +1348,7 @@ impl VadApp {
                         );
                         let pyramid = WaveformPyramid::from_pcm(&pcm);
                         self.waveform_pyramid = Some(pyramid);
+                        self.start_vad_analysis(&pcm);
                         self.current_audio = Some(pcm);
                         self.extraction_progress_pct = None;
                         self.extraction_handle = None;
@@ -1549,29 +1637,220 @@ impl VadApp {
             ui.separator();
             ui.add_space(4.0);
 
-            // --- CONTROLOS RÁPIDOS DE REUNIÃO (PLANO_VAD.md §6) ---
+            // --- CONTROLOS RÁPIDOS DE REUNIÃO (PLANO_VAD.md §6, Meeting.dc.html) ---
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(160, 165, 185), "Controlos Rápidos de Reunião:");
-                ui.add_enabled(false, egui::Button::new("Saltar Silêncios: Sprint 07"))
-                    .on_disabled_hover_text("Previsto para o Sprint 07 (§11)");
-                ui.add_enabled(false, egui::Button::new("Redução de Ruído: Sprint 07"))
-                    .on_disabled_hover_text("Previsto para o Sprint 07 (§11)");
+                ui.colored_label(Color32::from_rgb(160, 165, 185), "Controlos Rápidos:");
+
+                // Pill: Saltar Silêncios (Meeting.dc.html lines 60-63)
+                let skip_btn_text = if self.skip_silence_enabled {
+                    "Saltar Silêncios: ATIVO"
+                } else {
+                    "Saltar Silêncios: INATIVO"
+                };
+                let mut skip_btn = egui::Button::new(RichText::new(skip_btn_text).strong().size(12.0));
+                if self.skip_silence_enabled {
+                    skip_btn = skip_btn
+                        .fill(Color32::from_rgba_premultiplied(139, 124, 246, 55))
+                        .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
+                }
+                if ui
+                    .add(skip_btn)
+                    .on_hover_text("Salta automaticamente pausas e silêncios durante a reprodução da reunião")
+                    .clicked()
+                {
+                    self.skip_silence_enabled = !self.skip_silence_enabled;
+                }
+                let vad_note = match (&self.vad_result, self.vad_rx.is_some()) {
+                    (Some(vad), _) => format!("{} pausas detetadas", vad.silence_segments.len()),
+                    (None, true) => "A analisar áudio…".to_string(),
+                    (None, false) => "Sem análise de áudio".to_string(),
+                };
+                ui.colored_label(Color32::from_rgb(130, 135, 155), vad_note);
+
+                // Placeholder for Sprint 08 / Noise reduction
+                ui.add_enabled(false, egui::Button::new("Redução de Ruído: Sprint 08"))
+                    .on_disabled_hover_text("Previsto para o Sprint 08 (§11)");
 
                 if self.whisper_panel.is_transcribing() {
                     let prog = self.whisper_panel.transcribe_progress().unwrap_or(0);
                     ui.spinner();
                     ui.colored_label(Color32::from_rgb(139, 124, 246), format!("A transcrever: {}%", prog));
-                } else if ui.button("🎙 Abrir Whisper AI").on_hover_text("Abrir painel lateral de Transcrição Whisper AI").clicked() {
+                } else if ui
+                    .button("🎙 Abrir Whisper AI")
+                    .on_hover_text("Abrir painel lateral de Transcrição Whisper AI")
+                    .clicked()
+                {
                     self.active_side_panel = ActiveSidePanel::Whisper;
                 }
             });
 
+            ui.add_space(10.0);
+
+            // --- MARCADORES DA REUNIÃO (Meeting.dc.html lines 72-89) ---
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("MARCADORES DA REUNIÃO")
+                        .size(12.0)
+                        .strong()
+                        .color(Color32::from_rgb(160, 165, 185)),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let add_btn = egui::Button::new(
+                        RichText::new("+ Adicionar nota")
+                            .color(Color32::from_rgb(139, 124, 246))
+                            .strong(),
+                    );
+                    if ui
+                        .add_enabled(self.current_media_path.is_some(), add_btn)
+                        .on_hover_text("Criar nota no timestamp atual da reprodução")
+                        .on_disabled_hover_text("Abre um ficheiro para criar notas")
+                        .clicked()
+                    {
+                        let cur_pos = self.shared_state.get_time_pos();
+                        let new_id = self.bookmark_store.add(cur_pos, DEFAULT_NOTE_TEXT);
+                        self.editing_bookmark_id = Some(new_id);
+                        self.bookmark_input_text.clear();
+                        self.focus_bookmark_edit = true;
+                        self.save_bookmarks();
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            // Bookmark List Frame
+            let mut bookmark_to_delete = None;
+            let mut bookmark_to_seek = None;
+            let mut bookmark_to_edit = None;
+
+            egui::Frame::new()
+                .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                .corner_radius(8.0)
+                .inner_margin(8.0)
+                .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 15)))
+                .show(ui, |ui| {
+                    if self.bookmark_store.bookmarks.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                Color32::from_rgb(130, 135, 155),
+                                "Nenhum marcador adicionado. Clica em '+ Adicionar nota' para marcar momentos importantes da reunião.",
+                            );
+                            ui.add_space(6.0);
+                        });
+                    } else {
+                        let cur_sec = self.shared_state.get_time_pos();
+                        for bm in &self.bookmark_store.bookmarks {
+                            let is_current = (cur_sec - bm.timestamp_secs).abs() < 2.0;
+                            let ts_color = if is_current {
+                                Color32::from_rgb(250, 204, 21)
+                            } else {
+                                Color32::from_rgb(139, 124, 246)
+                            };
+
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    ts_color,
+                                    RichText::new(bm.formatted_timestamp()).monospace().strong(),
+                                );
+
+                                if self.editing_bookmark_id == Some(bm.id) {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.bookmark_input_text)
+                                            .hint_text(DEFAULT_NOTE_TEXT),
+                                    );
+                                    if std::mem::take(&mut self.focus_bookmark_edit) {
+                                        resp.request_focus();
+                                    }
+                                    let save_enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let save_clicked = ui.small_button("Guardar").clicked();
+                                    if save_enter || save_clicked {
+                                        bookmark_to_edit = Some((bm.id, self.bookmark_input_text.trim().to_string()));
+                                    }
+                                } else {
+                                    ui.label(RichText::new(&bm.text).size(12.5));
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("🗑").on_hover_text("Eliminar nota").clicked() {
+                                        bookmark_to_delete = Some(bm.id);
+                                    }
+
+                                    if self.editing_bookmark_id == Some(bm.id) {
+                                        if ui.small_button("Cancelar").clicked() {
+                                            self.editing_bookmark_id = None;
+                                        }
+                                    } else {
+                                        if ui.small_button("Editar").clicked() {
+                                            self.editing_bookmark_id = Some(bm.id);
+                                            self.bookmark_input_text = bm.text.clone();
+                                            self.focus_bookmark_edit = true;
+                                        }
+
+                                        if ui
+                                            .small_button("Ir")
+                                            .on_hover_text("Saltar reprodução para este segundo")
+                                            .clicked()
+                                        {
+                                            bookmark_to_seek = Some(bm.timestamp_secs);
+                                        }
+                                    }
+                                });
+                            });
+                            ui.separator();
+                        }
+                    }
+                });
+
+            if let Some((id, text)) = bookmark_to_edit {
+                // An empty box keeps the current text: an empty note is never useful
+                self.bookmark_store.edit(id, (!text.is_empty()).then_some(text), None);
+                self.editing_bookmark_id = None;
+                self.save_bookmarks();
+            }
+
+            if let Some(id) = bookmark_to_delete {
+                self.bookmark_store.remove(id);
+                if self.editing_bookmark_id == Some(id) {
+                    self.editing_bookmark_id = None;
+                }
+                self.save_bookmarks();
+            }
+
+            if let Some(target) = bookmark_to_seek {
+                if let Some(ref p) = self.player {
+                    let _ = p.seek_absolute(target);
+                }
+            }
+
             ui.add_space(8.0);
+
+            // --- EXPORTAR NOTAS E TRANSCRIÇÃO PARA MARKDOWN (Meeting.dc.html line 91) ---
+            let export_btn = egui::Button::new(
+                RichText::new("📄 Exportar Notas e Transcrição para Markdown (.md)").strong(),
+            );
+            if ui.add_sized([ui.available_width(), 34.0], export_btn).clicked() {
+                self.export_notes_and_transcription();
+            }
+
+            if let Some((ref msg, instant)) = self.export_notification {
+                if instant.elapsed().as_secs() < 6 {
+                    let color = if msg.starts_with("Falha") {
+                        Color32::RED
+                    } else {
+                        Color32::GREEN
+                    };
+                    ui.colored_label(color, msg);
+                }
+            }
+
+            ui.add_space(10.0);
 
             // Recent Transcription Segments preview
             let segments = self.whisper_panel.transcription_segments();
             if !segments.is_empty() {
-                ui.label(RichText::new("Marcadores da Reunião (Transcrição Whisper):").size(12.0).strong());
+                ui.label(RichText::new("Segmentos Transcritos (Whisper AI):").size(12.0).strong());
                 ui.add_space(4.0);
 
                 egui::Frame::new()
@@ -1600,6 +1879,97 @@ impl VadApp {
                             ui.add_space(2.0);
                         }
                     });
+            }
+        });
+    }
+
+    /// Persists the notes, logging (not hiding) a failure: a note the user typed must not vanish silently.
+    fn save_bookmarks(&self) {
+        if let Err(err) = self.bookmark_store.save_to_disk() {
+            error!("Could not save bookmarks: {err}");
+        }
+    }
+
+    /// Automatically unloads a RAM-only Whisper model after `IDLE_UNLOAD_TIMEOUT` of inactivity (§4.16).
+    /// Disk-mode models (mmap) are left to the kernel page cache.
+    fn check_whisper_inactivity_unload(&mut self, ctx: &egui::Context) {
+        let _ = self.whisper_panel.check_inactivity_unload(IDLE_UNLOAD_TIMEOUT);
+        // An idle window is never repainted by egui: schedule the moment the timeout expires.
+        if let Some(due_in) = self.whisper_panel.idle_unload_due_in(IDLE_UNLOAD_TIMEOUT) {
+            ctx.request_repaint_after(due_in.max(std::time::Duration::from_millis(50)));
+        }
+    }
+
+    /// Handles automatic skipping of silences during playback when skip-silence is active.
+    fn handle_skip_silence(&mut self) {
+        if !self.skip_silence_enabled {
+            return;
+        }
+
+        if self.shared_state.is_paused() {
+            return;
+        }
+
+        if self.last_skip_time.elapsed().as_millis() < 120 {
+            return;
+        }
+
+        let Some(ref vad) = self.vad_result else {
+            return;
+        };
+
+        let current_time = self.shared_state.get_time_pos();
+        if let Some(target_sec) = vad.next_speech_position(current_time, 0.5) {
+            if target_sec > current_time + 0.15 {
+                debug!(
+                    "Skip-silence jumping from {:.2}s to {:.2}s",
+                    current_time, target_sec
+                );
+                if let Some(ref p) = self.player {
+                    let _ = p.seek_absolute(target_sec);
+                    self.last_skip_time = Instant::now();
+                }
+            }
+        }
+    }
+
+    /// Exports meeting bookmarks and optional Whisper transcription to Markdown format (.md).
+    fn export_notes_and_transcription(&mut self) {
+        let title = self
+            .current_media_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Reunião".to_string());
+
+        let stem = self
+            .current_media_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "reuniao".to_string());
+
+        let segs = self.whisper_panel.transcription_segments();
+        let transcription_text = (!segs.is_empty()).then(|| WhisperEngine::segments_to_markdown(segs));
+
+        let md_content = self
+            .bookmark_store
+            .export_to_markdown(&title, transcription_text.as_deref());
+
+        // Same folder as the transcript export of the Whisper panel (`~/.local/share/vad/`),
+        // one file per recording.
+        let export_dir = vad_core::vad_data_dir();
+        let _ = std::fs::create_dir_all(&export_dir);
+        let export_path = export_dir.join(format!("notas_reuniao_{stem}.md"));
+
+        self.export_notification = Some(match std::fs::write(&export_path, md_content) {
+            Ok(()) => {
+                info!("Meeting notes and transcription exported to {:?}", export_path);
+                (format!("Exportado com sucesso para {:?}", export_path), Instant::now())
+            }
+            Err(err) => {
+                error!("Failed to export meeting notes: {:?}", err);
+                (format!("Falha ao exportar {:?}: {err}", export_path), Instant::now())
             }
         });
     }
@@ -1650,6 +2020,9 @@ impl eframe::App for VadApp {
         self.handle_drag_and_drop(&ctx);
         self.poll_events();
         self.poll_audio_extraction();
+        self.poll_vad_analysis(&ctx);
+        self.check_whisper_inactivity_unload(&ctx);
+        self.handle_skip_silence();
         self.save_progress_periodically();
 
         for integration in &mut self.platform_integrations {
@@ -2254,4 +2627,3 @@ mod tests {
         assert!(RAM_ONLY_TOOLTIP.contains("RAM"));
     }
 }
-

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Ui};
 use tracing::{error, info};
@@ -9,7 +9,21 @@ use vad_ai::{
     find_preset, DiskModelInfo, ModelManager, ModelPreset, ModelSource, PcmAudio,
     TranscriptionSegment, WhisperEngine, DISK_TOOLTIP, PRESET_MODELS, RAM_ONLY_TOOLTIP,
 };
-use vad_core::{ModelStorageMode, VadConfig};
+use vad_core::{get_process_rss_bytes, ModelStorageMode, VadConfig};
+
+/// Idle time after which a RAM-only Whisper model is released (§4.16).
+pub const IDLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Trigger for Whisper model unloading (§4.16, Sprint_Planning_07 risk): an automatic timeout is
+/// never confused with the user asking for the model to go. Replacing a model by another one is
+/// not an unload: the old engine is dropped only once its successor has loaded (§4.14).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnloadTrigger {
+    /// Inactivity timeout elapsed without use on a RAM-only model (§4.16).
+    Inactivity,
+    /// The user pressed "Descarregar".
+    ExplicitClose,
+}
 
 /// Action emitted by the Whisper panel to interact with the media player.
 #[derive(Debug, Clone)]
@@ -27,6 +41,10 @@ pub struct WhisperPanel {
     /// so the UI thread is never blocked on this mutex while a transcription runs.
     active_engine: Arc<Mutex<Option<Arc<WhisperEngine>>>>,
     active_model_id: Arc<Mutex<Option<String>>>,
+    /// Tracks the storage mode under which the active engine was loaded (§4.16).
+    active_storage_mode: Arc<Mutex<Option<ModelStorageMode>>>,
+    /// Timestamp of last activity with the Whisper model (§4.16).
+    last_activity: Arc<Mutex<Instant>>,
     download_progress: Arc<Mutex<Option<f32>>>,
     /// Set from the model-loading threads (download or engine initialisation failures).
     download_error: Arc<Mutex<Option<String>>>,
@@ -58,6 +76,8 @@ impl WhisperPanel {
             storage_mode: ModelStorageMode::Disk,
             active_engine: Arc::new(Mutex::new(None)),
             active_model_id: Arc::new(Mutex::new(None)),
+            active_storage_mode: Arc::new(Mutex::new(None)),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
             download_progress: Arc::new(Mutex::new(None)),
             download_error: Arc::new(Mutex::new(None)),
             transcribing: Arc::new(AtomicBool::new(false)),
@@ -87,6 +107,11 @@ impl WhisperPanel {
         self.storage_mode
     }
 
+    /// Storage mode under which the currently active model was loaded (§4.13, §4.16).
+    pub fn active_storage_mode(&self) -> Option<ModelStorageMode> {
+        *self.active_storage_mode.lock().ok()?
+    }
+
     /// Returns true if a model is currently loaded in memory and ready for inference.
     pub fn has_active_model(&self) -> bool {
         self.active_engine
@@ -98,6 +123,92 @@ impl WhisperPanel {
     /// Returns the name of the currently active model.
     pub fn active_model_id(&self) -> Option<String> {
         self.active_model_id.lock().ok()?.clone()
+    }
+
+    /// Resets the last activity timer to the current moment.
+    pub fn touch_activity(&self) {
+        if let Ok(mut g) = self.last_activity.lock() {
+            *g = Instant::now();
+        }
+    }
+
+    /// Duration elapsed since the last activity with the Whisper model (§4.16).
+    pub fn last_activity_elapsed(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .map(|g| g.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Unloads the active Whisper model from memory, recording the trigger and RSS memory delta.
+    ///
+    /// Per PLANO_VAD.md §4.16 and Sprint_Planning_07 risk:
+    /// Differentiates between automatic inactivity unload and explicit actions.
+    /// Returns the number of bytes freed from process Resident Set Size (RSS), if measurable.
+    pub fn unload_model(&mut self, trigger: UnloadTrigger) -> Option<u64> {
+        let before_rss = get_process_rss_bytes();
+        let model_id = self.active_model_id.lock().ok().and_then(|mut g| g.take());
+        let mode = self.active_storage_mode.lock().ok().and_then(|mut g| g.take());
+        let had_engine = self.active_engine.lock().ok().and_then(|mut g| g.take()).is_some();
+
+        if !had_engine && model_id.is_none() {
+            return None;
+        }
+
+        let after_rss = get_process_rss_bytes();
+        let freed_bytes = match (before_rss, after_rss) {
+            (Some(b), Some(a)) => Some(b.saturating_sub(a)),
+            _ => None,
+        };
+
+        info!(
+            "Whisper model '{:?}' ({:?}) unloaded via trigger {:?}. RSS before: {:?} bytes, after: {:?} bytes, freed: {:?} bytes (§4.16)",
+            model_id, mode, trigger, before_rss, after_rss, freed_bytes
+        );
+
+        freed_bytes
+    }
+
+    /// Time left before a RAM-only model is unloaded for inactivity (§4.16).
+    ///
+    /// `None` when there is nothing to schedule: no model, or one loaded in disk mode (mmap),
+    /// which the kernel page cache already manages — an active unload there would only compete
+    /// with the OS. The caller uses this to wake the UI: egui does not repaint an idle window,
+    /// so without a scheduled repaint the timeout would never be checked.
+    pub fn idle_unload_due_in(&self, timeout: Duration) -> Option<Duration> {
+        if self.active_storage_mode() != Some(ModelStorageMode::RamOnly) {
+            return None;
+        }
+        Some(timeout.saturating_sub(self.last_activity_elapsed()))
+    }
+
+    /// Unloads a RAM-only model that has been inactive for `timeout` (§4.16); returns the RSS
+    /// freed if it did. Never unloads while a transcription runs.
+    pub fn check_inactivity_unload(&mut self, timeout: Duration) -> Option<u64> {
+        if self.is_transcribing() {
+            self.touch_activity();
+            return None;
+        }
+
+        if self.idle_unload_due_in(timeout)? > Duration::ZERO {
+            return None;
+        }
+
+        info!(
+            "RAM-only Whisper model inactive for {:.1}s (timeout: {:.1}s). Triggering automatic unload (§4.16)",
+            self.last_activity_elapsed().as_secs_f64(),
+            timeout.as_secs_f64()
+        );
+        self.unload_model(UnloadTrigger::Inactivity)
+    }
+
+    /// Forgets the transcription of the previous recording: a new file must never show, or
+    /// export next to its own notes, another recording's transcript. A transcription still
+    /// running for the old file has its result discarded.
+    pub fn reset_for_new_media(&mut self) {
+        self.transcription_segments.clear();
+        self.transcription_error = None;
+        self.transcription_rx = None;
     }
 
     /// Renders the Whisper AI lateral panel.
@@ -220,7 +331,18 @@ impl WhisperPanel {
                 let is_current_active = active_id.as_deref() == current_preset.map(|p| p.id);
 
                 if is_current_active {
-                    ui.colored_label(accent, format!("✓ Modelo ativo: {}", active_id.as_deref().unwrap_or_default()));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(accent, format!("✓ Modelo ativo: {}", active_id.as_deref().unwrap_or_default()));
+                        let idle = !self.is_transcribing();
+                        if ui
+                            .add_enabled(idle, egui::Button::new("Descarregar").small())
+                            .on_hover_text("Descarregar modelo da memória RAM")
+                            .on_disabled_hover_text("Aguarda o fim da transcrição")
+                            .clicked()
+                        {
+                            self.unload_model(UnloadTrigger::ExplicitClose);
+                        }
+                    });
                 } else if let Some(preset) = current_preset {
                     let btn_text = if self.storage_mode == ModelStorageMode::Disk
                         && self.model_manager.is_model_on_disk(preset.filename)
@@ -420,11 +542,14 @@ impl WhisperPanel {
 
     /// Spawns model download & initialization in a background thread.
     fn start_model_load(&mut self, preset: ModelPreset, mode: ModelStorageMode) {
+        self.touch_activity();
         *self.download_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let progress_state = Arc::clone(&self.download_progress);
         let error_state = Arc::clone(&self.download_error);
         let active_engine_state = Arc::clone(&self.active_engine);
         let active_model_id_state = Arc::clone(&self.active_model_id);
+        let active_storage_mode_state = Arc::clone(&self.active_storage_mode);
+        let last_activity_state = Arc::clone(&self.last_activity);
         let manager = ModelManager::new();
 
         *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(0.0);
@@ -443,6 +568,12 @@ impl WhisperPanel {
                     *active_engine_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(engine));
                     *active_model_id_state.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(preset.id.to_string());
+                    *active_storage_mode_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(mode);
+                    *last_activity_state.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                    info!(
+                        "Whisper model '{}' loaded successfully ({:?}) (§4.13)",
+                        preset.id, mode
+                    );
                 }
                 Err(err) => {
                     // ModelDownloadFailed / engine init: tell the user (§4.14), keep any active model
@@ -457,15 +588,21 @@ impl WhisperPanel {
 
     /// Loads an existing disk model file directly.
     fn start_direct_disk_load(&mut self, path: std::path::PathBuf, id: String) {
+        self.touch_activity();
         *self.download_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let error_state = Arc::clone(&self.download_error);
         let active_engine_state = Arc::clone(&self.active_engine);
         let active_model_id_state = Arc::clone(&self.active_model_id);
+        let active_storage_mode_state = Arc::clone(&self.active_storage_mode);
+        let last_activity_state = Arc::clone(&self.last_activity);
 
         thread::spawn(move || match WhisperEngine::load(&ModelSource::Disk(path)) {
             Ok(engine) => {
                 *active_engine_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(engine));
-                *active_model_id_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+                *active_model_id_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+                *active_storage_mode_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModelStorageMode::Disk);
+                *last_activity_state.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                info!("Direct disk model '{}' loaded successfully into memory (§4.13)", id);
             }
             Err(err) => {
                 error!("Failed to initialize direct disk model: {:?}", err);
@@ -476,6 +613,7 @@ impl WhisperPanel {
 
     /// Spawns Whisper transcription on a background worker thread.
     fn start_transcription(&mut self, audio: PcmAudio) {
+        self.touch_activity();
         self.transcription_error = None;
         self.transcription_segments.clear();
         self.transcribing.store(true, Ordering::SeqCst);
@@ -483,6 +621,7 @@ impl WhisperPanel {
         let active_engine = Arc::clone(&self.active_engine);
         let transcribing = Arc::clone(&self.transcribing);
         let transcribe_progress = Arc::clone(&self.transcribe_progress);
+        let last_activity = Arc::clone(&self.last_activity);
 
         let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
 
@@ -497,9 +636,13 @@ impl WhisperPanel {
             };
 
             let prog_clone = Arc::clone(&transcribe_progress);
+            let last_act_clone = Arc::clone(&last_activity);
             let progress_cb = move |pct: i32| {
                 if let Ok(mut g) = prog_clone.lock() {
                     *g = Some(pct);
+                }
+                if let Ok(mut g) = last_act_clone.lock() {
+                    *g = Instant::now();
                 }
             };
 
@@ -510,6 +653,9 @@ impl WhisperPanel {
 
             transcribing.store(false, Ordering::SeqCst);
             *transcribe_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Ok(mut g) = last_activity.lock() {
+                *g = Instant::now();
+            }
         });
 
         self.transcription_rx = Some(rx);
@@ -534,5 +680,145 @@ impl WhisperPanel {
     /// Returns current transcription progress percentage if active.
     pub fn transcribe_progress(&self) -> Option<i32> {
         self.transcribe_progress.lock().ok().and_then(|g| *g)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inactivity_unload_respects_storage_mode_section_4_16() {
+        let mut panel = WhisperPanel::new();
+
+        // 1. When no model is loaded, check_inactivity_unload returns None
+        assert_eq!(panel.check_inactivity_unload(Duration::from_millis(10)), None);
+
+        // 2. Simulate model loaded in Disk mode
+        *panel.active_model_id.lock().unwrap() = Some("tiny".to_string());
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::Disk);
+        *panel.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(400);
+
+        // Per §4.16: Disk mode must NOT be unloaded on inactivity!
+        let freed_disk = panel.check_inactivity_unload(Duration::from_secs(300));
+        assert_eq!(freed_disk, None, "Disk mode model must NOT be unloaded on inactivity (§4.16)");
+        assert_eq!(panel.active_model_id().as_deref(), Some("tiny"));
+
+        // 3. Simulate model loaded in RAM-only mode
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::RamOnly);
+        // Reset activity to now: should NOT unload yet
+        *panel.last_activity.lock().unwrap() = Instant::now();
+        assert_eq!(panel.check_inactivity_unload(Duration::from_secs(300)), None);
+        assert_eq!(panel.active_model_id().as_deref(), Some("tiny"));
+
+        // Advance simulated activity to past 300s
+        *panel.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(301);
+        let _freed_ram = panel.check_inactivity_unload(Duration::from_secs(300));
+        assert_eq!(
+            panel.active_model_id(),
+            None,
+            "RAM-only model must be unloaded after inactivity timeout (§4.16)"
+        );
+        assert_eq!(panel.active_storage_mode(), None);
+    }
+
+    #[test]
+    fn test_explicit_unload_vs_inactivity_triggers() {
+        let mut panel = WhisperPanel::new();
+        *panel.active_model_id.lock().unwrap() = Some("base-q5".to_string());
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::RamOnly);
+
+        // Explicit close
+        let _ = panel.unload_model(UnloadTrigger::ExplicitClose);
+        assert_eq!(panel.active_model_id(), None);
+    }
+
+    /// Idle timers are scheduled only for RAM-only models (§4.16); disk models have none.
+    #[test]
+    fn test_idle_unload_due_in_only_for_ram_only() {
+        let panel = WhisperPanel::new();
+        assert_eq!(panel.idle_unload_due_in(IDLE_UNLOAD_TIMEOUT), None);
+
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::Disk);
+        assert_eq!(panel.idle_unload_due_in(IDLE_UNLOAD_TIMEOUT), None);
+
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::RamOnly);
+        *panel.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(100);
+        let due = panel.idle_unload_due_in(IDLE_UNLOAD_TIMEOUT).unwrap();
+        assert!(due > Duration::from_secs(190) && due <= Duration::from_secs(200), "due in {due:?}");
+
+        *panel.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(900);
+        assert_eq!(panel.idle_unload_due_in(IDLE_UNLOAD_TIMEOUT), Some(Duration::ZERO));
+    }
+
+    /// The elapsed-clock path with no back-dated `Instant`: the timeout really expires.
+    #[test]
+    fn test_inactivity_unload_fires_after_real_elapsed_time() {
+        let mut panel = WhisperPanel::new();
+        *panel.active_model_id.lock().unwrap() = Some("base-q5".to_string());
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::RamOnly);
+        panel.touch_activity();
+
+        let timeout = Duration::from_millis(600);
+        assert_eq!(panel.check_inactivity_unload(timeout), None, "must not fire right after use");
+        assert!(panel.active_model_id().is_some());
+
+        thread::sleep(timeout + Duration::from_millis(200));
+        let _ = panel.check_inactivity_unload(timeout);
+        assert_eq!(panel.active_model_id(), None, "must fire once the timeout really elapsed");
+    }
+
+    #[test]
+    fn test_reset_for_new_media_drops_previous_transcript() {
+        let mut panel = WhisperPanel::new();
+        panel.set_segments(vec![TranscriptionSegment { start_ms: 0, end_ms: 1000, text: "old".into() }]);
+        panel.transcription_error = Some("old error".into());
+        panel.reset_for_new_media();
+        assert!(panel.transcription_segments().is_empty());
+        assert!(panel.transcription_error.is_none());
+    }
+
+    /// §4.16 exit criterion with a REAL engine: load `base-q5` RAM-only, let the idle timeout
+    /// expire, and compare the process RSS before/after the unload the panel performs itself.
+    /// Needs network (downloads ~55 MB into /tmp); run with
+    /// `cargo test -p vad-app -- --ignored --nocapture unload_frees`.
+    #[test]
+    #[ignore = "needs network access (downloads the base-q5 model)"]
+    fn test_inactivity_unload_frees_real_engine_ram() {
+        let dir = std::path::PathBuf::from(format!("/tmp/vad_test_unload_{}", std::process::id()));
+        let manager = ModelManager::with_dir(dir.join("models"));
+        let preset = find_preset("base-q5").unwrap();
+
+        let rss_start = get_process_rss_bytes().unwrap();
+        let source = manager
+            .load_or_download_model(preset, ModelStorageMode::RamOnly, |_| {})
+            .expect("model download");
+        let engine = WhisperEngine::load(&source).expect("engine load");
+        drop(source); // only the engine may keep the model alive from here on
+        let rss_loaded = get_process_rss_bytes().unwrap();
+
+        let mut panel = WhisperPanel::new();
+        *panel.active_engine.lock().unwrap() = Some(Arc::new(engine));
+        *panel.active_model_id.lock().unwrap() = Some(preset.id.to_string());
+        *panel.active_storage_mode.lock().unwrap() = Some(ModelStorageMode::RamOnly);
+
+        // Not yet idle: nothing may happen
+        assert_eq!(panel.check_inactivity_unload(IDLE_UNLOAD_TIMEOUT), None);
+        assert!(panel.has_active_model());
+
+        *panel.last_activity.lock().unwrap() = Instant::now() - IDLE_UNLOAD_TIMEOUT - Duration::from_secs(1);
+        let freed_reported = panel.check_inactivity_unload(IDLE_UNLOAD_TIMEOUT);
+        let rss_after = get_process_rss_bytes().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        println!(
+            "UNLOAD RSS: start={rss_start} B, model loaded={rss_loaded} B (+{} B), after inactivity unload={rss_after} B, freed={} B, panel reported {freed_reported:?}",
+            rss_loaded.saturating_sub(rss_start),
+            rss_loaded.saturating_sub(rss_after),
+        );
+        assert!(!panel.has_active_model(), "engine must be dropped by the inactivity unload");
+        let grew = rss_loaded.saturating_sub(rss_start);
+        let freed = rss_loaded.saturating_sub(rss_after);
+        assert!(grew > 0 && freed * 2 >= grew, "unload must return at least half of what loading took");
     }
 }

@@ -254,18 +254,24 @@ impl WhisperEngine {
         Ok(results)
     }
 
-    /// Formats transcription segments into clean Markdown format.
-    pub fn export_to_markdown(title: &str, segments: &[TranscriptionSegment]) -> String {
+    /// Formats transcription segments as Markdown list lines (`- **[00:04 → 00:09]** text`),
+    /// shared by the transcript export and the meeting-notes export.
+    pub fn segments_to_markdown(segments: &[TranscriptionSegment]) -> String {
         let mut md = String::new();
-        md.push_str(&format!("# Transcrição — {}\n\n", title));
-        md.push_str("Gerado automaticamente pelo VAD com Whisper AI.\n\n---\n\n");
-
         for seg in segments {
             let start = TranscriptionSegment::format_timestamp(seg.start_ms);
             let end = TranscriptionSegment::format_timestamp(seg.end_ms);
             md.push_str(&format!("- **[{start} → {end}]** {}\n", seg.text));
         }
+        md
+    }
 
+    /// Formats transcription segments into clean Markdown format.
+    pub fn export_to_markdown(title: &str, segments: &[TranscriptionSegment]) -> String {
+        let mut md = String::new();
+        md.push_str(&format!("# Transcrição — {}\n\n", title));
+        md.push_str("Gerado automaticamente pelo VAD com Whisper AI.\n\n---\n\n");
+        md.push_str(&Self::segments_to_markdown(segments));
         md
     }
 }
