@@ -8,5 +8,10 @@ description = "VAD Audio Tools crate (Clip export, Waveform pyramid) - Milestone
 vad-core = { path = "../vad-core" }
 vad-ai = { path = "../vad-ai" }
 tracing = "0.1"
+crossbeam-channel = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+

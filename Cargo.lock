@@ -3694,6 +3694,8 @@ dependencies = [
 name = "vad-audio-tools"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
+ "libc",
  "tracing",
  "vad-ai",
  "vad-core",

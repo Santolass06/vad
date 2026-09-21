@@ -1,6 +1,8 @@
 use std::ffi::{c_void, CString};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
 
 use eframe::egui::{
     self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Stroke, StrokeKind, UiBuilder,
@@ -10,19 +12,23 @@ use vad_ai::{
     AudioExtractor, ExtractionHandle, ExtractionStatus, PcmAudio, TranscriptionSegment,
     VadDetectionResult, VadDetector, WhisperEngine,
 };
-use vad_audio_tools::{WaveformPyramid, TARGET_VISIBLE_POINTS};
+use vad_audio_tools::{
+    export_clip_async, ClipExportHandle, ClipExportOptions, ClipExportStatus, WaveformPyramid,
+    TARGET_VISIBLE_POINTS,
+};
 use vad_core::{
-    create_event_channel, is_allowed_url_scheme, BookmarkStore, EventReceiver, GlProcAddressFn,
-    PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
+    create_event_channel, is_allowed_url_scheme, vad_data_dir, BookmarkStore, EventReceiver,
+    GlProcAddressFn, PlatformIntegration, Player, PlayerEvent, Playlist, RecentEntry, RecentsStore,
     SharedPlayerState, VadConfig, VadError,
 };
 
 use crate::panels::{
-    AudioPanel, HudAction, HudPanel, PlaylistAction, PlaylistPanel, VideoPanel,
-    WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT,
+    AudioPanel, ClipExportAction, ClipExportPanel, HudAction, HudPanel, PlaylistAction,
+    PlaylistPanel, VideoPanel, WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT,
 };
 use crate::probe::probe_dependencies;
 use crate::render::GlVideoRenderer;
+
 
 /// Text of a freshly added meeting note until the user types their own.
 const DEFAULT_NOTE_TEXT: &str = "Nova nota";
@@ -105,7 +111,13 @@ pub struct VadApp {
     focus_bookmark_edit: bool,
     export_notification: Option<(String, Instant)>,
     last_skip_time: Instant,
+    clip_export_panel: ClipExportPanel,
+    clip_export_open: bool,
+    clip_export_handle: Option<ClipExportHandle>,
+    clip_export_rx: Option<crossbeam_channel::Receiver<ClipExportStatus>>,
+    selection_playback_target: Option<f64>,
 }
+
 
 impl VadApp {
     pub fn new(
@@ -291,7 +303,13 @@ impl VadApp {
             focus_bookmark_edit: false,
             export_notification: None,
             last_skip_time: Instant::now(),
+            clip_export_panel: ClipExportPanel::new(),
+            clip_export_open: false,
+            clip_export_handle: None,
+            clip_export_rx: None,
+            selection_playback_target: None,
         };
+
 
         if let Some(path) = initial_file {
             app.load_media(&path);
@@ -370,6 +388,8 @@ impl VadApp {
                 self.editing_bookmark_id = None;
                 self.bookmark_input_text.clear();
                 self.whisper_panel.reset_for_new_media();
+                self.selection_playback_target = None;
+                self.clip_export_panel.reset_for_media(trimmed, 0.0);
 
                 // Start non-blocking background audio extraction for waveform & Whisper (§4.17)
                 self.start_audio_extraction(trimmed);
@@ -503,7 +523,10 @@ impl VadApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // Dismiss dialogs with Escape (§4.34)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.resume_toast.is_some() {
+            if self.clip_export_open {
+                self.clip_export_open = false;
+                self.selection_playback_target = None;
+            } else if self.resume_toast.is_some() {
                 self.resume_toast = None;
             } else if self.show_dependency_dialog {
                 self.show_dependency_dialog = false;
@@ -513,6 +536,7 @@ impl VadApp {
                 self.load_subtitles_modal_open = false;
             }
         }
+
 
         // Ctrl+O: Open File modal
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
@@ -629,7 +653,42 @@ impl VadApp {
                 self.hud.set_notification(format!("Atraso legendas: {:.0} ms", next * 1000.0));
             }
         }
+
+        // C key: toggle Clip Export panel (Task 3)
+        if !wants_keyboard
+            && self.current_media_path.is_some()
+            && ctx.input(|i| i.key_pressed(egui::Key::C))
+        {
+            if self.clip_export_open {
+                self.clip_export_open = false;
+                self.selection_playback_target = None;
+            } else {
+                self.open_clip_export();
+            }
+        }
+
+        // I key: set In-point (Task 3)
+        if !wants_keyboard
+            && self.current_media_path.is_some()
+            && ctx.input(|i| i.key_pressed(egui::Key::I))
+        {
+            let cur = self.shared_state.get_time_pos();
+            self.clip_export_panel.set_in_point(cur);
+            self.hud.set_notification(format!("Ponto de Início definido (I): {}", ClipExportPanel::format_hms(self.clip_export_panel.start_seconds)));
+        }
+
+        // O key: set Out-point (Task 3)
+        if !wants_keyboard
+            && self.current_media_path.is_some()
+            && ctx.input(|i| i.key_pressed(egui::Key::O))
+        {
+            let cur = self.shared_state.get_time_pos();
+            let dur = self.shared_state.get_duration();
+            self.clip_export_panel.set_out_point(cur, dur);
+            self.hud.set_notification(format!("Ponto de Fim definido (O): {}", ClipExportPanel::format_hms(self.clip_export_panel.end_seconds)));
+        }
     }
+
 
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
         // Process dropped files
@@ -1377,6 +1436,188 @@ impl VadApp {
         }
     }
 
+    /// Opens the Clip Export interface for the current media file.
+    pub fn open_clip_export(&mut self) {
+        if let Some(ref path) = self.current_media_path {
+            let dur = self.shared_state.get_duration();
+            self.clip_export_panel.reset_for_media(path, dur);
+            self.clip_export_open = true;
+            self.hud.poke();
+        }
+    }
+
+    /// Starts asynchronous clip export using the FFmpeg CLI subprocess (§4.26).
+    fn start_clip_export(
+        &mut self,
+        start_seconds: f64,
+        end_seconds: f64,
+        exact_cut: bool,
+        output_filename: String,
+    ) {
+        let input_path = match self.current_media_path.as_deref() {
+            Some(p) => p.to_string(),
+            None => return,
+        };
+
+        let path_buf = Path::new(&output_filename);
+        let output_path = if path_buf.is_absolute() {
+            output_filename
+        } else {
+            let parent = Path::new(&input_path).parent().unwrap_or(Path::new("."));
+            let target_dir = if parent.is_dir() && !parent.as_os_str().is_empty() {
+                parent.to_path_buf()
+            } else {
+                vad_data_dir().join("clips")
+            };
+            let _ = std::fs::create_dir_all(&target_dir);
+            target_dir
+                .join(&output_filename)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        let options = ClipExportOptions {
+            input_path,
+            output_path,
+            start_seconds,
+            end_seconds,
+            exact_cut,
+        };
+
+        let (rx, handle) = export_clip_async(options);
+        self.clip_export_rx = Some(rx);
+        self.clip_export_handle = Some(handle);
+        self.clip_export_panel.is_exporting = true;
+        self.clip_export_panel.set_status("A exportar clip...", false);
+    }
+
+    /// Polls clip export completion or error without blocking the UI thread.
+    fn poll_clip_export(&mut self, ctx: &egui::Context) {
+        if let Some(ref rx) = self.clip_export_rx {
+            while let Ok(status) = rx.try_recv() {
+                match status {
+                    ClipExportStatus::Starting => {
+                        self.clip_export_panel.is_exporting = true;
+                    }
+                    ClipExportStatus::Completed {
+                        output_path,
+                        duration_seconds,
+                    } => {
+                        self.clip_export_panel.is_exporting = false;
+                        self.clip_export_handle = None;
+                        let msg = format!(
+                            "Clip exportado com sucesso: {} ({:.1}s)",
+                            output_path.display(),
+                            duration_seconds
+                        );
+                        self.clip_export_panel.set_status(msg.clone(), false);
+                        self.export_notification = Some((msg, Instant::now()));
+                        ctx.request_repaint();
+                        break;
+                    }
+                    ClipExportStatus::Failed(err) => {
+                        self.clip_export_panel.is_exporting = false;
+                        self.clip_export_handle = None;
+                        self.clip_export_panel
+                            .set_status(format!("Falha na exportação: {err}"), true);
+                        ctx.request_repaint();
+                        break;
+                    }
+                    ClipExportStatus::Cancelled => {
+                        self.clip_export_panel.is_exporting = false;
+                        self.clip_export_handle = None;
+                        self.clip_export_panel
+                            .set_status("Exportação cancelada", false);
+                        ctx.request_repaint();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Manages playback when previewing a selection, stopping when the out-point is reached.
+    fn handle_selection_playback(&mut self) {
+        if let Some(target) = self.selection_playback_target {
+            let cur = self.shared_state.get_time_pos();
+            if cur >= target {
+                if let Some(ref p) = self.player {
+                    let _ = p.pause();
+                }
+                self.selection_playback_target = None;
+            }
+        }
+    }
+
+    /// Renders the Clip Export panel taking over the central area per ClipExport.dc.html.
+    fn render_clip_export_view(&mut self, ui: &mut egui::Ui, _available_rect: Rect) {
+        let media_path = match self.current_media_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let duration = self.shared_state.get_duration();
+        let current_time = self.shared_state.get_time_pos();
+        let is_playing_sel = self.selection_playback_target.is_some();
+
+        let mut maybe_action = None;
+        ui.vertical(|ui| {
+            maybe_action = self.clip_export_panel.ui(
+                ui,
+                &media_path,
+                duration,
+                current_time,
+                is_playing_sel,
+                self.waveform_pyramid.as_mut(),
+            );
+        });
+
+        if let Some(action) = maybe_action {
+            match action {
+                ClipExportAction::Close => {
+                    self.clip_export_open = false;
+                    self.selection_playback_target = None;
+                }
+                ClipExportAction::PlaySelection {
+                    start_seconds,
+                    end_seconds,
+                } => {
+                    if let Some(ref p) = self.player {
+                        let _ = p.seek_absolute(start_seconds);
+                        let _ = p.play();
+                        self.selection_playback_target = Some(end_seconds);
+                    }
+                }
+                ClipExportAction::PauseSelection => {
+                    if let Some(ref p) = self.player {
+                        let _ = p.pause();
+                    }
+                    self.selection_playback_target = None;
+                }
+                ClipExportAction::SeekTo(secs) => {
+                    if let Some(ref p) = self.player {
+                        let _ = p.seek_absolute(secs);
+                    }
+                }
+                ClipExportAction::Export {
+                    start_seconds,
+                    end_seconds,
+                    exact_cut,
+                    output_filename,
+                } => {
+                    self.start_clip_export(
+                        start_seconds,
+                        end_seconds,
+                        exact_cut,
+                        output_filename,
+                    );
+                }
+            }
+        }
+    }
+
+
+
+
     /// Adjusts waveform zoom window based on mouse wheel scroll (§5).
     fn apply_waveform_zoom(&mut self, scroll_y: f32, current_time: f64, duration: f64) {
         self.waveform_zoom_window =
@@ -1667,9 +1908,39 @@ impl VadApp {
                 };
                 ui.colored_label(Color32::from_rgb(130, 135, 155), vad_note);
 
-                // Placeholder for Sprint 08 / Noise reduction
-                ui.add_enabled(false, egui::Button::new("Redução de Ruído: Sprint 08"))
-                    .on_disabled_hover_text("Previsto para o Sprint 08 (§11)");
+                // Pill: Redução de Ruído (RNNoise) - Task 4 (§1/§3/§8)
+                let rn_text = if self.audio_panel.rnnoise {
+                    "Redução de Ruído: ATIVA"
+                } else {
+                    "Redução de Ruído: INATIVA"
+                };
+                let mut rn_btn = egui::Button::new(RichText::new(rn_text).strong().size(12.0));
+                if self.audio_panel.rnnoise {
+                    rn_btn = rn_btn
+                        .fill(Color32::from_rgba_premultiplied(139, 124, 246, 55))
+                        .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
+                }
+                if ui
+                    .add(rn_btn)
+                    .on_hover_text("Ativa o filtro RNNoise (af=arnndn) para supressão de ruído de voz")
+                    .clicked()
+                {
+                    self.audio_panel.rnnoise = !self.audio_panel.rnnoise;
+                    if let Some(ref p) = self.player {
+                        let _ = p.set_audio_filters(&self.audio_panel.gains, self.audio_panel.rnnoise);
+                    }
+                }
+
+                // Botão: Cortar Clip - Task 3
+                let clip_btn = egui::Button::new(RichText::new("✂ Cortar Clip").strong().size(12.0));
+                if ui
+                    .add(clip_btn)
+                    .on_hover_text("Abre o painel de corte e exportação de clips (atalho: C)")
+                    .clicked()
+                {
+                    self.open_clip_export();
+                }
+
 
                 if self.whisper_panel.is_transcribing() {
                     let prog = self.whisper_panel.transcribe_progress().unwrap_or(0);
@@ -2023,7 +2294,10 @@ impl eframe::App for VadApp {
         self.poll_vad_analysis(&ctx);
         self.check_whisper_inactivity_unload(&ctx);
         self.handle_skip_silence();
+        self.poll_clip_export(&ctx);
+        self.handle_selection_playback();
         self.save_progress_periodically();
+
 
         for integration in &mut self.platform_integrations {
             let _ = integration.update();
@@ -2130,6 +2404,19 @@ impl eframe::App for VadApp {
                             }
                         }
                     }
+
+                    if self.current_media_path.is_some() {
+                        let clip_active = self.clip_export_open;
+                        if ui.selectable_label(clip_active, "✂ Cortar Clip").clicked() {
+                            if clip_active {
+                                self.clip_export_open = false;
+                                self.selection_playback_target = None;
+                            } else {
+                                self.open_clip_export();
+                            }
+                        }
+                    }
+
 
                     let vid_active = self.active_side_panel == ActiveSidePanel::Video;
                     if ui.selectable_label(vid_active, "🎞 Vídeo").clicked() {
@@ -2321,6 +2608,8 @@ impl eframe::App for VadApp {
             if self.current_media_path.is_none() {
                 // Show Welcome Screen with dropzone
                 self.render_welcome_screen(ui);
+            } else if self.clip_export_open {
+                self.render_clip_export_view(ui, available_rect);
             } else {
                 let has_video = self.player.as_ref().map(|p| p.has_video()).unwrap_or(false);
                 let show_meeting_mode = !has_video || self.meeting_mode_view;
@@ -2371,6 +2660,14 @@ impl eframe::App for VadApp {
                                         ActiveSidePanel::Whisper
                                     };
                                 }
+                                HudAction::ToggleClipExport => {
+                                    if self.clip_export_open {
+                                        self.clip_export_open = false;
+                                        self.selection_playback_target = None;
+                                    } else {
+                                        self.open_clip_export();
+                                    }
+                                }
                                 HudAction::OpenSubtitlesDialog => {
                                     self.load_subtitles_modal_open = true;
                                     self.load_subtitles_input.clear();
@@ -2378,6 +2675,7 @@ impl eframe::App for VadApp {
                             }
                         }
                     }
+
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("Renderer OpenGL indisponível");

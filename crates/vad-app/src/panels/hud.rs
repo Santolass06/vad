@@ -13,8 +13,10 @@ pub enum HudAction {
     ToggleEqualizer,
     ToggleVideo,
     ToggleWhisper,
+    ToggleClipExport,
     OpenSubtitlesDialog,
 }
+
 
 /// Floating HUD panel overlaying the video canvas.
 /// Complies with PLANO_VAD.md §4.29 (fixed ~92% opacity, no blur shader)
@@ -456,7 +458,15 @@ impl HudPanel {
             if ui.button("🎞 Vídeo").clicked() {
                 action = Some(HudAction::ToggleVideo);
             }
+            if ui
+                .button("✂ Cortar Clip")
+                .on_hover_text("Abrir painel de corte e exportação de clips (atalho: C)")
+                .clicked()
+            {
+                action = Some(HudAction::ToggleClipExport);
+            }
         });
+
 
         child_ui.add_space(6.0);
 
