@@ -23,10 +23,13 @@ pub struct WhisperPanel {
     model_manager: ModelManager,
     selected_preset_idx: usize,
     storage_mode: ModelStorageMode,
-    active_engine: Arc<Mutex<Option<WhisperEngine>>>,
+    /// Shared handle: the transcription thread clones the `Arc` and releases the lock at once,
+    /// so the UI thread is never blocked on this mutex while a transcription runs.
+    active_engine: Arc<Mutex<Option<Arc<WhisperEngine>>>>,
     active_model_id: Arc<Mutex<Option<String>>>,
     download_progress: Arc<Mutex<Option<f32>>>,
-    download_error: Option<String>,
+    /// Set from the model-loading threads (download or engine initialisation failures).
+    download_error: Arc<Mutex<Option<String>>>,
     transcribing: Arc<AtomicBool>,
     transcribe_progress: Arc<Mutex<Option<i32>>>,
     transcription_segments: Vec<TranscriptionSegment>,
@@ -56,7 +59,7 @@ impl WhisperPanel {
             active_engine: Arc::new(Mutex::new(None)),
             active_model_id: Arc::new(Mutex::new(None)),
             download_progress: Arc::new(Mutex::new(None)),
-            download_error: None,
+            download_error: Arc::new(Mutex::new(None)),
             transcribing: Arc::new(AtomicBool::new(false)),
             transcribe_progress: Arc::new(Mutex::new(None)),
             transcription_segments: Vec::new(),
@@ -77,6 +80,11 @@ impl WhisperPanel {
     pub fn refresh_disk_models(&mut self) {
         self.cached_disk_models = self.model_manager.list_disk_models();
         self.last_models_refresh = Instant::now();
+    }
+
+    /// Storage mode currently selected in the panel.
+    pub fn storage_mode(&self) -> ModelStorageMode {
+        self.storage_mode
     }
 
     /// Returns true if a model is currently loaded in memory and ready for inference.
@@ -229,7 +237,8 @@ impl WhisperPanel {
                 }
             }
 
-            if let Some(ref err) = self.download_error {
+            let load_error = self.download_error.lock().ok().and_then(|g| g.clone());
+            if let Some(err) = load_error {
                 ui.colored_label(Color32::RED, format!("Erro: {err}"));
             }
 
@@ -375,22 +384,33 @@ impl WhisperPanel {
                 ui.add_space(6.0);
 
                 if ui.button("📄 Exportar .md").on_hover_text("Guardar transcrição para Markdown").clicked() {
-                    let title = current_audio.map(|a| a.path.as_str()).unwrap_or("Reunião");
-                    let md_content = WhisperEngine::export_to_markdown(title, &self.transcription_segments);
+                    let source = current_audio.map(|a| a.path.as_str());
+                    let title = source
+                        .and_then(|p| std::path::Path::new(p).file_name())
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Reunião".to_string());
+                    let md_content = WhisperEngine::export_to_markdown(&title, &self.transcription_segments);
 
-                    // Save file next to source audio or in ~/.local/share/vad/
+                    // One file per recording under ~/.local/share/vad/ — a fixed name would
+                    // silently overwrite the previous meeting's transcript.
+                    let stem = source
+                        .and_then(|p| std::path::Path::new(p).file_stem())
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "reuniao".to_string());
                     let export_dir = self.model_manager.models_dir().parent().unwrap_or(self.model_manager.models_dir());
-                    let export_path = export_dir.join("transcricao_reuniao.md");
+                    let export_path = export_dir.join(format!("transcricao_{stem}.md"));
 
-                    if std::fs::write(&export_path, md_content).is_ok() {
-                        self.export_notification = Some((format!("Guardado em {:?}", export_path), Instant::now()));
-                    }
+                    self.export_notification = Some(match std::fs::write(&export_path, md_content) {
+                        Ok(()) => (format!("Guardado em {:?}", export_path), Instant::now()),
+                        Err(err) => (format!("Falha ao guardar {:?}: {err}", export_path), Instant::now()),
+                    });
                 }
             }
 
             if let Some((ref msg, instant)) = self.export_notification {
                 if instant.elapsed().as_secs() < 6 {
-                    ui.colored_label(Color32::GREEN, msg);
+                    let color = if msg.starts_with("Falha") { Color32::RED } else { Color32::GREEN };
+                    ui.colored_label(color, msg);
                 }
             }
         });
@@ -400,13 +420,14 @@ impl WhisperPanel {
 
     /// Spawns model download & initialization in a background thread.
     fn start_model_load(&mut self, preset: ModelPreset, mode: ModelStorageMode) {
-        self.download_error = None;
+        *self.download_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let progress_state = Arc::clone(&self.download_progress);
+        let error_state = Arc::clone(&self.download_error);
         let active_engine_state = Arc::clone(&self.active_engine);
         let active_model_id_state = Arc::clone(&self.active_model_id);
         let manager = ModelManager::new();
 
-        *progress_state.lock().unwrap() = Some(0.0);
+        *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(0.0);
 
         thread::spawn(move || {
             let prog_clone = Arc::clone(&progress_state);
@@ -416,39 +437,39 @@ impl WhisperPanel {
                 }
             });
 
-            match result {
-                Ok(source) => match WhisperEngine::load(&source) {
-                    Ok(engine) => {
-                        *active_engine_state.lock().unwrap() = Some(engine);
-                        *active_model_id_state.lock().unwrap() = Some(preset.id.to_string());
-                    }
-                    Err(err) => {
-                        error!("Failed to initialize WhisperEngine: {:?}", err);
-                    }
-                },
+            let loaded = result.and_then(|source| WhisperEngine::load(&source));
+            match loaded {
+                Ok(engine) => {
+                    *active_engine_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(engine));
+                    *active_model_id_state.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(preset.id.to_string());
+                }
                 Err(err) => {
-                    error!("Model download failed: {:?}", err);
+                    // ModelDownloadFailed / engine init: tell the user (§4.14), keep any active model
+                    error!("Failed to load model {}: {:?}", preset.id, err);
+                    *error_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
                 }
             }
 
-            *progress_state.lock().unwrap() = None;
+            *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
     }
 
     /// Loads an existing disk model file directly.
     fn start_direct_disk_load(&mut self, path: std::path::PathBuf, id: String) {
+        *self.download_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let error_state = Arc::clone(&self.download_error);
         let active_engine_state = Arc::clone(&self.active_engine);
         let active_model_id_state = Arc::clone(&self.active_model_id);
 
-        thread::spawn(move || {
-            match WhisperEngine::load(&ModelSource::Disk(path)) {
-                Ok(engine) => {
-                    *active_engine_state.lock().unwrap() = Some(engine);
-                    *active_model_id_state.lock().unwrap() = Some(id);
-                }
-                Err(err) => {
-                    error!("Failed to initialize direct disk model: {:?}", err);
-                }
+        thread::spawn(move || match WhisperEngine::load(&ModelSource::Disk(path)) {
+            Ok(engine) => {
+                *active_engine_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(engine));
+                *active_model_id_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+            }
+            Err(err) => {
+                error!("Failed to initialize direct disk model: {:?}", err);
+                *error_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
             }
         });
     }
@@ -466,8 +487,10 @@ impl WhisperPanel {
         let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
 
         thread::spawn(move || {
-            let guard = active_engine.lock().unwrap();
-            let Some(ref engine) = *guard else {
+            // Clone the handle and release the lock immediately: holding it for the whole
+            // transcription would block the UI thread (`has_active_model` runs every frame).
+            let engine = active_engine.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let Some(engine) = engine else {
                 let _ = tx.send(Err("Nenhum modelo Whisper ativo".to_string()));
                 transcribing.store(false, Ordering::SeqCst);
                 return;
@@ -486,7 +509,7 @@ impl WhisperPanel {
             let _ = tx.send(res_mapped);
 
             transcribing.store(false, Ordering::SeqCst);
-            *transcribe_progress.lock().unwrap() = None;
+            *transcribe_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
 
         self.transcription_rx = Some(rx);

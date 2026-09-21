@@ -35,41 +35,64 @@ impl TranscriptionSegment {
     }
 }
 
+/// User callbacks handed to whisper.cpp, plus whether one of them panicked (§4.24).
+/// Both trampolines receive a pointer to this struct as `user_data`.
+struct CallbackState<P, A> {
+    progress: Option<P>,
+    abort: Option<A>,
+    panicked: bool,
+}
+
 /// Trampoline for progress callback wrapped in `std::panic::catch_unwind` (§4.24).
 /// Ensures that Rust panics never cross the FFI boundary, preventing process abort.
-unsafe extern "C" fn safe_progress_trampoline<F>(
+/// A panic is recorded in the state so `transcribe` can turn it into a `VadError`.
+unsafe extern "C" fn safe_progress_trampoline<P, A>(
     _ctx: *mut whisper_rs_sys::whisper_context,
     _state: *mut whisper_rs_sys::whisper_state,
     progress: c_int,
     user_data: *mut c_void,
 ) where
-    F: FnMut(i32),
+    P: FnMut(i32),
 {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !user_data.is_null() {
-            let callback = &mut *(user_data as *mut F);
-            callback(progress);
+    if user_data.is_null() {
+        return;
+    }
+    let state = &mut *(user_data as *mut CallbackState<P, A>);
+    if state.panicked {
+        return;
+    }
+    if let Some(cb) = state.progress.as_mut() {
+        if catch_unwind(AssertUnwindSafe(|| cb(progress))).is_err() {
+            state.panicked = true;
         }
-    }));
+    }
 }
 
 /// Trampoline for abort callback wrapped in `std::panic::catch_unwind` (§4.24).
-/// In case of panic inside Rust callback, safely aborts Whisper inference without crashing.
-unsafe extern "C" fn safe_abort_trampoline<F>(user_data: *mut c_void) -> bool
+/// Also installed when the caller has no abort callback, so a panic in the progress callback
+/// stops the inference instead of letting it run to completion for nothing.
+unsafe extern "C" fn safe_abort_trampoline<P, A>(user_data: *mut c_void) -> bool
 where
-    F: FnMut() -> bool,
+    A: FnMut() -> bool,
 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if !user_data.is_null() {
-            let callback = &mut *(user_data as *mut F);
-            callback()
-        } else {
-            false
+    if user_data.is_null() {
+        return false;
+    }
+    let state = &mut *(user_data as *mut CallbackState<P, A>);
+    if state.panicked {
+        return true;
+    }
+    let Some(cb) = state.abort.as_mut() else {
+        return false;
+    };
+    match catch_unwind(AssertUnwindSafe(cb)) {
+        Ok(abort) => abort,
+        Err(_) => {
+            // Signal abort to whisper.cpp safely
+            state.panicked = true;
+            true
         }
-    }));
-
-    // If panic occurred, signal abort to whisper.cpp safely
-    result.unwrap_or(true)
+    }
 }
 
 /// High-level Whisper transcription engine wrapping `whisper.cpp` via `whisper-rs`.
@@ -148,8 +171,8 @@ impl WhisperEngine {
         &self,
         audio: &PcmAudio,
         language: Option<&str>,
-        mut progress_cb: Option<P>,
-        mut abort_cb: Option<A>,
+        progress_cb: Option<P>,
+        abort_cb: Option<A>,
     ) -> Result<Vec<TranscriptionSegment>, VadError>
     where
         P: FnMut(i32),
@@ -173,20 +196,18 @@ impl WhisperEngine {
             params.set_language(Some("auto"));
         }
 
-        // Set safe progress callback wrapped in catch_unwind (§4.24)
-        if let Some(ref mut cb) = progress_cb {
-            unsafe {
-                params.set_progress_callback(Some(safe_progress_trampoline::<P>));
-                params.set_progress_callback_user_data(cb as *mut P as *mut c_void);
-            }
-        }
-
-        // Set safe abort callback wrapped in catch_unwind (§4.24)
-        if let Some(ref mut cb) = abort_cb {
-            unsafe {
-                params.set_abort_callback(Some(safe_abort_trampoline::<A>));
-                params.set_abort_callback_user_data(cb as *mut A as *mut c_void);
-            }
+        // Callbacks go through catch_unwind trampolines (§4.24); the state must outlive `full`.
+        let mut callbacks = CallbackState {
+            progress: progress_cb,
+            abort: abort_cb,
+            panicked: false,
+        };
+        let user_data = &mut callbacks as *mut CallbackState<P, A> as *mut c_void;
+        unsafe {
+            params.set_progress_callback(Some(safe_progress_trampoline::<P, A>));
+            params.set_progress_callback_user_data(user_data);
+            params.set_abort_callback(Some(safe_abort_trampoline::<P, A>));
+            params.set_abort_callback_user_data(user_data);
         }
 
         let f32_samples = audio.to_f32_samples();
@@ -197,8 +218,16 @@ impl WhisperEngine {
             audio.duration_seconds
         );
 
-        state
-            .full(params, &f32_samples)
+        let full_result = state.full(params, &f32_samples);
+
+        // A panic caught in a callback is reported as such, not as a generic inference error (§4.24)
+        if callbacks.panicked {
+            error!("Panic caught in a Whisper callback; inference aborted");
+            return Err(VadError::WhisperCallbackPanic(
+                "Um callback de progresso/abort entrou em pânico; a inferência foi interrompida".to_string(),
+            ));
+        }
+        full_result
             .map_err(|err| VadError::Whisper(format!("Erro durante a inferência do Whisper: {:?}", err)))?;
 
         let num_segments = state.full_n_segments();
@@ -262,31 +291,121 @@ mod tests {
     #[test]
     fn test_safe_callbacks_catch_unwind_protection_section_4_24() {
         type ProgressCb = Box<dyn FnMut(i32)>;
-        let mut panicking_progress: ProgressCb = Box::new(|_pct: i32| {
-            panic!("Intentional test panic inside progress callback");
-        });
+        type AbortCb = Box<dyn FnMut() -> bool>;
+
+        let mut state = CallbackState::<ProgressCb, AbortCb> {
+            progress: Some(Box::new(|_pct: i32| panic!("Intentional test panic inside progress callback"))),
+            abort: Some(Box::new(|| -> bool { panic!("Intentional test panic inside abort callback") })),
+            panicked: false,
+        };
+        let user_data = &mut state as *mut _ as *mut c_void;
 
         unsafe {
-            safe_progress_trampoline::<ProgressCb>(
+            safe_progress_trampoline::<ProgressCb, AbortCb>(
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 50,
-                &mut panicking_progress as *mut _ as *mut c_void,
+                user_data,
             );
         }
+        // Reaching here means catch_unwind caught the panic; it must also be recorded
+        assert!(state.panicked, "a caught panic must be recorded so transcribe() can report it");
 
-        // If we reached here, catch_unwind caught the panic successfully without aborting the process!
+        // Once a callback panicked, abort is requested without calling user code again
+        let aborted = unsafe { safe_abort_trampoline::<ProgressCb, AbortCb>(user_data) };
+        assert!(aborted, "Panic in a callback must safely abort inference without crashing");
 
-        type AbortCb = Box<dyn FnMut() -> bool>;
-        let mut panicking_abort: AbortCb = Box::new(|| -> bool {
-            panic!("Intentional test panic inside abort callback");
-        });
+        // A panicking abort callback aborts too
+        state.panicked = false;
+        let aborted = unsafe { safe_abort_trampoline::<ProgressCb, AbortCb>(user_data) };
+        assert!(aborted && state.panicked);
+    }
 
+    #[test]
+    fn test_abort_trampoline_without_user_callback_does_not_abort() {
+        type ProgressCb = fn(i32);
+        type AbortCb = fn() -> bool;
+        let mut state = CallbackState::<ProgressCb, AbortCb> { progress: None, abort: None, panicked: false };
         let aborted = unsafe {
-            safe_abort_trampoline::<AbortCb>(&mut panicking_abort as *mut _ as *mut c_void)
+            safe_abort_trampoline::<ProgressCb, AbortCb>(&mut state as *mut _ as *mut c_void)
         };
+        assert!(!aborted);
+    }
 
-        assert!(aborted, "Panic in abort callback must safely abort inference without crashing");
+    /// Exit criterion of Sprint_06 with real inputs: YouTube audio (yt-dlp) -> `AudioExtractor`
+    /// -> `WhisperEngine`, loading the `tiny` model from disk and from a RAM-only buffer.
+    /// Needs network, yt-dlp and ffmpeg; run with `cargo test -p vad-ai -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs network access, yt-dlp and ffmpeg"]
+    fn test_real_speech_transcription_disk_and_ram_only() {
+        use crate::extractor::{AudioExtractor, ExtractionStatus};
+        use crate::model_manager::{find_preset, ModelManager};
+        use std::time::Duration;
+        use vad_core::ModelStorageMode;
+
+        let dir = std::path::PathBuf::from(format!("/tmp/vad_test_whisper_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // "Me at the zoo": 19s of English speech ("...in front of the elephants...")
+        let speech = dir.join("speech.m4a");
+        let ok = std::process::Command::new("yt-dlp")
+            .args(["--no-config", "-q", "-f", "bestaudio[ext=m4a]/bestaudio", "-o"])
+            .arg(&speech)
+            .arg("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok && speech.exists(), "yt-dlp could not fetch the speech sample");
+
+        let extractor = AudioExtractor::new();
+        let (rx, _handle) = extractor.extract_async(speech.to_string_lossy().to_string(), Some(19.0));
+        let audio = loop {
+            match rx.recv_timeout(Duration::from_secs(30)).expect("extraction timed out") {
+                ExtractionStatus::Completed(a) => break a,
+                ExtractionStatus::Failed(e) => panic!("extraction failed: {e}"),
+                _ => {}
+            }
+        };
+        assert!((15.0..25.0).contains(&audio.duration_seconds));
+
+        // Disk mode: download once into the sandbox, then load by path
+        let manager = ModelManager::with_dir(dir.join("models"));
+        let preset = find_preset("tiny").unwrap();
+        let disk_source = manager
+            .load_or_download_model(preset, ModelStorageMode::Disk, |_| {})
+            .expect("tiny model download");
+        let ModelSource::Disk(model_path) = &disk_source else { panic!("expected disk source") };
+
+        let mut progress_seen = false;
+        let engine = WhisperEngine::load(&disk_source).expect("load from disk");
+        let segments = engine
+            .transcribe(&audio, Some("en"), Some(|_: i32| progress_seen = true), None::<fn() -> bool>)
+            .expect("transcription (disk)");
+        let text = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ").to_lowercase();
+        println!("[disk] {} segments: {text}", segments.len());
+        assert!(progress_seen, "progress callback never ran");
+        assert!(text.contains("elephant"), "unexpected transcription: {text}");
+        assert!(segments.iter().all(|s| s.end_ms >= s.start_ms && s.end_ms <= 25_000));
+
+        // RAM-only path: the same model bytes held in a pinned Arc<[u8]> (§4.11)
+        let bytes: std::sync::Arc<[u8]> = std::fs::read(model_path).unwrap().into();
+        let ram_engine = WhisperEngine::load(&ModelSource::Ram(bytes)).expect("load from RAM buffer");
+        let ram_segments = ram_engine
+            .transcribe(&audio, Some("en"), None::<fn(i32)>, None::<fn() -> bool>)
+            .expect("transcription (RAM-only)");
+        let ram_text = ram_segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ").to_lowercase();
+        println!("[ram] {} segments: {ram_text}", ram_segments.len());
+        assert!(ram_text.contains("elephant"), "unexpected transcription: {ram_text}");
+
+        // A callback that aborts stops the inference with an error instead of hanging
+        let aborted = engine.transcribe(&audio, Some("en"), None::<fn(i32)>, Some(|| true));
+        assert!(aborted.is_err(), "abort callback must stop the inference");
+
+        // A panicking progress callback is reported as WhisperCallbackPanic, not a crash (§4.24)
+        let panicked = engine.transcribe(&audio, Some("en"), Some(|_: i32| panic!("boom")), None::<fn() -> bool>);
+        assert!(matches!(panicked, Err(VadError::WhisperCallbackPanic(_))), "got {panicked:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

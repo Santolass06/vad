@@ -72,6 +72,8 @@ pub struct VadApp {
     extraction_handle: Option<ExtractionHandle>,
     extraction_rx: Option<crossbeam_channel::Receiver<ExtractionStatus>>,
     extraction_progress_pct: Option<f32>,
+    /// Why there is no waveform for the current file (shown in Meeting Mode, not as a global error).
+    extraction_error: Option<String>,
     current_audio: Option<PcmAudio>,
     waveform_pyramid: Option<WaveformPyramid>,
     waveform_zoom_window: Option<(f64, f64)>,
@@ -248,6 +250,7 @@ impl VadApp {
             extraction_handle: None,
             extraction_rx: None,
             extraction_progress_pct: None,
+            extraction_error: None,
             current_audio: None,
             waveform_pyramid: None,
             waveform_zoom_window: None,
@@ -1197,17 +1200,33 @@ impl VadApp {
     /// Never blocks playback or UI (§4.17).
     pub fn start_audio_extraction(&mut self, path: &str) {
         self.cancel_extraction();
+        self.waveform_pyramid = None;
+        self.current_audio = None;
+        self.waveform_zoom_window = None;
+        self.extraction_error = None;
+
+        // ffmpeg cannot resolve stream pages (YouTube, ...) and would never finish on a live
+        // RTSP stream: extraction is for local files only. Without ffmpeg the waveform/Whisper
+        // features are disabled by the error table (§4.14) instead of failing on every open.
+        if is_allowed_url_scheme(path) {
+            self.extraction_error = Some("Waveform indisponível para streams por URL.".to_string());
+            return;
+        }
+        if self.is_feature_disabled("waveform") {
+            self.extraction_error = Some("Waveform desativada: FFmpeg em falta.".to_string());
+            return;
+        }
 
         // Check in-memory cache first (§4.12, §4.18)
         if let Some(cached) = self.audio_extractor.get_cached(path) {
             info!("Reusing in-memory cached PCM audio for {}", path);
-            let pyramid = WaveformPyramid::from_pcm(&cached);
-            self.waveform_pyramid = Some(pyramid);
+            self.waveform_pyramid = Some(WaveformPyramid::from_pcm(&cached));
             self.current_audio = Some(cached);
-            self.waveform_zoom_window = None;
-            self.extraction_progress_pct = None;
             return;
         }
+
+        // PCM is transient (§4.12): the previous file's audio is released when another opens
+        self.audio_extractor.clear_cache();
 
         let dur = self.shared_state.get_duration();
         let dur_hint = if dur > 0.0 { Some(dur) } else { None };
@@ -1215,9 +1234,6 @@ impl VadApp {
         self.extraction_handle = Some(handle);
         self.extraction_rx = Some(rx);
         self.extraction_progress_pct = Some(0.0);
-        self.waveform_pyramid = None;
-        self.current_audio = None;
-        self.waveform_zoom_window = None;
     }
 
     /// Cancels active audio extraction subprocess immediately (§4.17).
@@ -1252,8 +1268,10 @@ impl VadApp {
                         break;
                     }
                     ExtractionStatus::Failed(err) => {
+                        // Expected for e.g. videos without an audio track: keep it out of the
+                        // global error banner and explain it where the waveform would be.
                         warn!("Audio extraction failed: {}", err);
-                        self.last_error = Some(format!("Falha na extração de áudio: {}", err));
+                        self.extraction_error = Some(format!("Sem áudio extraível: {err}"));
                         self.extraction_progress_pct = None;
                         self.extraction_handle = None;
                         self.extraction_rx = None;
@@ -1273,32 +1291,8 @@ impl VadApp {
 
     /// Adjusts waveform zoom window based on mouse wheel scroll (§5).
     fn apply_waveform_zoom(&mut self, scroll_y: f32, current_time: f64, duration: f64) {
-        if duration <= 1.0 {
-            return;
-        }
-
-        let (cur_start, cur_end) = self.waveform_zoom_window.unwrap_or((0.0, duration));
-        let cur_span = cur_end - cur_start;
-
-        if scroll_y > 0.0 {
-            // Zoom in: decrease time window (down to 3s minimum)
-            let new_span = (cur_span * 0.65).max(3.0);
-            let center = current_time.clamp(0.0, duration);
-            let new_start = (center - new_span / 2.0).max(0.0);
-            let new_end = (new_start + new_span).min(duration);
-            self.waveform_zoom_window = Some((new_start, new_end));
-        } else if scroll_y < 0.0 {
-            // Zoom out: expand time window up to total duration
-            let new_span = cur_span * 1.5;
-            if new_span >= duration {
-                self.waveform_zoom_window = None;
-            } else {
-                let center = (cur_start + cur_end) / 2.0;
-                let new_start = (center - new_span / 2.0).max(0.0);
-                let new_end = (new_start + new_span).min(duration);
-                self.waveform_zoom_window = Some((new_start, new_end));
-            }
-        }
+        self.waveform_zoom_window =
+            next_waveform_zoom_window(self.waveform_zoom_window, scroll_y, current_time, duration);
     }
 
     /// Renders Meeting Mode view per PLANO_VAD.md §6 and Sprint_Planning_06 Task 6.
@@ -1309,7 +1303,14 @@ impl VadApp {
     /// - Mini-player transport bar below waveform ([⏪5s], [▶/⏸], [5s⏩], pos, speed, vol)
     fn render_meeting_mode(&mut self, ui: &mut egui::Ui, available_rect: Rect) {
         let current_time = self.shared_state.get_time_pos();
-        let duration = self.shared_state.get_duration();
+        let media_duration = self.shared_state.get_duration();
+        // A truncated extraction (§4.12) covers less than the media: draw the waveform against the
+        // audio actually held, otherwise it would be stretched over the full duration.
+        let truncated = self.current_audio.as_ref().is_some_and(|a| a.is_truncated);
+        let duration = match self.current_audio.as_ref() {
+            Some(a) if a.is_truncated => a.duration_seconds,
+            _ => media_duration,
+        };
 
         ui.vertical(|ui| {
             // Title & View Toggle
@@ -1331,6 +1332,16 @@ impl VadApp {
                     }
                 }
             });
+
+            if truncated {
+                ui.colored_label(
+                    Color32::from_rgb(230, 160, 60),
+                    format!(
+                        "⚠ Áudio truncado às {:.0}h (limite de memória, §4.12): a waveform e a transcrição só cobrem esse troço.",
+                        vad_ai::MAX_AUDIO_DURATION_SECS / 3600.0
+                    ),
+                );
+            }
 
             ui.add_space(6.0);
 
@@ -1444,7 +1455,7 @@ impl VadApp {
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Sem dados de áudio extraídos",
+                    self.extraction_error.as_deref().unwrap_or("Sem dados de áudio extraídos"),
                     egui::FontId::proportional(14.0),
                     Color32::from_rgb(140, 145, 165),
                 );
@@ -1483,7 +1494,7 @@ impl VadApp {
                 let time_text = format!(
                     "{} / {}",
                     HudPanel::format_time(current_time),
-                    HudPanel::format_time(duration)
+                    HudPanel::format_time(media_duration)
                 );
                 ui.monospace(RichText::new(time_text).strong());
 
@@ -1509,7 +1520,7 @@ impl VadApp {
                 if let Some(ref p) = self.player {
                     let mut vol = p.volume().unwrap_or(100.0);
                     ui.label("🔊");
-                    if ui.add(egui::Slider::new(&mut vol, 0.0..=150.0).show_value(false)).changed() {
+                    if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).show_value(false)).changed() {
                         let _ = p.set_volume(vol);
                     }
                     ui.label(format!("{:.0}%", vol));
@@ -1591,6 +1602,43 @@ impl VadApp {
                     });
             }
         });
+    }
+}
+
+/// Next waveform zoom window after a mouse-wheel step (§5); `None` is the global overview.
+/// Scrolling up zooms in around the playhead (down to a 3s window), scrolling down zooms out
+/// around the window centre and returns to the global overview once it would cover everything.
+fn next_waveform_zoom_window(
+    window: Option<(f64, f64)>,
+    scroll_y: f32,
+    current_time: f64,
+    duration: f64,
+) -> Option<(f64, f64)> {
+    if duration <= 1.0 {
+        return window;
+    }
+
+    let (cur_start, cur_end) = window.unwrap_or((0.0, duration));
+    let cur_span = cur_end - cur_start;
+
+    if scroll_y > 0.0 {
+        let new_span = (cur_span * 0.65).max(3.0);
+        let center = current_time.clamp(0.0, duration);
+        let new_start = (center - new_span / 2.0).max(0.0);
+        let new_end = (new_start + new_span).min(duration);
+        Some((new_start, new_end))
+    } else if scroll_y < 0.0 {
+        let new_span = cur_span * 1.5;
+        if new_span >= duration {
+            None
+        } else {
+            let center = (cur_start + cur_end) / 2.0;
+            let new_start = (center - new_span / 2.0).max(0.0);
+            let new_end = (new_start + new_span).min(duration);
+            Some((new_start, new_end))
+        }
+    } else {
+        window
     }
 }
 
@@ -1880,7 +1928,11 @@ impl eframe::App for VadApp {
                                             let _ = p.seek_absolute(secs);
                                         }
                                     }
-                                    WhisperAction::SaveConfig => {}
+                                    WhisperAction::SaveConfig => {
+                                        self.config.whisper.default_storage_mode =
+                                            self.whisper_panel.storage_mode();
+                                        let _ = self.config.save_default();
+                                    }
                                 }
                             }
                         }
@@ -2163,47 +2215,31 @@ mod tests {
     fn test_waveform_zoom_calculations() {
         let duration: f64 = 3600.0; // 1 hour
         let current_time: f64 = 1800.0; // 30 minutes in
-        let mut zoom_window: Option<(f64, f64)> = None;
 
-        // Helper replicating apply_waveform_zoom logic
-        let apply_zoom = |window: &mut Option<(f64, f64)>, scroll_y: f32| {
-            let (cur_start, cur_end) = window.unwrap_or((0.0, duration));
-            let cur_span = cur_end - cur_start;
-            if scroll_y > 0.0 {
-                let new_span = (cur_span * 0.65).max(3.0);
-                let center = current_time.clamp(0.0, duration);
-                let new_start = (center - new_span / 2.0).max(0.0);
-                let new_end = (new_start + new_span).min(duration);
-                *window = Some((new_start, new_end));
-            } else if scroll_y < 0.0 {
-                let new_span = cur_span * 1.5;
-                if new_span >= duration {
-                    *window = None;
-                } else {
-                    let center = (cur_start + cur_end) / 2.0;
-                    let new_start = (center - new_span / 2.0).max(0.0);
-                    let new_end = (new_start + new_span).min(duration);
-                    *window = Some((new_start, new_end));
-                }
-            }
-        };
-
-        // Initially global view (None)
-        assert!(zoom_window.is_none());
-
-        // Zoom in once
-        apply_zoom(&mut zoom_window, 1.0);
-        assert!(zoom_window.is_some());
-        let (s, e) = zoom_window.unwrap();
+        // Initially global view (None); zoom in once
+        let zoomed = next_waveform_zoom_window(None, 1.0, current_time, duration);
+        let (s, e) = zoomed.expect("zoom in leaves the global view");
         assert!(e - s < duration);
-        assert!(s >= 0.0);
-        assert!(e <= duration);
+        assert!(s >= 0.0 && e <= duration);
+        assert!((s + e) / 2.0 - current_time < 1.0, "zoom in centres on the playhead");
 
-        // Zoom out enough times to restore global overview (None)
-        apply_zoom(&mut zoom_window, -1.0);
-        apply_zoom(&mut zoom_window, -1.0);
-        apply_zoom(&mut zoom_window, -1.0);
-        assert!(zoom_window.is_none());
+        // Zoom in never goes below 3s
+        let mut w = zoomed;
+        for _ in 0..40 {
+            w = next_waveform_zoom_window(w, 1.0, current_time, duration);
+        }
+        let (s, e) = w.unwrap();
+        assert!((e - s - 3.0).abs() < 1e-6);
+
+        // Zoom out enough times to restore the global overview (None)
+        for _ in 0..40 {
+            w = next_waveform_zoom_window(w, -1.0, current_time, duration);
+        }
+        assert!(w.is_none());
+
+        // No scroll / too-short media: window unchanged
+        assert_eq!(next_waveform_zoom_window(zoomed, 0.0, current_time, duration), zoomed);
+        assert_eq!(next_waveform_zoom_window(None, 1.0, 0.5, 1.0), None);
     }
 
     #[test]

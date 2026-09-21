@@ -199,6 +199,17 @@ impl AudioExtractor {
         input_path: String,
         duration_hint: Option<f64>,
     ) -> (Receiver<ExtractionStatus>, ExtractionHandle) {
+        self.extract_with_cap(input_path, duration_hint, MAX_AUDIO_SAMPLES)
+    }
+
+    /// Same as [`extract_async`](Self::extract_async) with an explicit sample cap, so the
+    /// truncation path (§4.12) can be exercised without a 4-hour recording.
+    fn extract_with_cap(
+        &self,
+        input_path: String,
+        duration_hint: Option<f64>,
+        max_samples: usize,
+    ) -> (Receiver<ExtractionStatus>, ExtractionHandle) {
         let (tx, rx) = unbounded();
         let handle = ExtractionHandle::new();
         let handle_clone = handle.clone();
@@ -213,7 +224,7 @@ impl AudioExtractor {
         thread::Builder::new()
             .name(format!("vad-extractor-{}", input_path))
             .spawn(move || {
-                Self::run_extraction(input_path, duration_hint, tx, handle_clone, cache);
+                Self::run_extraction(input_path, duration_hint, max_samples, tx, handle_clone, cache);
             })
             .expect("Failed to spawn audio extraction thread");
 
@@ -224,6 +235,7 @@ impl AudioExtractor {
     fn run_extraction(
         input_path: String,
         duration_hint: Option<f64>,
+        max_samples: usize,
         tx: Sender<ExtractionStatus>,
         handle: ExtractionHandle,
         cache: Arc<Mutex<HashMap<String, PcmAudio>>>,
@@ -328,14 +340,17 @@ impl AudioExtractor {
         // 2. Read raw PCM samples (s16le = 2 bytes per sample) from stdout
         let mut raw_bytes = vec![0u8; 16384];
         let mut pcm_samples: Vec<i16> = Vec::with_capacity(16000 * 60); // preallocate 1 min
+        let mut carry: Option<u8> = None;
         let mut is_truncated = false;
 
         loop {
             if handle.is_cancelled() {
                 debug!("Audio extraction cancelled by user");
+                // Owner-side kill: `cancel()` may already have signalled the pid, this also
+                // covers a cancel that landed before the pid was published.
+                handle.clear_pid();
                 let _ = child.kill();
                 let _ = child.wait();
-                handle.clear_pid();
                 let _ = stderr_thread.join();
                 let _ = tx.send(ExtractionStatus::Cancelled);
                 return;
@@ -344,24 +359,13 @@ impl AudioExtractor {
             match stdout_pipe.read(&mut raw_bytes) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    let mut i = 0;
-                    while i + 1 < n {
-                        if pcm_samples.len() >= MAX_AUDIO_SAMPLES {
-                            // Enforce 4h duration cap (§4.12)
-                            warn!(
-                                "Audio extraction reached 4h duration cap for {}; truncating buffer",
-                                input_path
-                            );
-                            is_truncated = true;
-                            break;
-                        }
-                        let sample = i16::from_le_bytes([raw_bytes[i], raw_bytes[i + 1]]);
-                        pcm_samples.push(sample);
-                        i += 2;
-                    }
-
-                    if is_truncated {
-                        // Kill child process as we've hit the safety cap (§4.12)
+                    if Self::push_s16le(&raw_bytes[..n], &mut carry, &mut pcm_samples, max_samples) {
+                        // Enforce the duration cap (§4.12): drop the rest of the stream
+                        warn!(
+                            "Audio extraction reached the duration cap for {}; truncating buffer",
+                            input_path
+                        );
+                        is_truncated = true;
                         let _ = child.kill();
                         break;
                     }
@@ -374,9 +378,11 @@ impl AudioExtractor {
             }
         }
 
+        // Stop publishing the pid *before* reaping: once `wait()` returns the pid can be reused,
+        // and a late `cancel()` must not SIGKILL an unrelated process.
+        handle.clear_pid();
         // Wait for child process exit status (§4.31)
         let wait_result = child.wait();
-        handle.clear_pid();
         let _ = stderr_thread.join();
 
         if handle.is_cancelled() {
@@ -435,6 +441,25 @@ impl AudioExtractor {
             total_seconds: duration_seconds,
         }));
         let _ = tx.send(ExtractionStatus::Completed(audio));
+    }
+
+    /// Appends little-endian `i16` samples decoded from `bytes`, keeping an odd trailing byte in
+    /// `carry` for the next chunk (a pipe read can end mid-sample; dropping that byte would
+    /// misalign every sample after it). Returns `true` when more samples arrive than
+    /// `max_samples` allows — the buffer is then filled exactly up to the cap.
+    fn push_s16le(bytes: &[u8], carry: &mut Option<u8>, out: &mut Vec<i16>, max_samples: usize) -> bool {
+        let mut iter = carry.take().into_iter().chain(bytes.iter().copied());
+        while let Some(lo) = iter.next() {
+            let Some(hi) = iter.next() else {
+                *carry = Some(lo);
+                break;
+            };
+            if out.len() >= max_samples {
+                return true;
+            }
+            out.push(i16::from_le_bytes([lo, hi]));
+        }
+        false
     }
 
     /// Formats ExitStatus into a descriptive error message per PLANO_VAD.md §4.31.
@@ -533,6 +558,61 @@ mod tests {
         // Assert that MAX_AUDIO_SAMPLES corresponds to exactly 4 hours at 16kHz mono
         assert_eq!(MAX_AUDIO_SAMPLES, 4 * 3600 * 16000);
         assert_eq!(MAX_AUDIO_DURATION_SECS, 14400.0);
+    }
+
+    #[test]
+    fn test_push_s16le_keeps_alignment_across_odd_chunks() {
+        // Samples 0x0201, 0x0403, 0x0605 split at every possible byte boundary
+        let bytes = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+        for split in 0..=bytes.len() {
+            let (mut carry, mut out) = (None, Vec::new());
+            assert!(!AudioExtractor::push_s16le(&bytes[..split], &mut carry, &mut out, 100));
+            assert!(!AudioExtractor::push_s16le(&bytes[split..], &mut carry, &mut out, 100));
+            assert_eq!(out, vec![0x0201, 0x0403, 0x0605], "split at {split}");
+            assert_eq!(carry, None);
+        }
+    }
+
+    #[test]
+    fn test_push_s16le_cap_truncates_exactly() {
+        let bytes = [0u8; 8]; // 4 samples
+        let (mut carry, mut out) = (None, Vec::new());
+        // Exactly at the cap: not truncated
+        assert!(!AudioExtractor::push_s16le(&bytes, &mut carry, &mut out, 4));
+        // One more sample than the cap allows: truncated, buffer stays at the cap
+        assert!(AudioExtractor::push_s16le(&[0, 0], &mut carry, &mut out, 4));
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn test_real_extraction_truncates_at_cap_and_flags_it() {
+        // Risk noted in Sprint_Planning_06: the cap must really truncate, not grow unbounded.
+        let test_file = "/tmp/vad_test_cap_sine.wav";
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "pcm_s16le", test_file])
+            .status()
+            .expect("Failed to execute ffmpeg");
+        assert!(status.success());
+
+        let extractor = AudioExtractor::new();
+        let cap = 16_000; // 1s of the 2s file
+        let (rx, _handle) = extractor.extract_with_cap(test_file.to_string(), Some(2.0), cap);
+
+        let mut completed = None;
+        while let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) {
+            match msg {
+                ExtractionStatus::Completed(audio) => {
+                    completed = Some(audio);
+                    break;
+                }
+                ExtractionStatus::Failed(err) => panic!("Extraction failed: {}", err),
+                _ => {}
+            }
+        }
+        let audio = completed.expect("Should complete extraction");
+        assert!(audio.is_truncated);
+        assert_eq!(audio.samples.len(), cap);
+        let _ = std::fs::remove_file(test_file);
     }
 
     #[test]

@@ -26,7 +26,7 @@ O trabalho foi desenvolvido e validado em seis frentes principais:
    - Suporte transparente para modo **Disco** (predefinição, `~/.local/share/vad/models/`, carregamento via mmap) e modo **RAM-only** (opt-in volátil em memória `Arc<[u8]>`).
    - Tooltips com o texto autoritativo exato do §4.13 (`DISK_TOOLTIP` e `RAM_ONLY_TOOLTIP`) exibidos na interface.
    - Teste de regressão automático confirmando **zero ficheiros novos em disco** em modo RAM-only (§10.3) e confirmação de **reutilização sem novo download** em modo disco (§10.4).
-   - Download seguro através de ficheiros temporários (`.tmp`) com renomeação atómica e verificação SHA-256.
+   - Download através de ficheiros temporários (`.tmp`) com renomeação atómica. **Não há verificação de integridade (SHA-256)** — ver dívida técnica.
 4. **Integração de inferência do Whisper com proteções FFI (`vad-ai/src/whisper.rs`):**
    - Bindings de whisper.cpp via `whisper-rs`.
    - No modo RAM-only, o modelo reside num `Arc<[u8]>` **pinado** retido pelo struct `WhisperEngine`, prevenindo qualquer realocação de buffer ou *use-after-free* no ponteiro consumido pelo C (§4.11).
@@ -49,7 +49,7 @@ O trabalho foi desenvolvido e validado em seis frentes principais:
 
 | Tarefa (planning) | Estado | Detalhes |
 | :--- | :--- | :--- |
-| 1. **`vad-ai/src/extractor.rs`**: Subprocesso `ffmpeg` → PCM 16kHz mono `i16` (§4.12); assíncrono com progresso e cancelamento (§4.17); cache por ficheiro com cap de 4h (§4.12); sem persistência em disco (§4.18); argumentos em vetor com `--` e sanitização (§4.26); monitorização de `ExitStatus` do filho (§4.31). | ✅ Feito | Implementado `AudioExtractor` assíncrono. Testa e valida cap de 4h com flag `is_truncated`, eliminação de processos filhos com `SIGKILL` em cancelamento, sanitização de prefixos de hífen, e conversão de falhas de subprocesso em erro imediato. 7 testes unitários dedicados aprovados. |
+| 1. **`vad-ai/src/extractor.rs`**: Subprocesso `ffmpeg` → PCM 16kHz mono `i16` (§4.12); assíncrono com progresso e cancelamento (§4.17); cache por ficheiro com cap de 4h (§4.12); sem persistência em disco (§4.18); argumentos em vetor com `--` e sanitização (§4.26); monitorização de `ExitStatus` do filho (§4.31). | ✅ Feito | Implementado `AudioExtractor` assíncrono. Cap de 4h com flag `is_truncated` (testado com um cap reduzido, `extract_with_cap`) e aviso na UI, eliminação de processos filhos com `SIGKILL` em cancelamento, sanitização de prefixos de hífen, e conversão de falhas de subprocesso em erro imediato. 7 testes unitários dedicados aprovados. |
 | 2. **`vad-audio-tools/src/waveform_pyramid.rs`**: Nível global pré-computado; níveis de 5 min/10s sob demanda ao fazer zoom com a roda do rato (§5); min/max por pixel; no máximo ~1000 pontos visíveis num único lote de desenho (§5). | ✅ Feito | Implementado `WaveformPyramid` com representação `MinMaxPoint` e teto constante `TARGET_VISIBLE_POINTS = 1000`. Testada consistência min/max, pré-computação do nível global e geração on-demand de janelas de detalhe. 3 testes unitários dedicados aprovados. |
 | 3. **`vad-ai/src/model_manager.rs`**: Escolha do utilizador — disco (`~/.local/share/vad/models/`, mmap) vs RAM-only (`Arc<[u8]>`); tooltips com texto exato do §4.13. | ✅ Feito | Implementado `ModelManager` com download atómico e gestão de modelos. Testados formalmente os testes §10.3 (zero ficheiros no disco em modo RAM-only) e §10.4 (reutilização em disco sem segundo download). 5 testes unitários dedicados aprovados. |
 | 4. **`vad-ai/src/whisper.rs`**: Bindings whisper.cpp; RAM-only em `Arc<[u8]>` pinado (§4.11); disco por path/mmap; callbacks com `catch_unwind` (§4.24); threads em `num_cpus::get_physical()` (§5). | ✅ Feito | Implementado `WhisperEngine`. Callbacks C protegidos contra panic; threads fixadas em 10 (físicas da máquina); extração de segmentos de texto com timestamps; exportação para Markdown. 4 testes unitários dedicados aprovados. |
@@ -60,10 +60,10 @@ O trabalho foi desenvolvido e validado em seis frentes principais:
 
 ## Critério de saída — cumprido?
 
-**Cumprido plenamente.**
+**Cumprido, com uma ressalva.** A transcrição de áudio real foi verificada (áudio do YouTube → extractor → Whisper `tiny`, disco e RAM-only, `test_real_speech_transcription_disk_and_ram_only`), mas a UI gráfica (painel Whisper, Modo Reunião, indicador da barra superior) não foi exercitada numa sessão real. A revisão pós-sprint encontrou que a UI **congelava durante a transcrição** (lock do motor mantido durante toda a inferência) — corrigido; ver `Sprint_06.md`.
 1. **Extração não-bloqueante e cancelável:**
    - A extração de áudio corre em thread de background com comunicação desacoplada via canais `crossbeam-channel`.
-   - Testada com reprodução concorrente de vídeo e áudio no `Player`: a reprodução continua sem travamentos ou quebras enquanto a extração decorre.
+   - A extração corre noutra thread sem estado partilhado com o `Player`; a reprodução concorrente não foi medida.
    - O indicador na barra superior permite abortar a operação em qualquer momento, terminando o processo `ffmpeg` sem órfãos.
 2. **Forma de onda da reunião visível de imediato:**
    - Assim que a extração termina, o nível global (~1000 pontos) é gerado instantaneamente e exibido na área central.
@@ -91,6 +91,12 @@ O trabalho foi desenvolvido e validado em seis frentes principais:
 
 ## Dívida técnica / transição para o Sprint 07
 
+- **Sem verificação de integridade dos modelos** (SHA-256 ou similar): um download truncado ou adulterado só falha ao carregar o motor.
+- **Custo de RAM da transcrição:** `to_f32_samples()` cria uma cópia `f32` de todo o áudio (4 bytes/amostra); no cap de 4 h são ~920 MB transitórios além dos ~460 MB do PCM `i16`. O planeamento (§4.12) aceita a conversão no ingestão, mas o pico não estava registado.
+- **A extração corre para todos os ficheiros locais ao abrir**, incluindo filmes longos que nunca vão ao Modo Reunião (CPU + ~230 MB por hora de áudio). Considerar extrair só ao abrir o Modo Reunião/Whisper.
+- **A transcrição não é cancelável** na UI (o motor suporta abort; o painel não o liga).
+- Não há waveform para streams por URL (o ffmpeg não resolve páginas de vídeo).
+
 Para o **Sprint 07 (M3, parte 2)**:
 - **Skip-silence e VAD inteligente:** Deteção de períodos de silêncio para salto automático durante a audição.
 - **Unload por inatividade:** Descarga automática do modelo Whisper da RAM após período de inatividade configurado.
@@ -102,6 +108,6 @@ Para o **Sprint 07 (M3, parte 2)**:
 ## Conclusão
 
 A **Sprint 06 (M3, parte 1) está concluída com sucesso**.
-- Total de testes no workspace: **60 aprovados**, 0 falhas, 1 teste ignorado dependente de rede externa.
+- Total de testes no workspace: **66 aprovados**, 0 falhas, 2 testes ignorados que dependem de rede (`cargo test --workspace -- --ignored`).
 - `cargo clippy --workspace --all-targets -- -D warnings`: 0 avisos.
 - Limpeza de repositório: zero ficheiros temporários, lixo ou artefactos órfãos no diretório de trabalho.

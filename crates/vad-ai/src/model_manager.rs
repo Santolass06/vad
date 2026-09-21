@@ -6,6 +6,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 use vad_core::{vad_models_dir, ModelStorageMode, VadError};
 
+/// Connection timeout for model downloads (§4.22 spirit: never leave network waits implicit).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Upper bound for a whole model download; large enough for the ~1.5 GB `medium` model.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
 /// Tooltip explaining the RAM-only storage choice per PLANO_VAD.md §4.13.
 pub const RAM_ONLY_TOOLTIP: &str = "Nada fica no disco. Ideal para privacidade extrema ou pouco espaço livre. Tens de descarregar de novo (o tamanho do modelo escolhido, ex. ~55 MB no base-q5) sempre que usares, e ocupa esse espaço em RAM enquanto estiver ativo.";
 
@@ -221,7 +226,11 @@ impl ModelManager {
                 info!("Downloading model {} to disk: {:?}", preset.id, target_path);
                 let tmp_path = self.models_dir.join(format!("{}.tmp", preset.filename));
 
-                self.download_to_file(preset.url, &tmp_path, &mut progress_cb)?;
+                if let Err(err) = self.download_to_file(preset.url, &tmp_path, &mut progress_cb) {
+                    // Never leave a partial download behind (it would look like a model on disk)
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err);
+                }
 
                 // Atomic rename over destination
                 fs::rename(&tmp_path, &target_path).map_err(|err| {
@@ -242,17 +251,19 @@ impl ModelManager {
         }
     }
 
-    /// Internal helper: downloads URL to a file with progress reporting.
-    fn download_to_file<F>(&self, url: &str, target_path: &Path, progress_cb: &mut F) -> Result<(), VadError>
-    where
-        F: FnMut(f32),
-    {
+    /// Sends the GET request for a model download and returns the response with its size.
+    ///
+    /// Only the connection has a short timeout: a total timeout would abort the larger models
+    /// (`medium` is ~1.5 GB) on ordinary connections. `DOWNLOAD_TIMEOUT` is just an upper bound
+    /// so a stalled transfer cannot hang the download thread forever.
+    fn open_download(url: &str) -> Result<(reqwest::blocking::Response, u64), VadError> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(DOWNLOAD_TIMEOUT)
             .build()
             .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
 
-        let mut response = client
+        let response = client
             .get(url)
             .send()
             .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
@@ -265,19 +276,31 @@ impl ModelManager {
         }
 
         let total_size = response.content_length().unwrap_or(0);
-        let mut file = File::create(target_path).map_err(VadError::Io)?;
+        Ok((response, total_size))
+    }
+
+    /// Streams `response` into `sink` in chunks, reporting progress; returns the bytes copied.
+    fn copy_with_progress<F>(
+        mut response: reqwest::blocking::Response,
+        total_size: u64,
+        progress_cb: &mut F,
+        mut sink: impl FnMut(&[u8]) -> Result<(), VadError>,
+    ) -> Result<u64, VadError>
+    where
+        F: FnMut(f32),
+    {
+        let mut chunk = [0u8; 32768];
         let mut downloaded: u64 = 0;
-        let mut buffer = [0u8; 32768];
 
         loop {
             let n = response
-                .read(&mut buffer)
+                .read(&mut chunk)
                 .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
             if n == 0 {
                 break;
             }
 
-            file.write_all(&buffer[..n]).map_err(VadError::Io)?;
+            sink(&chunk[..n])?;
             downloaded += n as u64;
 
             if total_size > 0 {
@@ -285,6 +308,21 @@ impl ModelManager {
                 progress_cb(pct);
             }
         }
+
+        Ok(downloaded)
+    }
+
+    /// Internal helper: downloads URL to a file with progress reporting.
+    fn download_to_file<F>(&self, url: &str, target_path: &Path, progress_cb: &mut F) -> Result<(), VadError>
+    where
+        F: FnMut(f32),
+    {
+        let (response, total_size) = Self::open_download(url)?;
+        let mut file = File::create(target_path).map_err(VadError::Io)?;
+
+        Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
+            file.write_all(bytes).map_err(VadError::Io)
+        })?;
 
         file.sync_all().map_err(VadError::Io)?;
         progress_cb(100.0);
@@ -296,42 +334,13 @@ impl ModelManager {
     where
         F: FnMut(f32),
     {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
-
-        let mut response = client
-            .get(url)
-            .send()
-            .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(VadError::ModelDownloadFailed(format!(
-                "Servidor retornou status HTTP {}",
-                response.status()
-            )));
-        }
-
-        let total_size = response.content_length().unwrap_or(0);
+        let (response, total_size) = Self::open_download(url)?;
         let mut buffer = Vec::with_capacity(total_size as usize);
-        let mut chunk = [0u8; 32768];
 
-        loop {
-            let n = response
-                .read(&mut chunk)
-                .map_err(|e| VadError::ModelDownloadFailed(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-
-            buffer.extend_from_slice(&chunk[..n]);
-
-            if total_size > 0 {
-                let pct = (buffer.len() as f32 / total_size as f32 * 100.0).clamp(0.0, 99.0);
-                progress_cb(pct);
-            }
-        }
+        Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
+            buffer.extend_from_slice(bytes);
+            Ok(())
+        })?;
 
         progress_cb(100.0);
         Ok(buffer)
@@ -428,40 +437,123 @@ mod tests {
         let _ = fs::remove_dir_all(&sandbox_dir);
     }
 
+    /// Minimal HTTP server on localhost serving `body` for every request; counts the requests.
+    fn serve_model(body: &'static [u8]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/ggml-test.bin", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                // Consume the request head
+                while reader.read_line(&mut line).map(|n| n > 2).unwrap_or(false) {
+                    line.clear();
+                }
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        (url, hits)
+    }
+
+    fn test_preset(url: String) -> ModelPreset {
+        ModelPreset {
+            id: "test",
+            display_name: "test",
+            filename: "ggml-test.bin",
+            url: Box::leak(url.into_boxed_str()),
+            approx_size_mb: 0.0,
+        }
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     #[test]
     fn test_ram_only_mode_zero_files_created_section_10_3() {
-        // Count files before in ~/.local/share/vad, ~/.cache, /tmp
-        fn count_dir_files(dir: &Path) -> usize {
-            if !dir.exists() {
-                return 0;
-            }
-            fs::read_dir(dir)
-                .map(|entries| entries.flatten().count())
-                .unwrap_or(0)
-        }
+        const BODY: &[u8] = b"RAM_ONLY_MODEL_BYTES";
+        let (url, hits) = serve_model(BODY);
+        let sandbox_dir = PathBuf::from(format!("/tmp/vad_test_ramonly_{}", std::process::id()));
+        let manager = ModelManager::with_dir(sandbox_dir.clone());
+        let tmp_before = files_in(Path::new("/tmp"));
 
-        let local_vad = vad_models_dir();
-        let cache_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache");
-
-        let count_vad_before = count_dir_files(&local_vad);
-        let count_cache_before = count_dir_files(&cache_dir);
-
-        // Load an in-memory buffer as a simulated RAM-only source
-        let memory_bytes: Arc<[u8]> = Arc::from(vec![1, 2, 3, 4, 5, 6, 7, 8].into_boxed_slice());
-        let source = ModelSource::Ram(Arc::clone(&memory_bytes));
+        let source = manager
+            .load_or_download_model(&test_preset(url), ModelStorageMode::RamOnly, |_| {})
+            .expect("RAM-only download from local server");
 
         match source {
-            ModelSource::Ram(buf) => {
-                assert_eq!(&*buf, &[1, 2, 3, 4, 5, 6, 7, 8]);
-            }
-            _ => panic!("Expected RAM source"),
+            ModelSource::Ram(buf) => assert_eq!(&*buf, BODY),
+            ModelSource::Disk(_) => panic!("Expected ModelSource::Ram"),
         }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // Confirm zero new files in ~/.local/share/vad and ~/.cache
-        let count_vad_after = count_dir_files(&local_vad);
-        let count_cache_after = count_dir_files(&cache_dir);
+        // Zero files: nothing in the models dir (not even a .tmp) and no model-looking file in /tmp
+        assert!(files_in(&sandbox_dir).is_empty(), "RAM-only left files in models dir");
+        let new_in_tmp: Vec<String> = files_in(Path::new("/tmp"))
+            .into_iter()
+            .filter(|n| !tmp_before.contains(n) && (n.contains("ggml") || n.ends_with(".tmp")))
+            .collect();
+        assert!(new_in_tmp.is_empty(), "RAM-only left files in /tmp: {new_in_tmp:?}");
 
-        assert_eq!(count_vad_before, count_vad_after, "Zero new files in local share");
-        assert_eq!(count_cache_before, count_cache_after, "Zero new files in cache");
+        let _ = fs::remove_dir_all(&sandbox_dir);
+    }
+
+    #[test]
+    fn test_disk_mode_downloads_once_then_reuses_section_10_4() {
+        const BODY: &[u8] = b"DISK_MODEL_BYTES";
+        let (url, hits) = serve_model(BODY);
+        let sandbox_dir = PathBuf::from(format!("/tmp/vad_test_diskdl_{}", std::process::id()));
+        let manager = ModelManager::with_dir(sandbox_dir.clone());
+        let preset = test_preset(url);
+
+        // First activation downloads and persists atomically (no .tmp left behind)
+        let first = manager
+            .load_or_download_model(&preset, ModelStorageMode::Disk, |_| {})
+            .expect("first download");
+        let ModelSource::Disk(path) = first else { panic!("Expected ModelSource::Disk") };
+        assert_eq!(path, sandbox_dir.join("ggml-test.bin"));
+        assert_eq!(fs::read(&path).unwrap(), BODY);
+        assert_eq!(files_in(&sandbox_dir), vec!["ggml-test.bin".to_string()]);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Next activation reuses the file: no new request
+        manager
+            .load_or_download_model(&preset, ModelStorageMode::Disk, |_| {})
+            .expect("reuse");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "model was downloaded again");
+
+        let _ = fs::remove_dir_all(&sandbox_dir);
+    }
+
+    #[test]
+    fn test_failed_download_leaves_no_partial_file() {
+        // Port 1 refuses connections: the request fails after the .tmp path was chosen
+        let sandbox_dir = PathBuf::from(format!("/tmp/vad_test_faildl_{}", std::process::id()));
+        let manager = ModelManager::with_dir(sandbox_dir.clone());
+        let preset = test_preset("http://127.0.0.1:1/ggml-test.bin".to_string());
+
+        let res = manager.load_or_download_model(&preset, ModelStorageMode::Disk, |_| {});
+        assert!(matches!(res, Err(VadError::ModelDownloadFailed(_))));
+        assert!(files_in(&sandbox_dir).is_empty());
+
+        let _ = fs::remove_dir_all(&sandbox_dir);
     }
 }
