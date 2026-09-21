@@ -6,10 +6,37 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use tracing::{error, info};
 use vad_ai::{
-    find_preset, DiskModelInfo, ModelManager, ModelPreset, ModelSource, PcmAudio,
-    TranscriptionSegment, WhisperEngine, DISK_TOOLTIP, PRESET_MODELS, RAM_ONLY_TOOLTIP,
+    find_preset, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
+    MapReduceSummarizer, MeetingSummary, MockSummarizer, ModelManager, ModelPreset, ModelSource,
+    PcmAudio, SummarizeProgress, Summarizer, TargetLanguage, TranscriptionSegment, WhisperEngine,
+    DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS, DEFAULT_QWEN_MODEL_FILENAME,
+    DEFAULT_QWEN_TOKENIZER_FILENAME, DISK_TOOLTIP, PRESET_MODELS, RAM_ONLY_TOOLTIP,
 };
 use vad_core::{get_process_rss_bytes, ModelStorageMode, VadConfig};
+
+/// Renders a standardized AI privacy badge (🔒 Local / ☁️ Sai do PC) per PLANO_VAD.md §4.1.
+pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
+    let (bg, text_color) = match badge {
+        AiPrivacyBadge::Local => (
+            Color32::from_rgba_premultiplied(34, 197, 94, 35),
+            Color32::from_rgb(74, 222, 128),
+        ),
+        AiPrivacyBadge::Cloud => (
+            Color32::from_rgba_premultiplied(234, 179, 8, 35),
+            Color32::from_rgb(250, 204, 21),
+        ),
+    };
+
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(badge.label()).size(10.5).color(text_color).strong());
+        })
+        .response
+        .on_hover_text(badge.tooltip());
+}
 
 /// Idle time after which a RAM-only Whisper model is released (§4.16).
 pub const IDLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -56,6 +83,27 @@ pub struct WhisperPanel {
     cached_disk_models: Vec<DiskModelInfo>,
     last_models_refresh: Instant,
     export_notification: Option<(String, Instant)>,
+
+    // --- LLM & Summarization state (M5a) ---
+    is_summarizing: Arc<AtomicBool>,
+    summarize_progress: Arc<Mutex<Option<SummarizeProgress>>>,
+    summarize_error: Option<String>,
+    summarize_abort: Arc<AtomicBool>,
+    meeting_summary: Option<MeetingSummary>,
+    summary_rx: Option<crossbeam_channel::Receiver<Result<MeetingSummary, String>>>,
+
+    // --- Translation state (M5a) ---
+    is_translating: Arc<AtomicBool>,
+    translation_progress: Arc<Mutex<Option<(usize, usize)>>>,
+    translation_error: Option<String>,
+    translation_abort: Arc<AtomicBool>,
+    selected_target_lang: TargetLanguage,
+    translated_segments: Option<Vec<TranscriptionSegment>>,
+    translation_rx: Option<crossbeam_channel::Receiver<Result<Vec<TranscriptionSegment>, String>>>,
+    show_translated_subtitles: bool,
+
+    // --- LLM Model / Test state ---
+    use_mock_llm: bool,
 }
 
 impl Default for WhisperPanel {
@@ -88,6 +136,24 @@ impl WhisperPanel {
             cached_disk_models: disk_models,
             last_models_refresh: Instant::now(),
             export_notification: None,
+
+            is_summarizing: Arc::new(AtomicBool::new(false)),
+            summarize_progress: Arc::new(Mutex::new(None)),
+            summarize_error: None,
+            summarize_abort: Arc::new(AtomicBool::new(false)),
+            meeting_summary: None,
+            summary_rx: None,
+
+            is_translating: Arc::new(AtomicBool::new(false)),
+            translation_progress: Arc::new(Mutex::new(None)),
+            translation_error: None,
+            translation_abort: Arc::new(AtomicBool::new(false)),
+            selected_target_lang: TargetLanguage::English,
+            translated_segments: None,
+            translation_rx: None,
+            show_translated_subtitles: false,
+
+            use_mock_llm: false,
         }
     }
 
@@ -209,6 +275,12 @@ impl WhisperPanel {
         self.transcription_segments.clear();
         self.transcription_error = None;
         self.transcription_rx = None;
+        self.meeting_summary = None;
+        self.summarize_error = None;
+        self.summary_rx = None;
+        self.translated_segments = None;
+        self.translation_error = None;
+        self.translation_rx = None;
     }
 
     /// Renders the Whisper AI lateral panel.
@@ -235,6 +307,45 @@ impl WhisperPanel {
                     }
                 }
                 self.transcription_rx = None;
+            }
+        }
+
+        // Non-blocking poll for meeting summarization completion (M5a)
+        if let Some(ref rx) = self.summary_rx {
+            if let Ok(res) = rx.try_recv() {
+                match res {
+                    Ok(summary) => {
+                        info!(
+                            "Meeting summarization finished successfully ({} chunks, {:.1}s audio)",
+                            summary.total_chunks, summary.duration_seconds
+                        );
+                        self.meeting_summary = Some(summary);
+                        self.summarize_error = None;
+                    }
+                    Err(err) => {
+                        error!("Meeting summarization error: {}", err);
+                        self.summarize_error = Some(err);
+                    }
+                }
+                self.summary_rx = None;
+            }
+        }
+
+        // Non-blocking poll for translation completion (M5a)
+        if let Some(ref rx) = self.translation_rx {
+            if let Ok(res) = rx.try_recv() {
+                match res {
+                    Ok(segs) => {
+                        info!("Translation finished successfully ({} segments)", segs.len());
+                        self.translated_segments = Some(segs);
+                        self.translation_error = None;
+                    }
+                    Err(err) => {
+                        error!("Translation error: {}", err);
+                        self.translation_error = Some(err);
+                    }
+                }
+                self.translation_rx = None;
             }
         }
 
@@ -529,6 +640,168 @@ impl WhisperPanel {
                 }
             }
 
+            ui.separator();
+            ui.add_space(4.0);
+
+            // --- SECTION 6: Meeting Summary (LLM Local, M5a, §4.1, §4.19, §4.20) ---
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("RESUMO DA REUNIÃO")
+                        .size(11.0)
+                        .strong()
+                        .color(Color32::from_rgb(160, 165, 185)),
+                );
+                render_privacy_badge(ui, AiPrivacyBadge::Local);
+            });
+            ui.add_space(4.0);
+
+            let is_summarizing = self.is_summarizing.load(Ordering::SeqCst);
+            let has_segments = !self.transcription_segments.is_empty();
+
+            if is_summarizing {
+                let prog_msg = self
+                    .summarize_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|p| p.display_message())
+                    .unwrap_or_else(|| "A inicializar resumo...".to_string());
+
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(prog_msg).size(12.0));
+                });
+                ui.add_space(2.0);
+
+                if ui
+                    .button(RichText::new("✕ Cancelar").color(Color32::from_rgb(239, 68, 68)))
+                    .on_hover_text("Cancelar a geração do resumo")
+                    .clicked()
+                {
+                    self.cancel_summary();
+                }
+            } else {
+                let summarize_btn = egui::Button::new(
+                    RichText::new("✨ Gerar Resumo da Reunião").strong(),
+                );
+                let resp = ui.add_enabled(has_segments, summarize_btn);
+                if !has_segments {
+                    resp.on_disabled_hover_text("Executa primeiro a transcrição com o Whisper");
+                } else if resp.clicked() {
+                    self.start_summary();
+                }
+            }
+
+            if let Some(ref err) = self.summarize_error {
+                ui.colored_label(Color32::RED, format!("Erro no resumo: {err}"));
+            }
+
+            if let Some(ref summary) = self.meeting_summary {
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .corner_radius(6.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} blocos processados ({:.1}s)", summary.total_chunks, summary.duration_seconds))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(160, 165, 185)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("📋 Copiar").clicked() {
+                                    ui.ctx().copy_text(summary.markdown.clone());
+                                }
+                            });
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&summary.markdown).size(11.5));
+                            });
+                    });
+            }
+
+            ui.separator();
+            ui.add_space(4.0);
+
+            // --- SECTION 7: Multilingual Translation (M5a, §4.1) ---
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("TRADUÇÃO MULTI-IDIOMA")
+                        .size(11.0)
+                        .strong()
+                        .color(Color32::from_rgb(160, 165, 185)),
+                );
+                render_privacy_badge(ui, AiPrivacyBadge::Local);
+            });
+            ui.add_space(4.0);
+
+            let is_translating = self.is_translating.load(Ordering::SeqCst);
+
+            ui.horizontal(|ui| {
+                ui.label("Destino:");
+                egui::ComboBox::from_id_salt("target_lang_select")
+                    .selected_text(self.selected_target_lang.display_name())
+                    .show_ui(ui, |ui| {
+                        for lang in TargetLanguage::ALL {
+                            ui.selectable_value(&mut self.selected_target_lang, lang, lang.display_name());
+                        }
+                    });
+            });
+
+            if is_translating {
+                let prog = self
+                    .translation_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or((0, self.transcription_segments.len().max(1)));
+
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("A traduzir: {}/{} segmentos...", prog.0, prog.1));
+                });
+                ui.add(egui::ProgressBar::new(prog.0 as f32 / prog.1 as f32).animate(true));
+
+                if ui
+                    .button(RichText::new("✕ Cancelar").color(Color32::from_rgb(239, 68, 68)))
+                    .on_hover_text("Cancelar tradução")
+                    .clicked()
+                {
+                    self.cancel_translation();
+                }
+            } else {
+                let trans_btn = egui::Button::new(
+                    RichText::new(format!("🌐 Traduzir para {}", self.selected_target_lang.display_name())).strong(),
+                );
+                let resp = ui.add_enabled(has_segments, trans_btn);
+                if !has_segments {
+                    resp.on_disabled_hover_text("Transcreve o áudio primeiro");
+                } else if resp.clicked() {
+                    let target = self.selected_target_lang;
+                    self.start_translation(target);
+                }
+            }
+
+            if let Some(ref err) = self.translation_error {
+                ui.colored_label(Color32::RED, format!("Erro de tradução: {err}"));
+            }
+
+            if let Some(ref trans_segs) = self.translated_segments {
+                ui.add_space(2.0);
+                ui.checkbox(
+                    &mut self.show_translated_subtitles,
+                    "Exibir tradução nas legendas / reprodução",
+                );
+                ui.label(
+                    RichText::new(format!("{} segmentos traduzidos disponíveis", trans_segs.len()))
+                        .size(11.0)
+                        .color(Color32::from_rgb(160, 165, 185)),
+                );
+            }
+
             if let Some((ref msg, instant)) = self.export_notification {
                 if instant.elapsed().as_secs() < 6 {
                     let color = if msg.starts_with("Falha") { Color32::RED } else { Color32::GREEN };
@@ -681,6 +954,183 @@ impl WhisperPanel {
     pub fn transcribe_progress(&self) -> Option<i32> {
         self.transcribe_progress.lock().ok().and_then(|g| *g)
     }
+
+    /// Returns the currently generated meeting summary, if any.
+    pub fn meeting_summary(&self) -> Option<&MeetingSummary> {
+        self.meeting_summary.as_ref()
+    }
+
+    /// Sets or clears the current meeting summary.
+    #[allow(dead_code)]
+    pub fn set_meeting_summary(&mut self, summary: Option<MeetingSummary>) {
+        self.meeting_summary = summary;
+    }
+
+    /// Returns whether meeting summarization is currently in progress.
+    #[allow(dead_code)]
+    pub fn is_summarizing(&self) -> bool {
+        self.is_summarizing.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether multilingual translation is currently in progress.
+    #[allow(dead_code)]
+    pub fn is_translating(&self) -> bool {
+        self.is_translating.load(Ordering::SeqCst)
+    }
+
+    /// Returns translated segments if available.
+    pub fn translated_segments(&self) -> Option<&[TranscriptionSegment]> {
+        self.translated_segments.as_deref()
+    }
+
+    /// Returns whether translated subtitles should be displayed.
+    pub fn show_translated_subtitles(&self) -> bool {
+        self.show_translated_subtitles
+    }
+
+    /// Sets whether translated subtitles should be displayed.
+    #[allow(dead_code)]
+    pub fn set_show_translated_subtitles(&mut self, show: bool) {
+        self.show_translated_subtitles = show;
+    }
+
+    /// Overrides LLM execution to use the deterministic MockSummarizer (useful for tests/demos).
+    #[allow(dead_code)]
+    pub fn set_use_mock_llm(&mut self, use_mock: bool) {
+        self.use_mock_llm = use_mock;
+    }
+
+    /// Initiates asynchronous meeting summarization with Map-Reduce in a background thread (§4.19, §4.20).
+    pub fn start_summary(&mut self) {
+        if self.is_summarizing.load(Ordering::SeqCst) || self.transcription_segments.is_empty() {
+            return;
+        }
+
+        self.touch_activity();
+        self.is_summarizing.store(true, Ordering::SeqCst);
+        self.summarize_abort.store(false, Ordering::SeqCst);
+        self.summarize_error = None;
+        *self.summarize_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        let segments = self.transcription_segments.clone();
+        let is_summarizing = Arc::clone(&self.is_summarizing);
+        let progress_state = Arc::clone(&self.summarize_progress);
+        let abort_flag = Arc::clone(&self.summarize_abort);
+
+        let manager = ModelManager::new();
+        let ready = manager.is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
+        let use_mock = self.use_mock_llm || !ready;
+
+        let summarizer: Arc<dyn Summarizer> = if !use_mock {
+            if let Some((model_p, tok_p)) = manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME) {
+                match LocalQwenSummarizer::load_from_paths(&model_p, &tok_p, DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        error!("Falha ao carregar modelo Qwen local: {:?}", e);
+                        Arc::new(MockSummarizer::default())
+                    }
+                }
+            } else {
+                Arc::new(MockSummarizer::default())
+            }
+        } else {
+            Arc::new(MockSummarizer::default())
+        };
+
+        let (tx, rx) = crossbeam_channel::bounded::<Result<MeetingSummary, String>>(1);
+
+        thread::spawn(move || {
+            let map_reduce = MapReduceSummarizer::new(summarizer);
+            let prog_clone = Arc::clone(&progress_state);
+            let progress_cb = move |p: SummarizeProgress| {
+                if let Ok(mut g) = prog_clone.lock() {
+                    *g = Some(p);
+                }
+            };
+
+            let res = map_reduce.summarize(&segments, Some(progress_cb), Some(abort_flag));
+            let mapped = res.map_err(|e| e.to_string());
+            let _ = tx.send(mapped);
+
+            is_summarizing.store(false, Ordering::SeqCst);
+            *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        });
+
+        self.summary_rx = Some(rx);
+    }
+
+    /// Signals cancellation of the running summarization operation (§4.20).
+    pub fn cancel_summary(&mut self) {
+        self.summarize_abort.store(true, Ordering::SeqCst);
+    }
+
+    /// Initiates multilingual translation of current transcription segments in a background thread (§4.1).
+    pub fn start_translation(&mut self, target_lang: TargetLanguage) {
+        if self.is_translating.load(Ordering::SeqCst) || self.transcription_segments.is_empty() {
+            return;
+        }
+
+        self.touch_activity();
+        self.is_translating.store(true, Ordering::SeqCst);
+        self.translation_abort.store(false, Ordering::SeqCst);
+        self.translation_error = None;
+        *self.translation_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        let segments = self.transcription_segments.clone();
+        let is_translating = Arc::clone(&self.is_translating);
+        let progress_state = Arc::clone(&self.translation_progress);
+        let abort_flag = Arc::clone(&self.translation_abort);
+
+        let manager = ModelManager::new();
+        let ready = manager.is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
+        let use_mock = self.use_mock_llm || !ready;
+
+        let summarizer: Arc<dyn Summarizer> = if !use_mock {
+            if let Some((model_p, tok_p)) = manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME) {
+                match LocalQwenSummarizer::load_from_paths(&model_p, &tok_p, DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS) {
+                    Ok(s) => Arc::new(s),
+                    Err(_) => Arc::new(MockSummarizer::default()),
+                }
+            } else {
+                Arc::new(MockSummarizer::default())
+            }
+        } else {
+            Arc::new(MockSummarizer::default())
+        };
+
+        let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
+
+        thread::spawn(move || {
+            let translator = LlmTranslator::new(summarizer);
+            let prog_clone = Arc::clone(&progress_state);
+            let progress_cb = move |curr: usize, total: usize| {
+                if let Ok(mut g) = prog_clone.lock() {
+                    *g = Some((curr, total));
+                }
+            };
+
+            let res = translator.translate_segments(
+                &segments,
+                "Português",
+                target_lang,
+                Some(progress_cb),
+                Some(abort_flag),
+            );
+
+            let mapped = res.map_err(|e| e.to_string());
+            let _ = tx.send(mapped);
+
+            is_translating.store(false, Ordering::SeqCst);
+            *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        });
+
+        self.translation_rx = Some(rx);
+    }
+
+    /// Signals cancellation of the running translation operation.
+    pub fn cancel_translation(&mut self) {
+        self.translation_abort.store(true, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -820,5 +1270,70 @@ mod tests {
         let grew = rss_loaded.saturating_sub(rss_start);
         let freed = rss_loaded.saturating_sub(rss_after);
         assert!(grew > 0 && freed * 2 >= grew, "unload must return at least half of what loading took");
+    }
+
+    #[test]
+    fn test_whisper_panel_start_summary_async() {
+        let mut panel = WhisperPanel::new();
+        panel.set_use_mock_llm(true);
+        panel.set_segments(vec![
+            TranscriptionSegment {
+                start_ms: 0,
+                end_ms: 3000,
+                text: "Apresentação dos resultados trimestrais.".to_string(),
+            },
+            TranscriptionSegment {
+                start_ms: 3000,
+                end_ms: 6000,
+                text: "O plano de migração foi aprovado por unanimidade.".to_string(),
+            },
+        ]);
+
+        assert!(!panel.is_summarizing());
+        panel.start_summary();
+        assert!(panel.is_summarizing());
+
+        // Wait for background worker to deliver result
+        let start = Instant::now();
+        while panel.is_summarizing() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!panel.is_summarizing());
+        let summary_rx = panel.summary_rx.take().expect("summary_rx must be present");
+        let res = summary_rx.recv_timeout(Duration::from_millis(500)).unwrap();
+        assert!(res.is_ok());
+        let summary = res.unwrap();
+        assert_eq!(summary.privacy_badge, AiPrivacyBadge::Local);
+        assert!(summary.markdown.contains("Resumo da Reunião"));
+    }
+
+    #[test]
+    fn test_whisper_panel_start_translation_async() {
+        let mut panel = WhisperPanel::new();
+        panel.set_use_mock_llm(true);
+        panel.set_segments(vec![TranscriptionSegment {
+            start_ms: 0,
+            end_ms: 2500,
+            text: "Bom dia a todos.".to_string(),
+        }]);
+
+        assert!(!panel.is_translating());
+        panel.start_translation(TargetLanguage::English);
+        assert!(panel.is_translating());
+
+        let start = Instant::now();
+        while panel.is_translating() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!panel.is_translating());
+        let translation_rx = panel.translation_rx.take().expect("translation_rx must be present");
+        let res = translation_rx.recv_timeout(Duration::from_millis(500)).unwrap();
+        assert!(res.is_ok());
+        let translated = res.unwrap();
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].start_ms, 0);
+        assert_eq!(translated[0].end_ms, 2500);
     }
 }

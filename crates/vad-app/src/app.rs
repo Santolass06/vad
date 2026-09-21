@@ -2161,10 +2161,47 @@ impl VadApp {
 
             ui.add_space(10.0);
 
-            // Recent Transcription Segments preview
-            let segments = self.whisper_panel.transcription_segments();
+            // Meeting Summary (LLM Local, M5a, §4.1, §4.19)
+            if let Some(summary) = self.whisper_panel.meeting_summary() {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Resumo da Reunião:").size(12.0).strong());
+                    crate::panels::render_privacy_badge(ui, summary.privacy_badge);
+                });
+                ui.add_space(4.0);
+
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .corner_radius(6.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&summary.markdown).size(11.5));
+                            });
+                    });
+            }
+
+            ui.add_space(10.0);
+
+            // Recent Transcription / Translation Segments preview
+            let show_translated = self.whisper_panel.show_translated_subtitles();
+            let segments = if show_translated {
+                self.whisper_panel
+                    .translated_segments()
+                    .unwrap_or_else(|| self.whisper_panel.transcription_segments())
+            } else {
+                self.whisper_panel.transcription_segments()
+            };
+
             if !segments.is_empty() {
-                ui.label(RichText::new("Segmentos Transcritos (Whisper AI):").size(12.0).strong());
+                let lbl = if show_translated {
+                    "Segmentos Traduzidos (LLM Local):"
+                } else {
+                    "Segmentos Transcritos (Whisper AI):"
+                };
+                ui.label(RichText::new(lbl).size(12.0).strong());
                 ui.add_space(4.0);
 
                 egui::Frame::new()
@@ -2266,9 +2303,17 @@ impl VadApp {
         let segs = self.whisper_panel.transcription_segments();
         let transcription_text = (!segs.is_empty()).then(|| WhisperEngine::segments_to_markdown(segs));
 
-        let md_content = self
+        let mut md_content = self
             .bookmark_store
             .export_to_markdown(&title, transcription_text.as_deref());
+
+        if let Some(summary) = self.whisper_panel.meeting_summary() {
+            md_content.push_str(&format!(
+                "\n\n---\n\n## Resumo da Reunião ({})\n\n{}\n",
+                summary.privacy_badge.label(),
+                summary.markdown
+            ));
+        }
 
         // Same folder as the transcript export of the Whisper panel (`~/.local/share/vad/`),
         // one file per recording.

@@ -10,5 +10,5 @@ pub use clip_export_panel::{ClipExportAction, ClipExportPanel, SelectionPlayback
 pub use hud::{HudAction, HudPanel};
 pub use playlist_panel::{PlaylistAction, PlaylistPanel};
 pub use video_panel::VideoPanel;
-pub use whisper_panel::{WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT};
+pub use whisper_panel::{render_privacy_badge, WhisperAction, WhisperPanel, IDLE_UNLOAD_TIMEOUT};
 

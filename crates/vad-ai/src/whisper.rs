@@ -178,6 +178,22 @@ impl WhisperEngine {
         P: FnMut(i32),
         A: FnMut() -> bool,
     {
+        self.transcribe_with_options(audio, language, false, progress_cb, abort_cb)
+    }
+
+    /// Transcribes and optionally translates into English using Whisper's native translation mode (§4.1).
+    pub fn transcribe_with_options<P, A>(
+        &self,
+        audio: &PcmAudio,
+        language: Option<&str>,
+        translate_to_en: bool,
+        progress_cb: Option<P>,
+        abort_cb: Option<A>,
+    ) -> Result<Vec<TranscriptionSegment>, VadError>
+    where
+        P: FnMut(i32),
+        A: FnMut() -> bool,
+    {
         let mut state = self.ctx.create_state().map_err(|err| {
             VadError::Whisper(format!("Falha ao criar estado do Whisper: {:?}", err))
         })?;
@@ -188,6 +204,7 @@ impl WhisperEngine {
         params.set_print_special(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        params.set_translate(translate_to_en);
 
         if let Some(lang) = language {
             params.set_language(Some(lang));

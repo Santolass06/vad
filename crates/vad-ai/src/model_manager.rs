@@ -65,12 +65,38 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
     },
 ];
 
+/// Preset specifications for official local LLM models (Qwen 2.5 0.5B Instruct GGUF).
+pub const PRESET_LLM_MODELS: [ModelPreset; 2] = [
+    ModelPreset {
+        id: "qwen2.5-0.5b",
+        display_name: "Qwen2.5 0.5B Instruct Q4_K_M (~398 MB)",
+        filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        approx_size_mb: 398.0,
+    },
+    ModelPreset {
+        id: "qwen2.5-tokenizer",
+        display_name: "Qwen2.5 Tokenizer (~7 MB)",
+        filename: "qwen2.5-tokenizer.json",
+        url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json",
+        approx_size_mb: 7.0,
+    },
+];
+
 /// Finds a known preset by ID or filename.
 pub fn find_preset(id_or_filename: &str) -> Option<&'static ModelPreset> {
     PRESET_MODELS.iter().find(|p| {
         p.id.eq_ignore_ascii_case(id_or_filename)
             || p.filename.eq_ignore_ascii_case(id_or_filename)
             || (p.id == "base-q5" && id_or_filename.eq_ignore_ascii_case("base-q5_1"))
+    })
+}
+
+/// Finds a known LLM preset by ID or filename.
+pub fn find_llm_preset(id_or_filename: &str) -> Option<&'static ModelPreset> {
+    PRESET_LLM_MODELS.iter().find(|p| {
+        p.id.eq_ignore_ascii_case(id_or_filename)
+            || p.filename.eq_ignore_ascii_case(id_or_filename)
     })
 }
 
@@ -162,6 +188,62 @@ impl ModelManager {
 
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+
+    /// Lists all `.gguf` local LLM models currently saved on disk in `~/.local/share/vad/models/`.
+    pub fn list_disk_llm_models(&self) -> Vec<DiskModelInfo> {
+        let mut list = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.models_dir) else {
+            return list;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let filename = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                if filename.ends_with(".gguf") && !filename.ends_with(".tmp") {
+                    let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let id = find_llm_preset(&filename)
+                        .map(|p| p.id.to_string())
+                        .unwrap_or_else(|| {
+                            filename
+                                .trim_end_matches(".gguf")
+                                .to_string()
+                        });
+
+                    list.push(DiskModelInfo {
+                        id,
+                        filename,
+                        path,
+                        size_bytes,
+                    });
+                }
+            }
+        }
+
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
+
+    /// Checks if both the GGUF model and its tokenizer exist on disk.
+    pub fn is_llm_model_ready(&self, model_filename: &str, tokenizer_filename: &str) -> bool {
+        self.is_model_on_disk(model_filename) && self.is_model_on_disk(tokenizer_filename)
+    }
+
+    /// Returns the paths to both the GGUF model and tokenizer if present.
+    pub fn get_llm_model_paths(
+        &self,
+        model_filename: &str,
+        tokenizer_filename: &str,
+    ) -> Option<(PathBuf, PathBuf)> {
+        let model_path = self.get_disk_model_path(model_filename)?;
+        let tokenizer_path = self.get_disk_model_path(tokenizer_filename)?;
+        Some((model_path, tokenizer_path))
     }
 
     /// Checks if a model filename exists on disk and is non-empty.

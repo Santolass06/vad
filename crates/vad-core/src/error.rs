@@ -78,6 +78,24 @@ pub enum VadError {
 
     #[error("Modelo RNNoise em falta: coloca um ficheiro .rnnn em {0}")]
     RnnoiseModelMissing(String),
+
+    #[error("Erro de LLM: {0}")]
+    Llm(String),
+
+    #[error("Janela de contexto do LLM excedida: {0}")]
+    LlmContextExceeded(String),
+
+    #[error("Operação do LLM cancelada")]
+    LlmCancelled,
+
+    #[error("Falha de autenticação do LLM: {0}")]
+    LlmAuthFailed(String),
+
+    #[error("Timeout na chamada do LLM: {0}")]
+    LlmTimeout(String),
+
+    #[error("Limite de taxa (rate limit) do LLM excedido: {0}")]
+    LlmRateLimited(String),
 }
 
 impl VadError {
@@ -224,6 +242,54 @@ impl VadError {
                 severity: ErrorSeverity::Warning,
                 title: "Pânico no Callback do Whisper",
                 description: "Um pânico no callback FFI do Whisper foi capturado com segurança.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::Llm(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Erro no LLM",
+                description: "Ocorreu um erro durante a inferência ou processamento com o modelo de linguagem.",
+                install_command: None,
+                disabled_features: &["summarizer", "translator"],
+                can_ignore: true,
+            },
+            VadError::LlmContextExceeded(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Janela de Contexto Excedida",
+                description: "O bloco de transcrição excedeu a janela de contexto configurada para o modelo.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::LlmCancelled => ErrorAction {
+                severity: ErrorSeverity::Info,
+                title: "Operação Cancelada",
+                description: "O resumo ou tradução foi cancelado pelo utilizador.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::LlmAuthFailed(_) => ErrorAction {
+                severity: ErrorSeverity::Degraded,
+                title: "Chave de API Inválida",
+                description: "Não foi possível autenticar com o provider de IA. Verifica a configuração ou chave de API.",
+                install_command: None,
+                disabled_features: &["cloud_llm"],
+                can_ignore: true,
+            },
+            VadError::LlmTimeout(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Timeout no LLM",
+                description: "O modelo demorou demasiado tempo a responder.",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::LlmRateLimited(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Limite de Requisições Excedido",
+                description: "O provider de IA atingiu o limite de taxa (rate limit).",
                 install_command: None,
                 disabled_features: &[],
                 can_ignore: true,
