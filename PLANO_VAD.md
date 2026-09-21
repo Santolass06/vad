@@ -445,6 +445,17 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     caracteres, e o cancelamento (§4.20) é verificado dentro de cada chamada — o prefill
     corre em fatias — em vez de só entre blocos.
 
+38. **Conformidade legal é uma sprint própria, no fim, e nunca é declarada "cumprida" por
+    um agente (Sprint_17, M7).** O VAD distribui um binário GPL-3.0 (§1) que liga
+    `libmpv`, embute fontes de terceiros (egui) e, empacotado em Flatpak (Sprint_15),
+    passa a distribuir `ffmpeg`/`yt-dlp` — cada coisa cria obrigações diferentes (avisos,
+    código-fonte correspondente, licenças de modelos, fluxos de dados pessoais). Isto vem
+    **depois** do M5b/M6 porque o inventário de ligações de saída (cloud) e o
+    empacotamento só existem então. **Regra:** a sprint entrega evidência verificável
+    (`cargo deny`, avisos gerados, testes) e uma lista de pendências que exigem revisão
+    humana qualificada; não substitui aconselhamento jurídico. *Este ponto acrescenta
+    âmbito ao §11 por pedido explícito do utilizador.*
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -708,6 +719,7 @@ conscientemente, em vez de o v1 impor silenciosamente o corte por keyframe.
 | **M5a** | Resumo + tradução via `llm_provider.rs` (`LocalQwen`), chunking/map-reduce (§4.19), progresso por bloco (§4.20) | **Gate de aceitação:** 100 segmentos reais (PT→EN/ES/FR) revistos manualmente sem alucinação/enchimento; transcrição de 90 min resumida sem exceder a janela de contexto |
 | **M5b** | Cloud opt-in: `OpenAiCompatible`/Anthropic/Gemini, `settings_panel.rs` com teste de ligação (§4.23), keyring + fallback env vars (§4.2), fallback offline com disclosure (§4.21), resiliência de rede (§4.22) — **milestone com peso próprio, não refinamento do M5a** | Badge 🔒/☁️ visível antes de cada operação cloud; `base_url` inválido detetado no "Testar ligação", nunca só ao usar; nenhuma chave em `config.toml` nem em `vad.log` |
 | **M6** | Polish (tema, animações), bandeja de sistema e PIP/always-on-top (`tray.rs`, best-effort — ver §4.8/4.9), perfil de release, empacotamento (Flatpak com ffmpeg/yt-dlp incluídos no manifesto, removendo a dependência de runtime do sistema na versão empacotada) | Binário instalável, arranque e RAM medidos e comparados ao M0 |
+| **M7** | Conformidade legal: `license` em todos os `Cargo.toml`, `deny.toml` (cargo-deny), `THIRD_PARTY_NOTICES.md` gerado (incl. fontes do egui), `docs/legal/COMPONENTES.md`, licença por modelo descarregado, `PRIVACY.md` + teste anti-leak com fonte única, diálogo Sobre, obrigações de distribuição do Flatpak (ver §4.38) | `cargo deny check licenses` a passar com allowlist explícita; avisos de terceiros == `Cargo.lock`; licença de cada modelo visível antes da descarga; **lista de pendências 🧑‍⚖️ entregue ao utilizador** — o critério é evidência reunida, nunca "em conformidade" |
 | **Pós-M6** | Esquema de URI `vad://` + instância única (§4.4/4.5); legendas automáticas via OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
 
 ---
@@ -785,6 +797,7 @@ utilizador decidir e medir à medida que a primeira sprint acontece.
 | **14** | M5b (parte 4) | Testes com HTTP mockado (§10.6), teste anti-leak (§10.7) | Critério do §9 (M5b) — fecha o milestone |
 | **15** | M6 | Tema/animações, `tray.rs` (ksni, best-effort, §4.8), PIP/always-on-top (§4.9), perfil de release (§5), Flatpak com `ffmpeg`/`yt-dlp` embutidos | Critério do §9 (M6) |
 | **16** (opcional) | Pós-M6 | Esquema de URI `vad://` + instância única (§4.4/4.5), OpenSubtitles (§4.10) | Stretch goals, sem data comprometida |
+| **17** | M7 | Licença declarada e auditada (`cargo-deny`), avisos de terceiros gerados, licenças de modelos, `PRIVACY.md`, obrigações de distribuição do Flatpak, diálogo Sobre (`docs/Sprint_17/`) | Critério do §9 (M7) — evidência reunida + pendências 🧑‍⚖️, não um parecer jurídico |
 
 **Nota sobre M5b ocupar 4 sprints contra as 6 de M1–M3 juntos:** o §4.2 descreve M5b
 como "comparável em dimensão" a M1–M3 juntos. Contagem de sprints não é a mesma coisa
