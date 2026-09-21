@@ -437,6 +437,14 @@ Com libmpv, quase nenhum precisa de ser implementado — mas todos precisam de U
     apaga a saída. **Decisão:** `validate_options` recusa uma saída que já exista (incluindo
     a própria entrada); o ffmpeg corre com `-n`; só se apaga o que a própria exportação criou.
 
+37. **O LLM local nunca é substituído em silêncio por texto fabricado (extensão do §4.21).**
+    Sem o modelo no disco, o resumo/tradução falha com erro visível e a UI oferece uma
+    descarga explícita (~491 MB, mostrada antes de acontecer, como no §4.13); o
+    `MockSummarizer` existe só para testes. O chunking por blocos mede a janela em tokens
+    do **tokenizer do provider** (`Summarizer::count_tokens`), não numa razão fixa de
+    caracteres, e o cancelamento (§4.20) é verificado dentro de cada chamada — o prefill
+    corre em fatias — em vez de só entre blocos.
+
 ### Fora de âmbito, por decisão deliberada
 
 Para não serem reintroduzidas mais tarde sem motivo — features do VLC que ficam de
@@ -522,6 +530,7 @@ esforço real de performance do projeto:
 de resumo/tradução (~350-700 MB, ver §4.2) somam-se quando ambos estão carregados. O
 resto da app (mpv + egui) fica bem abaixo disto — o M5 é, de longe, o maior consumidor
 de RAM do projeto, não uma otimização.
+**Medido na Sprint_09 (2026-09-21):** o `Qwen2.5-0.5B-Instruct-Q4_K_M` via `candle` chega a **976 MiB de RSS** carregado (pico **1157 MiB** num resumo de 90 min), acima dos ~350-700 MB estimados; a soma com o Whisper (~55 MB) não foi medida — o valor de 976 MiB é só o LLM. O modelo é carregado por operação e libertado no fim (thread do resumo/tradução).
 
 **Cache de PCM (waveform + Whisper, ver §4.12):** ~115 MB/hora de áudio em `i16`
 (~230 MB/hora se fosse `f32`) enquanto o ficheiro está aberto. Transitório — liberta-se

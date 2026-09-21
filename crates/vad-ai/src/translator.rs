@@ -71,7 +71,7 @@ impl LlmTranslator {
         target_lang: TargetLanguage,
     ) -> Result<String, VadError> {
         self.summarizer
-            .translate_text(text, source_lang, target_lang.display_name())
+            .translate_text(text, source_lang, target_lang.display_name(), None)
     }
 
     /// Translates a collection of transcription segments while preserving timestamp metadata.
@@ -124,6 +124,7 @@ impl LlmTranslator {
                 &batch_input,
                 source_lang,
                 target_lang.display_name(),
+                abort_flag.as_deref(),
             )?;
 
             // Parse translated lines back to segments
@@ -287,5 +288,43 @@ mod tests {
             VadError::LlmCancelled => {}
             other => panic!("Expected LlmCancelled, got {:?}", other),
         }
+    }
+
+    /// Real model, one batch of 10 segments: the numbered-lines protocol must survive a real
+    /// (imperfect) answer, timestamps must be kept, and no slot may fall back to the original.
+    /// The quality review of 100 segments is the Sprint_10 gate (§4.1), not this test.
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_translates_a_batch_keeping_timestamps() {
+        use crate::llm_provider::tests::real_qwen;
+        let qwen = Arc::new(real_qwen(crate::llm_provider::DEFAULT_QWEN_MAX_OUTPUT_TOKENS).expect("env vars not set"));
+        let texts = [
+            "Bom dia a todos, vamos começar a reunião.",
+            "O orçamento foi aprovado pela direção na semana passada.",
+            "Precisamos de fechar as datas de entrega até sexta-feira.",
+            "A latência baixou cerca de trinta por cento.",
+            "Quem fica responsável pelo relatório trimestral?",
+            "Eu trato disso, envio o rascunho amanhã de manhã.",
+            "Ficou decidido manter o mesmo fornecedor.",
+            "Há alguma questão sobre o plano de migração?",
+            "Não, por agora está tudo claro.",
+            "Então fica combinado, obrigado a todos.",
+        ];
+        let segments: Vec<TranscriptionSegment> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TranscriptionSegment { start_ms: i as i64 * 4000, end_ms: i as i64 * 4000 + 3500, text: t.to_string() })
+            .collect();
+        let translated = LlmTranslator::new(qwen)
+            .translate_segments(&segments, "Português", TargetLanguage::English, None::<fn(usize, usize)>, None)
+            .expect("translation");
+        assert_eq!(translated.len(), segments.len());
+        for (a, b) in segments.iter().zip(&translated) {
+            println!("{} | {} -> {}", a.start_ms, a.text, b.text);
+            assert_eq!((a.start_ms, a.end_ms), (b.start_ms, b.end_ms));
+            assert!(!b.text.trim().is_empty());
+        }
+        let kept_original = segments.iter().zip(&translated).filter(|(a, b)| a.text == b.text).count();
+        assert_eq!(kept_original, 0, "{kept_original} segments came back untranslated");
     }
 }

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::quantized::gguf_file;
@@ -10,7 +11,7 @@ use tokenizers::Tokenizer;
 use tracing::info;
 use vad_core::VadError;
 
-/// Default Qwen 2.5 0.5B Instruct GGUF model filename (§4.2, ~398 MB).
+/// Default Qwen 2.5 0.5B Instruct GGUF model filename (§4.2, 491,400,032 bytes on Hugging Face).
 pub const DEFAULT_QWEN_MODEL_FILENAME: &str = "qwen2.5-0.5b-instruct-q4_k_m.gguf";
 
 /// Default tokenizer filename matching Qwen 2.5.
@@ -152,16 +153,45 @@ pub trait Summarizer: Send + Sync {
     /// Returns the privacy badge associated with this summarizer (§4.1).
     fn privacy_badge(&self) -> AiPrivacyBadge;
 
+    /// Number of tokens this provider's tokenizer produces for `text`.
+    ///
+    /// The map-reduce chunker budgets by this, not by a fixed characters-per-token guess: the
+    /// real ratio depends on the tokenizer and on the text (timestamps and accents cost more).
+    /// The default is a conservative 3 characters per token.
+    fn count_tokens(&self, text: &str) -> usize {
+        text.len().div_ceil(3)
+    }
+
     /// Summarizes a chunk of transcription text.
     ///
     /// - `chunk`: The raw transcription block (or joined partial summaries).
     /// - `is_final_reduce`: True if this call synthesizes multiple partial summaries into
     ///   the final meeting minutes, false if it summarizes an intermediate chunk.
-    fn summarize_chunk(&self, chunk: &str, is_final_reduce: bool) -> Result<String, VadError>;
+    /// - `abort`: checked inside the call, so cancelling does not wait for a whole chunk (§4.20).
+    fn summarize_chunk(
+        &self,
+        chunk: &str,
+        is_final_reduce: bool,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError>;
 
     /// Translates text from `source_lang` to `target_lang` using LLM prompt guidance (§4.1).
-    fn translate_text(&self, text: &str, source_lang: &str, target_lang: &str) -> Result<String, VadError>;
+    fn translate_text(
+        &self,
+        text: &str,
+        source_lang: &str,
+        target_lang: &str,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError>;
 }
+
+fn is_aborted(abort: Option<&AtomicBool>) -> bool {
+    abort.is_some_and(|a| a.load(Ordering::Relaxed))
+}
+
+/// Prompt tokens fed per forward pass while prefilling, so an abort waits for one slice
+/// (a few seconds on CPU) and not for the whole prompt.
+const PREFILL_SLICE_TOKENS: usize = 128;
 
 /// Local LLM summarizer powered by Candle and Qwen 2.5 Instruct GGUF.
 pub struct LocalQwenSummarizer {
@@ -221,6 +251,14 @@ impl LocalQwenSummarizer {
         })
     }
 
+    /// Number of tokens the real tokenizer produces for `text`.
+    pub fn count_tokens(&self, text: &str) -> Result<usize, VadError> {
+        self.tokenizer
+            .encode(text, true)
+            .map(|e| e.get_ids().len())
+            .map_err(|e| VadError::Llm(format!("Falha ao tokenizar texto: {:?}", e)))
+    }
+
     /// Formats a chat prompt using the Qwen 2.5 Instruct chat template.
     pub fn format_prompt(system_prompt: &str, user_prompt: &str) -> String {
         format!(
@@ -231,7 +269,12 @@ impl LocalQwenSummarizer {
     }
 
     /// Runs text generation on the loaded model.
-    pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, VadError> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError> {
         let encoding = self.tokenizer.encode(prompt, true).map_err(|e| {
             VadError::Llm(format!("Falha ao tokenizar prompt: {:?}", e))
         })?;
@@ -252,26 +295,41 @@ impl LocalQwenSummarizer {
         // Reset KV cache between separate calls (§4.19 / Candle)
         weights.clear_kv_cache();
 
-        let mut all_tokens = tokens.to_vec();
         let mut generated_tokens = Vec::new();
 
         // End-of-sequence token IDs for Qwen2.5 (<|im_end|>, <|endoftext|>)
         let eos_token_id = self.tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
         let eot_token_id = self.tokenizer.token_to_id("<|endoftext|>").unwrap_or(151643);
 
-        // Prefill prompt tokens
-        let input = Tensor::new(&all_tokens[..], &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| VadError::Llm(format!("Falha ao criar tensor de entrada: {:?}", e)))?;
-
-        let mut logits = weights
-            .forward(&input, 0)
-            .map_err(|e| VadError::Llm(format!("Erro no forward do prompt: {:?}", e)))?;
+        // Prefill in slices; the logits of the last slice predict the first generated token.
+        let mut logits = None;
+        for (i, slice) in tokens.chunks(PREFILL_SLICE_TOKENS).enumerate() {
+            if is_aborted(abort) {
+                weights.clear_kv_cache();
+                return Err(VadError::LlmCancelled);
+            }
+            let input = Tensor::new(slice, &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| VadError::Llm(format!("Falha ao criar tensor de entrada: {:?}", e)))?;
+            logits = Some(
+                weights
+                    .forward(&input, i * PREFILL_SLICE_TOKENS)
+                    .map_err(|e| VadError::Llm(format!("Erro no forward do prompt: {:?}", e)))?,
+            );
+        }
+        let Some(mut logits) = logits else {
+            return Err(VadError::Llm("Prompt vazio".to_string()));
+        };
 
         for index in 0..max_tokens {
+            if is_aborted(abort) {
+                weights.clear_kv_cache();
+                return Err(VadError::LlmCancelled);
+            }
+
+            // `forward` already narrows to the last position: logits are `(1, vocab)`.
             let logits_s = logits
                 .squeeze(0)
-                .and_then(|l| l.get(l.dim(0)? - 1))
                 .map_err(|e| VadError::Llm(format!("Erro ao extrair logits: {:?}", e)))?;
 
             // Greedy argmax sampling for deterministic summary/translation
@@ -285,7 +343,6 @@ impl LocalQwenSummarizer {
             }
 
             generated_tokens.push(next_token);
-            all_tokens.push(next_token);
 
             // Forward next single token with updated position index
             let next_input = Tensor::new(&[next_token], &self.device)
@@ -321,7 +378,17 @@ impl Summarizer for LocalQwenSummarizer {
         AiPrivacyBadge::Local
     }
 
-    fn summarize_chunk(&self, chunk: &str, is_final_reduce: bool) -> Result<String, VadError> {
+    fn count_tokens(&self, text: &str) -> usize {
+        // A tokenizer failure must not make the budget optimistic: fall back to the default ratio.
+        LocalQwenSummarizer::count_tokens(self, text).unwrap_or_else(|_| text.len().div_ceil(3))
+    }
+
+    fn summarize_chunk(
+        &self,
+        chunk: &str,
+        is_final_reduce: bool,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError> {
         let (system_prompt, user_prompt) = if is_final_reduce {
             (
                 "És um assistente executivo de reuniões em língua portuguesa. A tua função é criar um resumo estruturado e profissional com base nos resumos parciais fornecidos. Organiza a resposta com: 1. Sumário Executivo; 2. Principais Discussões; 3. Decisões Tomadas; 4. Próximos Passos e Tarefas. Não inventes factos.",
@@ -335,17 +402,23 @@ impl Summarizer for LocalQwenSummarizer {
         };
 
         let prompt = Self::format_prompt(system_prompt, &user_prompt);
-        self.generate(&prompt, self.max_output_tokens)
+        self.generate(&prompt, self.max_output_tokens, abort)
     }
 
-    fn translate_text(&self, text: &str, source_lang: &str, target_lang: &str) -> Result<String, VadError> {
+    fn translate_text(
+        &self,
+        text: &str,
+        source_lang: &str,
+        target_lang: &str,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError> {
         let system_prompt = format!(
             "És um tradutor profissional e rigoroso de {} para {}. Traduz o texto fornecido com máxima fidelidade e naturalidade, sem alucinações, sem comentários adicionais e sem explicações.",
             source_lang, target_lang
         );
         let user_prompt = format!("Texto a traduzir:\n{}", text);
         let prompt = Self::format_prompt(&system_prompt, &user_prompt);
-        self.generate(&prompt, self.max_output_tokens)
+        self.generate(&prompt, self.max_output_tokens, abort)
     }
 }
 
@@ -403,10 +476,22 @@ impl Summarizer for MockSummarizer {
         self.privacy_badge
     }
 
-    fn summarize_chunk(&self, chunk: &str, is_final_reduce: bool) -> Result<String, VadError> {
+    fn count_tokens(&self, text: &str) -> usize {
+        text.len() / 4
+    }
+
+    fn summarize_chunk(
+        &self,
+        chunk: &str,
+        is_final_reduce: bool,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError> {
+        if is_aborted(abort) {
+            return Err(VadError::LlmCancelled);
+        }
         // Enforce context window constraint (§4.19)
         // Approximate 1 token ~= 4 characters
-        let approx_tokens = chunk.len() / 4;
+        let approx_tokens = self.count_tokens(chunk);
         if approx_tokens > self.context_window {
             return Err(VadError::LlmContextExceeded(format!(
                 "Bloco com ~{} tokens excedeu a janela de contexto de {}",
@@ -447,8 +532,17 @@ impl Summarizer for MockSummarizer {
         }
     }
 
-    fn translate_text(&self, text: &str, source_lang: &str, target_lang: &str) -> Result<String, VadError> {
-        let approx_tokens = text.len() / 4;
+    fn translate_text(
+        &self,
+        text: &str,
+        source_lang: &str,
+        target_lang: &str,
+        abort: Option<&AtomicBool>,
+    ) -> Result<String, VadError> {
+        if is_aborted(abort) {
+            return Err(VadError::LlmCancelled);
+        }
+        let approx_tokens = self.count_tokens(text);
         if approx_tokens > self.context_window {
             return Err(VadError::LlmContextExceeded(format!(
                 "Texto para tradução com ~{} tokens excedeu a janela de contexto de {}",
@@ -463,7 +557,7 @@ impl Summarizer for MockSummarizer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -517,12 +611,12 @@ mod tests {
 
         // Chunk within limit (50 tokens ~= 200 chars)
         let small_chunk = "Resumo curto que cabe perfeitamente na janela.";
-        let res = summarizer.summarize_chunk(small_chunk, false);
+        let res = summarizer.summarize_chunk(small_chunk, false, None);
         assert!(res.is_ok());
 
         // Chunk exceeding limit (> 50 tokens)
         let huge_chunk = "A".repeat(400);
-        let err_res = summarizer.summarize_chunk(&huge_chunk, false);
+        let err_res = summarizer.summarize_chunk(&huge_chunk, false, None);
         assert!(err_res.is_err());
         match err_res.unwrap_err() {
             VadError::LlmContextExceeded(msg) => {
@@ -539,5 +633,76 @@ mod tests {
             formatted,
             "<|im_start|>system\nTu és um resumo.<|im_end|>\n<|im_start|>user\nResume isto.<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    /// Runs the real model. Needs `VAD_TEST_QWEN_MODEL` and `VAD_TEST_QWEN_TOKENIZER`:
+    /// `cargo test -p vad-ai -- --ignored --nocapture real_qwen`.
+    pub(crate) fn real_qwen(max_output_tokens: usize) -> Option<LocalQwenSummarizer> {
+        let model = std::env::var("VAD_TEST_QWEN_MODEL").ok()?;
+        let tokenizer = std::env::var("VAD_TEST_QWEN_TOKENIZER").ok()?;
+        Some(
+            LocalQwenSummarizer::load_from_paths(
+                Path::new(&model),
+                Path::new(&tokenizer),
+                DEFAULT_QWEN_CONTEXT_WINDOW,
+                max_output_tokens,
+            )
+            .expect("load real Qwen"),
+        )
+    }
+
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_generates_coherent_text() {
+        let Some(q) = real_qwen(64) else { panic!("env vars not set") };
+        let prompt = LocalQwenSummarizer::format_prompt(
+            "Responde apenas com a capital pedida.",
+            "Qual é a capital de França?",
+        );
+        let out = q.generate(&prompt, 16, None).expect("generate");
+        println!("generate -> {out:?}");
+        assert!(out.contains("Paris"), "unexpected output: {out:?}");
+    }
+
+    /// Prints prefill and decode throughput (no assertion on time): the numbers go in the diary.
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_throughput() {
+        use std::time::Instant;
+        let q = real_qwen(64).expect("env vars not set");
+        let text = "[00:01:04] Revimos o estado atual da migração para Rust e mpv.\n".repeat(40);
+        let prompt = LocalQwenSummarizer::format_prompt("Resume.", &text);
+        let n = q.count_tokens(&prompt).unwrap();
+        let t = Instant::now();
+        q.generate(&prompt, 1, None).unwrap();
+        let prefill = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        q.generate(&prompt, 33, None).unwrap();
+        let both = t.elapsed().as_secs_f64();
+        println!("prompt {n} tokens: prefill {:.2}s ({:.0} tok/s); decode {:.1} tok/s",
+            prefill, n as f64 / prefill, 32.0 / (both - prefill));
+    }
+
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_abort_does_not_wait_for_the_whole_prompt() {
+        use std::time::{Duration, Instant};
+        let q = Arc::new(real_qwen(64).expect("env vars not set"));
+        let text = "[00:01:04] Revimos o estado atual da migração para Rust e mpv.\n".repeat(150);
+        let prompt = LocalQwenSummarizer::format_prompt("Resume.", &text);
+        assert!(q.count_tokens(&prompt).unwrap() > 1500, "prompt must take a long prefill");
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&abort);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        let res = q.generate(&prompt, 64, Some(&abort));
+        let waited = t.elapsed();
+        println!("aborted after {waited:?}");
+        assert!(matches!(res, Err(VadError::LlmCancelled)), "got {res:?}");
+        assert!(waited < Duration::from_secs(20), "abort took {waited:?}");
     }
 }

@@ -18,6 +18,9 @@ pub enum SummarizeProgress {
     Chunking { total_chunks: usize },
     /// Generating partial summary for a chunk (1-indexed: `current` of `total`).
     SummarizingChunk { current: usize, total: usize },
+    /// Intermediate reduction of partial summaries that still do not fit one prompt
+    /// (batch `current` of `total` in reduction `pass`).
+    ReducingBatch { pass: usize, current: usize, total: usize },
     /// Synthesizing partial summaries into the final consolidated summary.
     Synthesizing { pass: usize, total_passes: usize },
     /// Summarization completed.
@@ -34,13 +37,10 @@ impl SummarizeProgress {
             Self::SummarizingChunk { current, total } => {
                 format!("A resumir bloco {} de {}...", current, total)
             }
-            Self::Synthesizing { pass, total_passes } => {
-                if *total_passes > 1 {
-                    format!("A sintetizar resumos (passo {} de {})...", pass, total_passes)
-                } else {
-                    "A sintetizar resumo final da reunião...".to_string()
-                }
+            Self::ReducingBatch { pass, current, total } => {
+                format!("A condensar resumos (passo {pass}, parte {current} de {total})...")
             }
+            Self::Synthesizing { .. } => "A sintetizar resumo final da reunião...".to_string(),
             Self::Done => "Resumo concluído com sucesso.".to_string(),
         }
     }
@@ -104,13 +104,13 @@ impl MapReduceSummarizer {
             return Vec::new();
         }
 
+        // Budget in the provider's own tokens. Counting line by line slightly over-counts
+        // (no merges across lines), which only errs on the safe side of the window.
         let max_tokens = self.max_chunk_tokens();
-        // Heuristic: ~3.8 characters per token in Portuguese text
-        let max_chars = max_tokens * 38 / 10;
 
         let mut chunks = Vec::new();
         let mut current_lines = Vec::new();
-        let mut current_chars = 0;
+        let mut current_tokens = 0;
         let mut chunk_start_ms = segments[0].start_ms;
         let mut chunk_end_ms = segments[0].end_ms;
         let mut chunk_index = 1;
@@ -121,9 +121,9 @@ impl MapReduceSummarizer {
                 TranscriptionSegment::format_timestamp(seg.start_ms),
                 seg.text.trim()
             );
-            let line_len = line.len() + 1; // newline
+            let line_tokens = self.summarizer.count_tokens(&line) + 1; // + newline
 
-            if !current_lines.is_empty() && (current_chars + line_len > max_chars) {
+            if !current_lines.is_empty() && (current_tokens + line_tokens > max_tokens) {
                 // Emit current chunk
                 chunks.push(TranscriptionChunk {
                     chunk_index,
@@ -133,12 +133,12 @@ impl MapReduceSummarizer {
                 });
                 chunk_index += 1;
                 current_lines.clear();
-                current_chars = 0;
+                current_tokens = 0;
                 chunk_start_ms = seg.start_ms;
             }
 
             chunk_end_ms = seg.end_ms;
-            current_chars += line_len;
+            current_tokens += line_tokens;
             current_lines.push(line);
         }
 
@@ -229,7 +229,9 @@ impl MapReduceSummarizer {
             );
 
             // Compute partial summary
-            let summary_text = self.summarizer.summarize_chunk(&raw_text, false)?;
+            let summary_text =
+                self.summarizer
+                    .summarize_chunk(&raw_text, false, abort_flag.as_deref())?;
 
             // CRITICAL: Drop raw chunk text immediately! (§4.19)
             drop(raw_text);
@@ -284,17 +286,10 @@ impl MapReduceSummarizer {
         }
 
         if partials.len() == 1 {
-            // Single chunk: if it's already well structured, return or format it
-            let p = &partials[0];
-            return Ok(format!(
-                "# Resumo da Reunião ({})\n\n{}\n",
-                TranscriptionSegment::format_timestamp(p.end_ms),
-                p.summary_text
-            ));
+            return Ok(with_title(&partials[0].summary_text, duration_secs));
         }
 
         let max_tokens = self.max_chunk_tokens();
-        let max_chars = max_tokens * 38 / 10;
 
         let mut current_level: Vec<String> = partials
             .iter()
@@ -309,62 +304,77 @@ impl MapReduceSummarizer {
             .collect();
 
         let mut pass = 1;
+        let abort = abort_flag.as_deref();
 
         while current_level.len() > 1 {
-            if let Some(ref abort) = abort_flag {
-                if abort.load(Ordering::Relaxed) {
-                    return Err(VadError::LlmCancelled);
-                }
+            if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
+                return Err(VadError::LlmCancelled);
             }
 
             let joined = current_level.join("\n\n");
             // If all fit comfortably in one reduction prompt, execute final synthesis
-            if joined.len() <= max_chars {
+            if self.summarizer.count_tokens(&joined) <= max_tokens {
                 if let Some(ref mut cb) = progress_cb {
                     cb(SummarizeProgress::Synthesizing {
                         pass,
                         total_passes: pass,
                     });
                 }
-                return self.summarizer.summarize_chunk(&joined, true);
+                let body = self.summarizer.summarize_chunk(&joined, true, abort)?;
+                return Ok(with_title(&body, duration_secs));
             }
 
-            // Hierarchical reduction: combine into batches
-            let mut next_level = Vec::new();
-            let mut batch = Vec::new();
-            let mut batch_chars = 0;
-
+            // Hierarchical reduction: combine into batches, each within the token budget
+            let mut batches: Vec<String> = Vec::new();
+            let mut batch: Vec<String> = Vec::new();
+            let mut batch_tokens = 0;
             for item in current_level {
-                let item_len = item.len() + 2;
-                if !batch.is_empty() && (batch_chars + item_len > max_chars) {
-                    let batch_text = batch.join("\n\n");
-                    let intermediate = self.summarizer.summarize_chunk(&batch_text, false)?;
-                    next_level.push(intermediate);
+                let item_tokens = self.summarizer.count_tokens(&item) + 2;
+                if !batch.is_empty() && batch_tokens + item_tokens > max_tokens {
+                    batches.push(batch.join("\n\n"));
                     batch.clear();
-                    batch_chars = 0;
+                    batch_tokens = 0;
                 }
-                batch_chars += item_len;
+                batch_tokens += item_tokens;
                 batch.push(item);
             }
-
             if !batch.is_empty() {
-                let batch_text = batch.join("\n\n");
-                let intermediate = self.summarizer.summarize_chunk(&batch_text, false)?;
-                next_level.push(intermediate);
+                batches.push(batch.join("\n\n"));
+            }
+
+            let total_batches = batches.len();
+            let mut next_level = Vec::with_capacity(total_batches);
+            for (i, batch_text) in batches.into_iter().enumerate() {
+                if let Some(ref mut cb) = progress_cb {
+                    cb(SummarizeProgress::ReducingBatch {
+                        pass,
+                        current: i + 1,
+                        total: total_batches,
+                    });
+                }
+                next_level.push(self.summarizer.summarize_chunk(&batch_text, false, abort)?);
             }
 
             current_level = next_level;
             pass += 1;
         }
 
-        // Final single item remaining
+        // A single item is left: it is the summary itself (no further synthesis to do).
         let final_text = current_level.into_iter().next().unwrap_or_default();
-        Ok(format!(
-            "# Resumo da Reunião (Duração: {:.0} min)\n\n{}\n",
-            duration_secs / 60.0,
-            final_text
-        ))
+        Ok(with_title(&final_text, duration_secs))
     }
+}
+
+/// Prepends the document title unless the model already produced a top-level heading.
+fn with_title(body: &str, duration_secs: f64) -> String {
+    let body = body.trim();
+    if body.starts_with("# ") {
+        return format!("{body}\n");
+    }
+    format!(
+        "# Resumo da Reunião (Duração: {:.0} min)\n\n{body}\n",
+        duration_secs / 60.0
+    )
 }
 
 #[cfg(test)]
@@ -507,5 +517,154 @@ mod tests {
             VadError::LlmCancelled => {}
             other => panic!("Expected LlmCancelled, got {:?}", other),
         }
+    }
+
+    /// Provider whose tokens are single characters: the worst case for a chars-per-token guess.
+    struct CharTokens(MockSummarizer);
+
+    impl Summarizer for CharTokens {
+        fn context_window(&self) -> usize {
+            self.0.context_window()
+        }
+        fn max_output_tokens(&self) -> usize {
+            self.0.max_output_tokens()
+        }
+        fn privacy_badge(&self) -> AiPrivacyBadge {
+            AiPrivacyBadge::Local
+        }
+        fn count_tokens(&self, text: &str) -> usize {
+            text.chars().count()
+        }
+        fn summarize_chunk(&self, c: &str, f: bool, a: Option<&AtomicBool>) -> Result<String, VadError> {
+            self.0.summarize_chunk(c, f, a)
+        }
+        fn translate_text(&self, t: &str, s: &str, d: &str, a: Option<&AtomicBool>) -> Result<String, VadError> {
+            self.0.translate_text(t, s, d, a)
+        }
+    }
+
+    #[test]
+    fn test_partition_budgets_with_the_providers_own_token_count() {
+        let provider = Arc::new(CharTokens(MockSummarizer::new(1024, 256, AiPrivacyBadge::Local)));
+        let map_reduce = MapReduceSummarizer::new(Arc::clone(&provider) as Arc<dyn Summarizer>);
+        let chunks = map_reduce.partition_segments(&make_synthetic_transcription(20, 8));
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            let tokens = provider.count_tokens(&c.text);
+            assert!(
+                tokens <= map_reduce.max_chunk_tokens(),
+                "chunk {} has {tokens} tokens, budget {}",
+                c.chunk_index,
+                map_reduce.max_chunk_tokens()
+            );
+        }
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_reports_progress_and_stays_in_window() {
+        // Tiny window: the partial summaries do not fit one prompt, so extra passes are needed.
+        let provider = Arc::new(MockSummarizer::new(256, 64, AiPrivacyBadge::Local));
+        let map_reduce = MapReduceSummarizer::new(Arc::clone(&provider) as Arc<dyn Summarizer>);
+        let mut events = Vec::new();
+        let summary = map_reduce
+            .summarize(&make_synthetic_transcription(30, 8), Some(|p| events.push(p)), None)
+            .expect("summary");
+        assert!(events.iter().any(|e| matches!(e, SummarizeProgress::ReducingBatch { .. })));
+        assert!(provider.chunks_received().iter().all(|c| c.len() / 4 <= 256));
+        assert!(summary.markdown.starts_with("# Resumo da Reunião"));
+    }
+
+    #[test]
+    fn test_cancel_during_map_stops_before_the_next_chunk() {
+        let provider = Arc::new(MockSummarizer::new(512, 128, AiPrivacyBadge::Local));
+        let map_reduce = MapReduceSummarizer::new(Arc::clone(&provider) as Arc<dyn Summarizer>);
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&abort);
+        let res = map_reduce.summarize(
+            &make_synthetic_transcription(20, 8),
+            Some(move |p: SummarizeProgress| {
+                if matches!(p, SummarizeProgress::SummarizingChunk { current: 2, .. }) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }),
+            Some(abort),
+        );
+        assert!(matches!(res, Err(VadError::LlmCancelled)));
+        assert_eq!(provider.chunks_received().len(), 1, "only chunk 1 was summarized");
+    }
+
+    /// The chunker must respect the window measured with the real tokenizer (not a guess).
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_90_minute_chunks_fit_the_window() {
+        use crate::llm_provider::{tests::real_qwen, LocalQwenSummarizer};
+        let qwen = Arc::new(real_qwen(64).expect("env vars not set"));
+        let map_reduce = MapReduceSummarizer::new(Arc::clone(&qwen) as Arc<dyn Summarizer>);
+        let chunks = map_reduce.partition_segments(&make_synthetic_transcription(90, 8));
+        let mut worst = 0;
+        for c in &chunks {
+            // Both prompts (map and reduce) wrap the chunk in a few hundred tokens at most.
+            let prompt = LocalQwenSummarizer::format_prompt(
+                "És um assistente de síntese em língua portuguesa. Resume o bloco de transcrição fornecido de forma concisa, capturando os pontos discutidos, ideias centrais e quaisquer decisões ou números mencionados. Responde apenas com o resumo dos pontos relevantes.",
+                &format!("Resume objetivamente o seguinte bloco de transcrição:\n\n{}", c.text),
+            );
+            worst = worst.max(qwen.count_tokens(&prompt).unwrap());
+        }
+        println!("{} chunks; worst full prompt = {worst} tokens (window {})", chunks.len(), qwen.context_window());
+        assert!(worst <= qwen.context_window());
+    }
+
+    /// Real 90-minute run on the real model with the app's own output limit (exit criterion).
+    /// Needs `VAD_TEST_QWEN_MODEL` and `VAD_TEST_QWEN_TOKENIZER`; `VAD_TEST_MINUTES` overrides 90.
+    /// Prints elapsed time and RSS (baseline, model loaded, peak during the run).
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB); slow"]
+    fn test_real_qwen_map_reduce_exit_criterion() {
+        use crate::llm_provider::{tests::real_qwen, DEFAULT_QWEN_MAX_OUTPUT_TOKENS};
+        use std::sync::atomic::AtomicU64;
+        use std::time::Instant;
+        let mib = |b: u64| b as f64 / 1_048_576.0;
+
+        let rss_base = vad_core::get_process_rss_bytes().unwrap_or(0);
+        let qwen = Arc::new(real_qwen(DEFAULT_QWEN_MAX_OUTPUT_TOKENS).expect("env vars not set"));
+        let rss_loaded = vad_core::get_process_rss_bytes().unwrap_or(0);
+        let minutes: u32 = std::env::var("VAD_TEST_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+        let segments = make_synthetic_transcription(minutes, 8);
+        let map_reduce = MapReduceSummarizer::new(Arc::clone(&qwen) as Arc<dyn Summarizer>);
+
+        // RSS is sampled from a side thread: the peak is reached inside a forward pass.
+        let peak = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak, stop) = (Arc::clone(&peak), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(vad_core::get_process_rss_bytes().unwrap_or(0), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            })
+        };
+
+        let t0 = Instant::now();
+        let mut events = Vec::new();
+        let result = map_reduce.summarize(
+            &segments,
+            Some(|p: SummarizeProgress| {
+                println!("[{:>6.0}s] {}", t0.elapsed().as_secs_f64(), p.display_message());
+                events.push(p)
+            }),
+            None,
+        );
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        println!(
+            "elapsed {:.0}s | RSS baseline {:.0} MiB, model loaded {:.0} MiB, peak {:.0} MiB",
+            t0.elapsed().as_secs_f64(), mib(rss_base), mib(rss_loaded), mib(peak.load(Ordering::Relaxed))
+        );
+        let summary = result.expect("real map-reduce (a ContextExceeded here means the criterion fails)");
+        println!("chunks: {}\n---\n{}", summary.total_chunks, summary.markdown);
+        assert!(summary.total_chunks >= 2 || minutes < 20);
+        assert_eq!(events.last(), Some(&SummarizeProgress::Done));
+        assert!(summary.markdown.trim().len() > 200, "summary is implausibly short");
     }
 }

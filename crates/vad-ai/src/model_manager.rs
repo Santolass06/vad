@@ -69,10 +69,10 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
 pub const PRESET_LLM_MODELS: [ModelPreset; 2] = [
     ModelPreset {
         id: "qwen2.5-0.5b",
-        display_name: "Qwen2.5 0.5B Instruct Q4_K_M (~398 MB)",
+        display_name: "Qwen2.5 0.5B Instruct Q4_K_M (~491 MB)",
         filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
         url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        approx_size_mb: 398.0,
+        approx_size_mb: 491.0,
     },
     ModelPreset {
         id: "qwen2.5-tokenizer",

@@ -2308,10 +2308,16 @@ impl VadApp {
             .export_to_markdown(&title, transcription_text.as_deref());
 
         if let Some(summary) = self.whisper_panel.meeting_summary() {
+            // The summary carries its own H1 title; inside this H2 section it would nest wrongly.
+            let body = summary
+                .markdown
+                .strip_prefix("# ")
+                .and_then(|rest| rest.split_once('\n'))
+                .map_or(summary.markdown.as_str(), |(_, rest)| rest.trim_start());
             md_content.push_str(&format!(
                 "\n\n---\n\n## Resumo da Reunião ({})\n\n{}\n",
                 summary.privacy_badge.label(),
-                summary.markdown
+                body
             ));
         }
 

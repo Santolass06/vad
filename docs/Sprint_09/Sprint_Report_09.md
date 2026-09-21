@@ -30,6 +30,8 @@ As principais entregas foram:
 
 ## Entregue vs. planeado
 
+> Estados originais, escritos antes da revisão: as linhas 1, 2, 3 e 5 estavam incompletas (o modelo real nunca gerava, o chunking era heurístico, o painel usava o Mock em silêncio). Ver «Revisão pós-sprint».
+
 | Tarefa (planning) | Estado | Detalhes |
 | :--- | :--- | :--- |
 | 1. `crates/vad-ai/src/llm_provider.rs`: Trait `Summarizer`, enum `LlmProviderConfig`, badge `AiPrivacyBadge` (§4.1), motor local Qwen2.5 | ✅ Concluído | Trait desacoplada implementada. Badge com variantes `Local` e `Cloud`. Motor `LocalQwenSummarizer` com `candle` GGUF. `MockSummarizer` para testes. |
@@ -43,14 +45,20 @@ As principais entregas foram:
 
 ## Critério de saída (§9, M5a parte 1) — cumprido?
 
-**Cumprido plenamente.**
+**Cumprido, mas só depois da revisão pós-sprint.** A versão original deste relatório dizia «cumprido
+plenamente» com base num teste que usa `MockSummarizer`; o `LocalQwenSummarizer` nunca gerava um token
+(defeito 1 abaixo). Depois de corrigido, o critério foi verificado com o modelo real:
 
-- **Critério explícito:** *«Resumo de reunião de 90 min sem estourar context window do LocalQwen (map-reduce com descarte do bloco bruto (§4.19)).»*
-- **Verificação via teste de integração:** O teste `crates/vad-ai/src/summarizer.rs::test_summarize_90_minute_transcription_exit_criterion` simula uma reunião de 90 minutos com 13.500 palavras (~18.000 tokens), excedendo deliberadamente o contexto máximo de um único bloco. O `MapReduceSummarizer` divide a transcrição em chunks pelo limite de tokens, descarta imediatamente o bloco bruto de texto da memória (`drop(raw_text)`) a cada iteração, reporta o progresso por bloco ("A resumir bloco 1 de 2", "A resumir bloco 2 de 2") e consolida com sucesso o resumo final sem estouro de contexto nem fugas de memória.
+- **90 min, Qwen2.5-0.5B Q4_K_M real, saída de 768 tokens:** 13 blocos + síntese final, **2128 s**, sem
+  `LlmContextExceeded`; pior prompt completo **3055 de 4096** tokens (tokenizer real).
+- O teste com o Mock (`test_summarize_90_minute_transcription_exit_criterion`) continua a validar a lógica de
+  chunking/progresso em milissegundos, mas **não é** a prova do critério.
+- Ressalva: a corrida usou `-C target-cpu=native`; o build normal é ~2,6–3× mais lento (medido em
+  throughput, não na corrida inteira).
 
----
+## Validação visual e medições reais (`tools/vad-visual-mcp`) — *antes da revisão*
 
-## Validação visual e medições reais (`tools/vad-visual-mcp`)
+> O RSS abaixo é o da app **sem o modelo LLM carregado**; o custo real do LLM está em «Revisão pós-sprint».
 
 - **Ambiente:** Servidor virtual Xvfb headless (1280×720, software GL `[SW (CPU)]`), D-Bus de sessão privado, sandboxed (`/tmp/vadv-*`), áudio com volume mudo.
 - **Medição do processo (App em execução com áudio fixture e Modo Reunião):**
@@ -96,10 +104,48 @@ As principais entregas foram:
 
 ---
 
+## Revisão pós-sprint
+
+| # | Defeito | Estado |
+| :--- | :--- | :--- |
+| 1 | `LocalQwenSummarizer` nunca gerava tokens (forma dos logits); só o Mock era testado | ✅ corrigido, provado com o modelo real |
+| 2 | Fallback silencioso ao Mock: resumo/tradução fabricados sob 🔒 Local, exportados no `.md` | ✅ erro visível + descarga explícita (§4.37) |
+| 3 | Modelo de 491 MB carregado na thread da UI | ✅ carrega no worker |
+| 4 | Chunking por 3,8 car./token | ✅ tokens reais (`count_tokens`); 13 blocos, pior 3055/4096 |
+| 5 | Cancelar só entre blocos (~160 s) | ✅ dentro da chamada; 3,2 s medidos |
+| 6 | Worker sem guarda contra pânico | ✅ `ClearOnDrop` + `Disconnected` |
+| 7 | Badge ilegível (`premultiplied`) | ✅ visto e revisto no ecrã |
+| 8 | Redução sem título uniforme nem progresso hierárquico | ✅ `ReducingBatch` |
+| 9 | Preset 398 MB (real 491,4 MB); `candle-nn` sem uso | ✅ |
+| 10 | H1 aninhado no export | ✅ |
+
+Alegações do relatório original corrigidas: RSS de 207–215 MiB **não incluía o modelo** (real: 976 MiB
+carregado, pico 1157 MiB, só o LLM — acima dos 350–700 MB do §5, agora anotado no plano); «visualizador de
+markdown» é texto cru; a tradução nativa do Whisper existe no motor mas **não está ligada à UI**; a contagem
+de 127 testes passa a **132** (`vad-ai` 42, `vad-core` 36, `vad-app` 33, `vad-audio-tools` 21), 11 `#[ignore]` (`vad-ai` 8, `vad-app` 1, `vad-core` 2).
+
+**Visto no ecrã:** painel sem modelo, descarga real (43 s), badge legível, LLM presente. **Não visto:** o
+clique em "Gerar Resumo"/"Traduzir" com transcrição real na UI; a qualidade do resumo (o texto de teste é
+sintético e repetitivo — gate da Sprint_10); RSS Whisper+Qwen em simultâneo.
+
+**Eficiência (para decisão do utilizador, nada alterado):** no mesmo GGUF, o `llama.cpp` faz prefill a 255
+tok/s contra 55 (candle, `target-cpu=native`) e 21 (build normal); a geração é equivalente (18 vs 21 tok/s).
+Trocar de motor reabre o risco de colisão `ggml` com o `whisper-rs-sys`. Alternativas de modelo pesquisadas
+mas **não testadas**: LFM2 (sem português), Qwen3.5-0.8B (suporte no candle por confirmar).
+Fontes: bentoml.com/blog/the-best-open-source-small-language-models · huggingface.co/LiquidAI/LFM2-1.2B ·
+github.com/huggingface/candle/issues/1939.
+
+## Dívida técnica adicional
+
+- Descodificação gananciosa sem penalização de repetição: o resumo de teste entrou em repetições.
+- `-C target-cpu=native` (ou `+avx2`) triplica a velocidade mas quebra CPUs sem AVX2: decisão em aberto.
+- O modelo recarrega (~1–4 s) a cada operação; aceitável, mas um resumo seguido de tradução paga duas vezes.
+- Whisper `translate` sem uso na UI; sem SHA-256 do modelo descarregado.
+
 ## Conclusão
 
-A Sprint 09 fica concluída com total sucesso e sem pendências.
+A Sprint 09 fica concluída **após a revisão pós-sprint**; a versão original dizia «sem pendências», o que não era verdade (ver a secção acima).
 
-- **Testes no workspace:** **127 aprovados** (`vad-ai`: 39, `vad-core`: 36, `vad-app`: 31, `vad-audio-tools`: 21), 0 falhas, 5 ignorados (`#[ignore]` para testes com rede ou modelos pesados).
+- **Testes no workspace:** **132 aprovados** (`vad-ai`: 42, `vad-core`: 36, `vad-app`: 33, `vad-audio-tools`: 21), 0 falhas, 11 ignorados (`#[ignore]`: rede, modelos pesados; `vad-ai` 8, `vad-app` 1, `vad-core` 2). *(A versão original dizia 127.)*
 - **Clippy:** `cargo clippy --workspace --all-targets -- -D warnings` com **0 avisos**.
 - **Limpeza do repositório:** Ficheiros temporários de teste e scripts de verificação removidos; nenhuma criação de lixo fora do `.gitignore`.

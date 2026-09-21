@@ -10,19 +10,20 @@ use vad_ai::{
     MapReduceSummarizer, MeetingSummary, MockSummarizer, ModelManager, ModelPreset, ModelSource,
     PcmAudio, SummarizeProgress, Summarizer, TargetLanguage, TranscriptionSegment, WhisperEngine,
     DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS, DEFAULT_QWEN_MODEL_FILENAME,
-    DEFAULT_QWEN_TOKENIZER_FILENAME, DISK_TOOLTIP, PRESET_MODELS, RAM_ONLY_TOOLTIP,
+    DEFAULT_QWEN_TOKENIZER_FILENAME, DISK_TOOLTIP, PRESET_LLM_MODELS, PRESET_MODELS,
+    RAM_ONLY_TOOLTIP,
 };
-use vad_core::{get_process_rss_bytes, ModelStorageMode, VadConfig};
+use vad_core::{get_process_rss_bytes, ModelStorageMode, VadConfig, VadError};
 
 /// Renders a standardized AI privacy badge (🔒 Local / ☁️ Sai do PC) per PLANO_VAD.md §4.1.
 pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
     let (bg, text_color) = match badge {
         AiPrivacyBadge::Local => (
-            Color32::from_rgba_premultiplied(34, 197, 94, 35),
+            Color32::from_rgba_unmultiplied(34, 197, 94, 40),
             Color32::from_rgb(74, 222, 128),
         ),
         AiPrivacyBadge::Cloud => (
-            Color32::from_rgba_premultiplied(234, 179, 8, 35),
+            Color32::from_rgba_unmultiplied(234, 179, 8, 40),
             Color32::from_rgb(250, 204, 21),
         ),
     };
@@ -36,6 +37,42 @@ pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
         })
         .response
         .on_hover_text(badge.tooltip());
+}
+
+/// Clears a "busy" flag when the worker thread ends, even if it panics: a flag stuck at `true`
+/// would leave the spinner going forever with nothing to cancel.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Loads the summarization/translation model. Runs on the worker thread (reading ~490 MB
+/// must not block the UI).
+///
+/// A missing or unreadable model is an error the user sees, never a silent switch to the
+/// mock: canned text under a "🔒 Local" badge would pass for a real summary (§4.21).
+fn load_llm(manager: &ModelManager, use_mock: bool) -> Result<Arc<dyn Summarizer>, VadError> {
+    if use_mock {
+        return Ok(Arc::new(MockSummarizer::default()));
+    }
+    let Some((model_path, tokenizer_path)) =
+        manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME)
+    else {
+        return Err(VadError::Llm(format!(
+            "modelo de linguagem em falta em {} — descarrega-o no painel",
+            manager.models_dir().display()
+        )));
+    };
+    let summarizer = LocalQwenSummarizer::load_from_paths(
+        &model_path,
+        &tokenizer_path,
+        DEFAULT_QWEN_CONTEXT_WINDOW,
+        DEFAULT_QWEN_MAX_OUTPUT_TOKENS,
+    )?;
+    Ok(Arc::new(summarizer))
 }
 
 /// Idle time after which a RAM-only Whisper model is released (§4.16).
@@ -102,7 +139,12 @@ pub struct WhisperPanel {
     translation_rx: Option<crossbeam_channel::Receiver<Result<Vec<TranscriptionSegment>, String>>>,
     show_translated_subtitles: bool,
 
-    // --- LLM Model / Test state ---
+    // --- LLM model on disk (explicit download, never a silent fallback) ---
+    llm_ready: bool,
+    llm_download_progress: Arc<Mutex<Option<f32>>>,
+    llm_download_error: Arc<Mutex<Option<String>>>,
+
+    /// Test hook: use the deterministic `MockSummarizer` instead of the real model.
     use_mock_llm: bool,
 }
 
@@ -116,6 +158,8 @@ impl WhisperPanel {
     pub fn new() -> Self {
         let manager = ModelManager::new();
         let disk_models = manager.list_disk_models();
+        let llm_ready = manager
+            .is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
 
         Self {
             model_manager: manager,
@@ -153,6 +197,10 @@ impl WhisperPanel {
             translation_rx: None,
             show_translated_subtitles: false,
 
+            llm_ready,
+            llm_download_progress: Arc::new(Mutex::new(None)),
+            llm_download_error: Arc::new(Mutex::new(None)),
+
             use_mock_llm: false,
         }
     }
@@ -165,6 +213,9 @@ impl WhisperPanel {
     /// Refreshes list of models stored in `~/.local/share/vad/models/`.
     pub fn refresh_disk_models(&mut self) {
         self.cached_disk_models = self.model_manager.list_disk_models();
+        self.llm_ready = self
+            .model_manager
+            .is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
         self.last_models_refresh = Instant::now();
     }
 
@@ -312,7 +363,15 @@ impl WhisperPanel {
 
         // Non-blocking poll for meeting summarization completion (M5a)
         if let Some(ref rx) = self.summary_rx {
-            if let Ok(res) = rx.try_recv() {
+            let polled = match rx.try_recv() {
+                Ok(res) => Some(res),
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+                // The worker died without answering (panic): do not wait for it forever.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(Err("o resumo terminou inesperadamente".to_string()))
+                }
+            };
+            if let Some(res) = polled {
                 match res {
                     Ok(summary) => {
                         info!(
@@ -333,7 +392,14 @@ impl WhisperPanel {
 
         // Non-blocking poll for translation completion (M5a)
         if let Some(ref rx) = self.translation_rx {
-            if let Ok(res) = rx.try_recv() {
+            let polled = match rx.try_recv() {
+                Ok(res) => Some(res),
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(Err("a tradução terminou inesperadamente".to_string()))
+                }
+            };
+            if let Some(res) = polled {
                 match res {
                     Ok(segs) => {
                         info!("Translation finished successfully ({} segments)", segs.len());
@@ -657,6 +723,7 @@ impl WhisperPanel {
 
             let is_summarizing = self.is_summarizing.load(Ordering::SeqCst);
             let has_segments = !self.transcription_segments.is_empty();
+            let llm_available = self.render_llm_model_status(ui);
 
             if is_summarizing {
                 let prog_msg = self
@@ -684,8 +751,10 @@ impl WhisperPanel {
                 let summarize_btn = egui::Button::new(
                     RichText::new("✨ Gerar Resumo da Reunião").strong(),
                 );
-                let resp = ui.add_enabled(has_segments, summarize_btn);
-                if !has_segments {
+                let resp = ui.add_enabled(has_segments && llm_available, summarize_btn);
+                if !llm_available {
+                    resp.on_disabled_hover_text("Descarrega primeiro o modelo de linguagem");
+                } else if !has_segments {
                     resp.on_disabled_hover_text("Executa primeiro a transcrição com o Whisper");
                 } else if resp.clicked() {
                     self.start_summary();
@@ -776,8 +845,10 @@ impl WhisperPanel {
                 let trans_btn = egui::Button::new(
                     RichText::new(format!("🌐 Traduzir para {}", self.selected_target_lang.display_name())).strong(),
                 );
-                let resp = ui.add_enabled(has_segments, trans_btn);
-                if !has_segments {
+                let resp = ui.add_enabled(has_segments && llm_available, trans_btn);
+                if !llm_available {
+                    resp.on_disabled_hover_text("Descarrega primeiro o modelo de linguagem (secção Resumo)");
+                } else if !has_segments {
                     resp.on_disabled_hover_text("Transcreve o áudio primeiro");
                 } else if resp.clicked() {
                     let target = self.selected_target_lang;
@@ -1013,34 +1084,15 @@ impl WhisperPanel {
         *self.summarize_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         let segments = self.transcription_segments.clone();
-        let is_summarizing = Arc::clone(&self.is_summarizing);
+        let busy = ClearOnDrop(Arc::clone(&self.is_summarizing));
         let progress_state = Arc::clone(&self.summarize_progress);
         let abort_flag = Arc::clone(&self.summarize_abort);
-
-        let manager = ModelManager::new();
-        let ready = manager.is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
-        let use_mock = self.use_mock_llm || !ready;
-
-        let summarizer: Arc<dyn Summarizer> = if !use_mock {
-            if let Some((model_p, tok_p)) = manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME) {
-                match LocalQwenSummarizer::load_from_paths(&model_p, &tok_p, DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS) {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        error!("Falha ao carregar modelo Qwen local: {:?}", e);
-                        Arc::new(MockSummarizer::default())
-                    }
-                }
-            } else {
-                Arc::new(MockSummarizer::default())
-            }
-        } else {
-            Arc::new(MockSummarizer::default())
-        };
+        let use_mock = self.use_mock_llm;
 
         let (tx, rx) = crossbeam_channel::bounded::<Result<MeetingSummary, String>>(1);
 
         thread::spawn(move || {
-            let map_reduce = MapReduceSummarizer::new(summarizer);
+            let _busy = busy;
             let prog_clone = Arc::clone(&progress_state);
             let progress_cb = move |p: SummarizeProgress| {
                 if let Ok(mut g) = prog_clone.lock() {
@@ -1048,15 +1100,92 @@ impl WhisperPanel {
                 }
             };
 
-            let res = map_reduce.summarize(&segments, Some(progress_cb), Some(abort_flag));
-            let mapped = res.map_err(|e| e.to_string());
-            let _ = tx.send(mapped);
-
-            is_summarizing.store(false, Ordering::SeqCst);
+            let res = load_llm(&ModelManager::new(), use_mock).and_then(|summarizer| {
+                MapReduceSummarizer::new(summarizer).summarize(&segments, Some(progress_cb), Some(abort_flag))
+            });
+            let _ = tx.send(res.map_err(|e| e.to_string()));
             *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
 
         self.summary_rx = Some(rx);
+    }
+
+    /// Shows the state of the local language model and, when it is missing, the explicit
+    /// download action. Returns whether summarizing/translating can start.
+    fn render_llm_model_status(&mut self, ui: &mut Ui) -> bool {
+        let progress = *self.llm_download_progress.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.llm_ready && progress.is_none() {
+            // Cheap (two stat calls) and picks up a finished download on the very next frame.
+            self.llm_ready = self.model_manager.is_llm_model_ready(
+                DEFAULT_QWEN_MODEL_FILENAME,
+                DEFAULT_QWEN_TOKENIZER_FILENAME,
+            );
+        }
+        if self.use_mock_llm || self.llm_ready {
+            return true;
+        }
+
+        if let Some(pct) = progress {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("A descarregar modelo de linguagem: {pct:.0}%"));
+            });
+            ui.add(egui::ProgressBar::new(pct / 100.0).animate(true));
+        } else {
+            let mb: f64 = PRESET_LLM_MODELS.iter().map(|p| p.approx_size_mb).sum();
+            let btn = egui::Button::new(
+                RichText::new(format!("⬇ Descarregar modelo de linguagem (~{mb:.0} MB)")).strong(),
+            );
+            if ui
+                .add(btn)
+                .on_hover_text(format!(
+                    "Qwen2.5 0.5B Instruct, corre neste computador. Guardado em {}",
+                    self.model_manager.models_dir().display()
+                ))
+                .clicked()
+            {
+                self.start_llm_download();
+            }
+        }
+        if let Some(err) = self.llm_download_error.lock().ok().and_then(|g| g.clone()) {
+            ui.colored_label(Color32::RED, format!("Erro ao descarregar: {err}"));
+        }
+        false
+    }
+
+    /// Downloads the LLM and its tokenizer in the background. Only ever started by an explicit
+    /// click: it is ~490 MB and the user must see that before it happens.
+    pub fn start_llm_download(&mut self) {
+        if self.llm_download_progress.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return;
+        }
+        *self.llm_download_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.llm_download_progress.lock().unwrap_or_else(|e| e.into_inner()) = Some(0.0);
+
+        let progress_state = Arc::clone(&self.llm_download_progress);
+        let error_state = Arc::clone(&self.llm_download_error);
+        let manager = ModelManager::new();
+
+        thread::spawn(move || {
+            let total_mb: f32 = PRESET_LLM_MODELS.iter().map(|p| p.approx_size_mb as f32).sum();
+            let mut done_mb = 0.0_f32;
+            for preset in PRESET_LLM_MODELS.iter() {
+                let (base, size) = (done_mb, preset.approx_size_mb as f32);
+                let prog = Arc::clone(&progress_state);
+                let result = manager.load_or_download_model(preset, ModelStorageMode::Disk, move |pct| {
+                    if let Ok(mut g) = prog.lock() {
+                        *g = Some((base + size * pct / 100.0) / total_mb * 100.0);
+                    }
+                });
+                if let Err(err) = result {
+                    error!("Falha ao descarregar {}: {:?}", preset.id, err);
+                    *error_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+                    break;
+                }
+                done_mb += size;
+            }
+            *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        });
     }
 
     /// Signals cancellation of the running summarization operation (§4.20).
@@ -1077,31 +1206,15 @@ impl WhisperPanel {
         *self.translation_progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         let segments = self.transcription_segments.clone();
-        let is_translating = Arc::clone(&self.is_translating);
+        let busy = ClearOnDrop(Arc::clone(&self.is_translating));
         let progress_state = Arc::clone(&self.translation_progress);
         let abort_flag = Arc::clone(&self.translation_abort);
-
-        let manager = ModelManager::new();
-        let ready = manager.is_llm_model_ready(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME);
-        let use_mock = self.use_mock_llm || !ready;
-
-        let summarizer: Arc<dyn Summarizer> = if !use_mock {
-            if let Some((model_p, tok_p)) = manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME) {
-                match LocalQwenSummarizer::load_from_paths(&model_p, &tok_p, DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS) {
-                    Ok(s) => Arc::new(s),
-                    Err(_) => Arc::new(MockSummarizer::default()),
-                }
-            } else {
-                Arc::new(MockSummarizer::default())
-            }
-        } else {
-            Arc::new(MockSummarizer::default())
-        };
+        let use_mock = self.use_mock_llm;
 
         let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
 
         thread::spawn(move || {
-            let translator = LlmTranslator::new(summarizer);
+            let _busy = busy;
             let prog_clone = Arc::clone(&progress_state);
             let progress_cb = move |curr: usize, total: usize| {
                 if let Ok(mut g) = prog_clone.lock() {
@@ -1109,18 +1222,16 @@ impl WhisperPanel {
                 }
             };
 
-            let res = translator.translate_segments(
-                &segments,
-                "Português",
-                target_lang,
-                Some(progress_cb),
-                Some(abort_flag),
-            );
-
-            let mapped = res.map_err(|e| e.to_string());
-            let _ = tx.send(mapped);
-
-            is_translating.store(false, Ordering::SeqCst);
+            let res = load_llm(&ModelManager::new(), use_mock).and_then(|summarizer| {
+                LlmTranslator::new(summarizer).translate_segments(
+                    &segments,
+                    "Português",
+                    target_lang,
+                    Some(progress_cb),
+                    Some(abort_flag),
+                )
+            });
+            let _ = tx.send(res.map_err(|e| e.to_string()));
             *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
 
@@ -1335,5 +1446,31 @@ mod tests {
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].start_ms, 0);
         assert_eq!(translated[0].end_ms, 2500);
+    }
+
+    #[test]
+    fn test_missing_llm_is_an_error_never_the_mock() {
+        let dir = std::env::temp_dir().join(format!("vad-llm-missing-{}", std::process::id()));
+        let manager = ModelManager::with_dir(dir.clone());
+        let err = load_llm(&manager, false).err().expect("must not fall back to the mock");
+        assert!(err.to_string().contains("em falta"), "message: {err}");
+
+        // Present but unreadable files are an error too, not a silent mock.
+        std::fs::write(dir.join(DEFAULT_QWEN_MODEL_FILENAME), b"not a gguf").unwrap();
+        std::fs::write(dir.join(DEFAULT_QWEN_TOKENIZER_FILENAME), b"{}").unwrap();
+        assert!(load_llm(&manager, false).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_busy_flag_is_cleared_when_the_worker_panics() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = ClearOnDrop(Arc::clone(&flag));
+        let _ = thread::spawn(move || {
+            let _guard = guard;
+            panic!("worker died");
+        })
+        .join();
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }
