@@ -565,7 +565,7 @@ impl WhisperPanel {
                 let mut to_activate = None;
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
                     .corner_radius(8.0)
                     .inner_margin(6.0)
                     .show(ui, |ui| {
@@ -768,7 +768,7 @@ impl WhisperPanel {
             if let Some(ref summary) = self.meeting_summary {
                 ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {

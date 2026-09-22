@@ -255,7 +255,7 @@ impl ClipExportPanel {
         self.ensure_media(media_path, duration_safe);
 
         let accent = Color32::from_rgb(139, 124, 246); // #8b7cf6
-        let bg_card = Color32::from_rgba_premultiplied(32, 34, 46, 220);
+        let bg_card = Color32::from_rgba_unmultiplied(32, 34, 46, 220);
         let border_color = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
 
         // --- ROOT CONTAINER (ClipExport.dc.html) ---

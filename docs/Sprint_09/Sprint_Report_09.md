@@ -142,10 +142,26 @@ github.com/huggingface/candle/issues/1939.
 - O modelo recarrega (~1–4 s) a cada operação; aceitável, mas um resumo seguido de tradução paga duas vezes.
 - Whisper `translate` sem uso na UI; sem SHA-256 do modelo descarregado.
 
+## Revisão pós-pós-sprint (2026-09-22)
+
+O utilizador perguntou por correções simples, não previstas, que tivessem ficado por fazer. Três achadas e
+aplicadas de imediato (detalhe no diário — `Sprint_09.md`):
+
+| # | Defeito | Estado |
+| :--- | :--- | :--- |
+| 11 | `from_rgba_premultiplied` mal usado em ~48 outros sítios do workspace (só o badge e o clip tinham sido corrigidos) | ✅ trocado por `from_rgba_unmultiplied`; revisto no ecrã (playlist, equalizador, corte de clip) |
+| 12 | Download de modelo truncado (ligação cortada a meio sem erro de I/O) passava a `.tmp`→rename como completo | ✅ verificação de bytes recebidos vs. `Content-Length`; teste com servidor HTTP local que trunca |
+| 13 | Penalização de repetição: **investigada, não aplicada** — melhorou a métrica de repetição (0,98→1,00) mas fez o resumo perder a data da decisão | documentado num teste real de regressão; sem alteração de comportamento |
+
+Não mudei `-C target-cpu`: voltei a medir `x86-64-v3` vs. `native` (a primeira tentativa ficou contaminada
+por processos de medição anteriores ainda a correr em paralelo — decode chegou a sair negativo). Limpos os
+processos, os dois ficam parecidos nesta CPU sem AVX-512: prefill 67 vs. 62 tok/s, decode 9,6 vs. 5,2 tok/s
+(medição única, 1015 tokens de prompt). Continua decisão do utilizador.
+
 ## Conclusão
 
 A Sprint 09 fica concluída **após a revisão pós-sprint**; a versão original dizia «sem pendências», o que não era verdade (ver a secção acima).
 
-- **Testes no workspace:** **132 aprovados** (`vad-ai`: 42, `vad-core`: 36, `vad-app`: 33, `vad-audio-tools`: 21), 0 falhas, 11 ignorados (`#[ignore]`: rede, modelos pesados; `vad-ai` 8, `vad-app` 1, `vad-core` 2). *(A versão original dizia 127.)*
+- **Testes no workspace:** **133 aprovados** (`vad-ai`: 43, `vad-core`: 36, `vad-app`: 33, `vad-audio-tools`: 21), 0 falhas, 12 ignorados (`#[ignore]`: rede, modelos pesados). *(A versão original dizia 127.)*
 - **Clippy:** `cargo clippy --workspace --all-targets -- -D warnings` com **0 avisos**.
 - **Limpeza do repositório:** Ficheiros temporários de teste e scripts de verificação removidos; nenhuma criação de lixo fora do `.gitignore`.

@@ -402,12 +402,26 @@ impl ModelManager {
         let (response, total_size) = Self::open_download(url)?;
         let mut file = File::create(target_path).map_err(VadError::Io)?;
 
-        Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
+        let downloaded = Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
             file.write_all(bytes).map_err(VadError::Io)
         })?;
+        Self::check_complete(downloaded, total_size)?;
 
         file.sync_all().map_err(VadError::Io)?;
         progress_cb(100.0);
+        Ok(())
+    }
+
+    /// The server may close the connection early without the transport surfacing an I/O error
+    /// (e.g. a proxy that drops the body but keeps `Content-Length`). Catch that case explicitly
+    /// so a truncated model is never renamed into place and silently fails to load later.
+    fn check_complete(downloaded: u64, total_size: u64) -> Result<(), VadError> {
+        if total_size > 0 && downloaded != total_size {
+            return Err(VadError::ModelDownloadFailed(format!(
+                "download incompleto: recebidos {} de {} bytes",
+                downloaded, total_size
+            )));
+        }
         Ok(())
     }
 
@@ -419,10 +433,11 @@ impl ModelManager {
         let (response, total_size) = Self::open_download(url)?;
         let mut buffer = Vec::with_capacity(total_size as usize);
 
-        Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
+        let downloaded = Self::copy_with_progress(response, total_size, progress_cb, |bytes| {
             buffer.extend_from_slice(bytes);
             Ok(())
         })?;
+        Self::check_complete(downloaded, total_size)?;
 
         progress_cb(100.0);
         Ok(buffer)
@@ -551,6 +566,34 @@ mod tests {
         (url, hits)
     }
 
+    /// Like `serve_model`, but claims a `Content-Length` larger than the body it actually sends,
+    /// then closes the connection — simulating a dropped transfer.
+    fn serve_truncated(body: &'static [u8], claimed_len: usize) -> String {
+        use std::io::{BufRead, BufReader};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/ggml-test.bin", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).map(|n| n > 2).unwrap_or(false) {
+                    line.clear();
+                }
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    claimed_len
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body); // shorter than claimed_len, then the socket closes
+            }
+        });
+
+        url
+    }
+
     fn test_preset(url: String) -> ModelPreset {
         ModelPreset {
             id: "test",
@@ -635,6 +678,26 @@ mod tests {
         let res = manager.load_or_download_model(&preset, ModelStorageMode::Disk, |_| {});
         assert!(matches!(res, Err(VadError::ModelDownloadFailed(_))));
         assert!(files_in(&sandbox_dir).is_empty());
+
+        let _ = fs::remove_dir_all(&sandbox_dir);
+    }
+
+    /// A server that claims a `Content-Length` it never delivers must not produce a model file
+    /// that looks complete (§4.30's atomic write is only atomic against crashes, not truncation).
+    #[test]
+    fn test_truncated_download_is_rejected_not_saved_as_complete() {
+        const BODY: &[u8] = b"SHORT";
+        let url = serve_truncated(BODY, BODY.len() + 1000);
+        let sandbox_dir = PathBuf::from(format!("/tmp/vad_test_truncdl_{}", std::process::id()));
+        let manager = ModelManager::with_dir(sandbox_dir.clone());
+        let preset = test_preset(url);
+
+        let res = manager.load_or_download_model(&preset, ModelStorageMode::Disk, |_| {});
+        assert!(
+            matches!(res, Err(VadError::ModelDownloadFailed(_))),
+            "expected a download error, got {res:?}"
+        );
+        assert!(files_in(&sandbox_dir).is_empty(), "a truncated download must not be kept, not even as .tmp");
 
         let _ = fs::remove_dir_all(&sandbox_dir);
     }

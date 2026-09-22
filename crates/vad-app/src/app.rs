@@ -730,8 +730,8 @@ impl VadApp {
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 238))
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .fill(Color32::from_rgba_unmultiplied(26, 28, 40, 238))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)))
                     .corner_radius(16)
                     .inner_margin(20),
             )
@@ -835,8 +835,8 @@ impl VadApp {
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 240))
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .fill(Color32::from_rgba_unmultiplied(26, 28, 40, 240))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)))
                     .corner_radius(14)
                     .inner_margin(18),
             )
@@ -921,8 +921,8 @@ impl VadApp {
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 240))
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .fill(Color32::from_rgba_unmultiplied(26, 28, 40, 240))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)))
                     .corner_radius(14)
                     .inner_margin(18),
             )
@@ -1034,8 +1034,8 @@ impl VadApp {
             painter.rect(
                 recents_rect,
                 CornerRadius::same(12),
-                Color32::from_rgba_premultiplied(255, 255, 255, 8),
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 16)),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
                 StrokeKind::Inside,
             );
 
@@ -1164,8 +1164,8 @@ impl VadApp {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(26, 28, 40, 235))
-                    .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)))
+                    .fill(Color32::from_rgba_unmultiplied(26, 28, 40, 235))
+                    .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)))
                     .corner_radius(14)
                     .inner_margin(16)
                     .shadow(egui::epaint::Shadow {
@@ -1205,13 +1205,13 @@ impl VadApp {
                         let pct = (toast.time_left / 8.0).clamp(0.0, 1.0);
                         let (bar_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0), egui::Sense::hover());
                         let painter = ui.painter_at(bar_rect);
-                        painter.rect_filled(bar_rect, CornerRadius::ZERO, Color32::from_rgba_premultiplied(255, 255, 255, 15));
+                        painter.rect_filled(bar_rect, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(255, 255, 255, 15));
                         let active_bar = Rect::from_min_size(bar_rect.min, vec2(bar_rect.width() * pct, 2.0));
                         painter.rect_filled(active_bar, CornerRadius::ZERO, accent);
 
                         // Media info box
                         egui::Frame::new()
-                            .fill(Color32::from_rgba_premultiplied(255, 255, 255, 10))
+                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 10))
                             .corner_radius(8)
                             .inner_margin(10)
                             .show(ui, |ui| {
@@ -1263,7 +1263,7 @@ impl VadApp {
                                         .strong()
                                         .color(Color32::from_rgb(200, 205, 225)),
                                 )
-                                .fill(Color32::from_rgba_premultiplied(255, 255, 255, 14))
+                                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 14))
                                 .corner_radius(CornerRadius::same(8));
 
                                 if ui.add(start_over_btn).clicked() {
@@ -1729,7 +1729,7 @@ impl VadApp {
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(8),
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 20)),
                 StrokeKind::Inside,
             );
 
@@ -1737,7 +1737,7 @@ impl VadApp {
             let mid_y = rect.center().y;
             painter.line_segment(
                 [pos2(rect.left(), mid_y), pos2(rect.right(), mid_y)],
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 30)),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
             );
 
             let (view_start, view_end) = self.waveform_zoom_window.unwrap_or((0.0, duration.max(0.1)));
@@ -1931,7 +1931,7 @@ impl VadApp {
                 let mut skip_btn = egui::Button::new(RichText::new(skip_btn_text).strong().size(12.0));
                 if self.skip_silence_enabled {
                     skip_btn = skip_btn
-                        .fill(Color32::from_rgba_premultiplied(139, 124, 246, 55))
+                        .fill(Color32::from_rgba_unmultiplied(139, 124, 246, 55))
                         .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
                 }
                 if ui
@@ -1957,7 +1957,7 @@ impl VadApp {
                 let mut rn_btn = egui::Button::new(RichText::new(rn_text).strong().size(12.0));
                 if self.audio_panel.rnnoise {
                     rn_btn = rn_btn
-                        .fill(Color32::from_rgba_premultiplied(139, 124, 246, 55))
+                        .fill(Color32::from_rgba_unmultiplied(139, 124, 246, 55))
                         .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
                 }
                 if ui
@@ -2039,10 +2039,10 @@ impl VadApp {
             let mut bookmark_to_edit = None;
 
             egui::Frame::new()
-                .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
                 .corner_radius(8.0)
                 .inner_margin(8.0)
-                .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 15)))
+                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 15)))
                 .show(ui, |ui| {
                     if self.bookmark_store.bookmarks.is_empty() {
                         ui.vertical_centered(|ui| {
@@ -2171,7 +2171,7 @@ impl VadApp {
                 ui.add_space(4.0);
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
@@ -2205,7 +2205,7 @@ impl VadApp {
                 ui.add_space(4.0);
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_premultiplied(25, 27, 36, 255))
+                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
@@ -2553,8 +2553,8 @@ impl eframe::App for VadApp {
                 .resizable(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_premultiplied(20, 22, 30, 248))
-                        .stroke(Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 18)))
+                        .fill(Color32::from_rgba_unmultiplied(20, 22, 30, 248))
+                        .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)))
                         .inner_margin(14),
                 )
                 .show(ui, |ui| {
@@ -2784,7 +2784,7 @@ impl eframe::App for VadApp {
                 painter.rect_filled(
                     available_rect,
                     CornerRadius::ZERO,
-                    Color32::from_rgba_premultiplied(139, 124, 246, 35),
+                    Color32::from_rgba_unmultiplied(139, 124, 246, 35),
                 );
                 painter.rect_stroke(
                     available_rect.shrink(8.0),

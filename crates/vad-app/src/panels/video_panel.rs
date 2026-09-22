@@ -60,7 +60,7 @@ impl VideoPanel {
         self.sync_from_player(player);
 
         let accent = Color32::from_rgb(139, 124, 246);
-        let inactive_bg = Color32::from_rgba_premultiplied(255, 255, 255, 15);
+        let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 15);
         let active_bg = accent;
 
         ui.spacing_mut().item_spacing = vec2(0.0, 14.0);

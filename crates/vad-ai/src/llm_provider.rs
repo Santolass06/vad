@@ -705,4 +705,40 @@ pub(crate) mod tests {
         assert!(matches!(res, Err(VadError::LlmCancelled)), "got {res:?}");
         assert!(waited < Duration::from_secs(20), "abort took {waited:?}");
     }
+
+    /// Fraction of distinct word 4-grams: 1.0 = no repeated phrase, low = the model is looping.
+    fn distinct_4grams(text: &str) -> f64 {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let grams: Vec<&[&str]> = words.windows(4).collect();
+        let distinct: std::collections::HashSet<_> = grams.iter().collect();
+        distinct.len() as f64 / grams.len().max(1) as f64
+    }
+
+    #[test]
+    #[ignore = "needs VAD_TEST_QWEN_MODEL and VAD_TEST_QWEN_TOKENIZER (~490 MB)"]
+    fn test_real_qwen_summary_of_realistic_text_does_not_loop() {
+        let q = real_qwen(256).expect("env vars not set");
+        let meeting = "\
+[00:00:05] Ana: Bom dia a todos, vamos começar pelo estado da migração para Rust.
+[00:00:21] Rui: O módulo de áudio já está migrado, faltam os testes de regressão no Linux.
+[00:00:48] Ana: E o prazo? Tínhamos combinado fechar tudo até dia 15 de outubro.
+[00:01:10] Rui: Vai atrasar-se uma semana, porque o servidor de integração contínua esteve em baixo.
+[00:01:33] Inês: Eu posso ajudar com os testes, mas só a partir de quarta-feira.
+[00:01:52] Ana: Combinado. Decisão: o novo prazo é 22 de outubro e a Inês apoia os testes.
+[00:02:15] Rui: Falta também decidir se mantemos o suporte ao formato antigo de ficheiros.
+[00:02:40] Inês: Sugiro remover, quase ninguém o usa e custa-nos 20% do tempo de manutenção.
+[00:03:05] Ana: Aprovado, removemos na próxima versão. Rui, avisas os utilizadores?
+[00:03:20] Rui: Sim, escrevo o aviso ainda esta semana. Fica anotado como ação minha.";
+        let prompt = LocalQwenSummarizer::format_prompt(
+            "És um assistente de síntese em língua portuguesa. Resume o bloco de transcrição fornecido de forma concisa, capturando os pontos discutidos, ideias centrais e quaisquer decisões ou números mencionados. Responde apenas com o resumo dos pontos relevantes.",
+            &format!("Resume objetivamente o seguinte bloco de transcrição:\n\n{meeting}"),
+        );
+        let summary = q.generate(&prompt, 256, None).unwrap();
+        let distinct = distinct_4grams(&summary);
+        println!("distinct 4-grams {distinct:.2}:\n{summary}");
+        // Measured 0.98 with greedy decoding. A repetition penalty (1.1 over the last 64 tokens)
+        // scored 1.00 but dropped the decision date and invented a decision: do not add one.
+        assert!(distinct > 0.8, "summary loops: {summary}");
+        assert!(summary.contains("22 de outubro"), "the decision date is missing: {summary}");
+    }
 }

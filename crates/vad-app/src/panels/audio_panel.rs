@@ -95,7 +95,7 @@ impl AudioPanel {
         self.refresh_devices(player);
 
         let accent = Color32::from_rgb(139, 124, 246);
-        let inactive_bg = Color32::from_rgba_premultiplied(255, 255, 255, 12);
+        let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
 
         ui.spacing_mut().item_spacing = vec2(0.0, 14.0);
 
@@ -159,12 +159,12 @@ impl AudioPanel {
             painter.rect_filled(
                 rect,
                 CornerRadius::same(12),
-                Color32::from_rgba_premultiplied(22, 24, 34, 200),
+                Color32::from_rgba_unmultiplied(22, 24, 34, 200),
             );
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(12),
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 18)),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
                 StrokeKind::Inside,
             );
 
@@ -178,7 +178,7 @@ impl AudioPanel {
                     pos2(plot_rect.left(), baseline_y),
                     pos2(plot_rect.right(), baseline_y),
                 ],
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 35)),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35)),
             );
 
             // 0 dB text badge
@@ -187,7 +187,7 @@ impl AudioPanel {
                 egui::Align2::RIGHT_CENTER,
                 "0 dB",
                 egui::FontId::monospace(9.0),
-                Color32::from_rgba_premultiplied(255, 255, 255, 60),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 60),
             );
 
             // Calculate band X positions and node points for continuous spectral curve
@@ -210,14 +210,14 @@ impl AudioPanel {
                 let track_bottom = baseline_y + half_h;
                 painter.line_segment(
                     [pos2(x, track_top), pos2(x, track_bottom)],
-                    Stroke::new(3.0, Color32::from_rgba_premultiplied(255, 255, 255, 15)),
+                    Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 15)),
                 );
 
                 // Vertical fill from baseline to current gain
                 let fill_color = if gain >= 0.0 {
-                    Color32::from_rgba_premultiplied(139, 124, 246, 180)
+                    Color32::from_rgba_unmultiplied(139, 124, 246, 180)
                 } else {
-                    Color32::from_rgba_premultiplied(100, 110, 140, 160)
+                    Color32::from_rgba_unmultiplied(100, 110, 140, 160)
                 };
                 painter.line_segment([pos2(x, baseline_y), pos2(x, y)], Stroke::new(3.0, fill_color));
 
@@ -285,7 +285,7 @@ impl AudioPanel {
 
                 painter.add(egui::Shape::convex_polygon(
                     fill_polygon,
-                    Color32::from_rgba_premultiplied(139, 124, 246, 28),
+                    Color32::from_rgba_unmultiplied(139, 124, 246, 28),
                     Stroke::NONE,
                 ));
 

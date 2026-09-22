@@ -158,3 +158,36 @@ desaparece); badge legível; com o LLM presente e o Whisper ativado pela UI.
 - Qualidade do resumo: a transcrição sintética repete 6 frases e o resumo saiu repetitivo (descodificação
   gananciosa, sem penalização de repetição). Não é avaliação; o gate é a Sprint_10.
 - RSS de Whisper + Qwen em simultâneo; a corrida de 90 min com o build normal (só a velocidade foi medida).
+
+## Revisão pós-revisão (2026-09-22)
+
+O utilizador perguntou explicitamente por correções simples e não previstas que tivessem ficado por fazer
+na revisão anterior. Achei três e apliquei-as de imediato:
+
+1. **`from_rgba_premultiplied` mal usado nos outros ~48 sítios do workspace** (só o badge e o painel de
+   clip tinham sido corrigidos): `audio_panel.rs`, `playlist_panel.rs`, `video_panel.rs`, `hud.rs`,
+   `whisper_panel.rs`, `app.rs`. Substituído por `from_rgba_unmultiplied` em todos. Revisto em
+   `vad_screenshot`: playlist, equalizador e painel de corte de clip, ilegíveis antes (fundos em cores
+   quase opacas), legíveis depois — sem regressão visual nos outros painéis já corrigidos.
+2. **Download de modelo truncado não era detetado.** `download_to_file`/`download_to_memory` paravam de
+   copiar quando `read()` devolvia 0 bytes, sem comparar com o `Content-Length` anunciado; um servidor ou
+   proxy que fechasse a ligação a meio (sem erro de I/O explícito) deixava passar um `.tmp`→rename como se
+   o modelo estivesse completo, e só falhava mais tarde, ao carregar. Adicionado `check_complete` (compara
+   bytes recebidos com `Content-Length` quando este é conhecido) e um teste com servidor HTTP local que
+   anuncia mais bytes do que envia (`test_truncated_download_is_rejected_not_saved_as_complete`): confirma
+   erro e zero ficheiros deixados (nem `.tmp`).
+3. **Penalização de repetição: investigada, não aplicada.** Testei com o modelo real (1.1 sobre os últimos
+   64 tokens, via `candle_transformers::utils::apply_repeat_penalty`) numa transcrição de reunião realista.
+   Resultado: a fração de 4-gramas distintos melhorou de 0,98 para 1,00 (deixou de repetir "Rui e Rui..."),
+   mas o resumo **perdeu a data da decisão** ("22 de outubro") que sobrevivia sem penalização. Para um
+   resumo de reunião, um facto omitido é pior do que uma repetição benigna, por isso não fica ativada; ficou
+   documentado num teste real (`test_real_qwen_summary_of_realistic_text_does_not_loop`) que serve de
+   regressão ao comportamento atual (gananciosa, sem penalização) e ao raciocínio da decisão.
+
+Não alterei `target-cpu`: medi `x86-64-v3` vs `native` de novo, desta vez com cuidado para não deixar
+processos de medição anteriores a correr em paralelo (o que já tinha estragado uma leitura, com "decode"
+negativo — CPU deste portátil não tem AVX-512, por isso os dois ficam parecidos: prefill 67 tok/s (v3) vs
+62 tok/s (native), decode 9,6 vs 5,2 tok/s, 1015 tokens de prompt, medição única). Continua a ser decisão
+do utilizador, por definir o requisito mínimo de CPU da distribuição.
+
+Testes: 133 passados (vad-ai 43, vad-core 36, vad-app 33, vad-audio-tools 21), 12 ignorados. Clippy limpo.

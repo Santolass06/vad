@@ -35,7 +35,7 @@ impl PlaylistPanel {
     ) -> Option<PlaylistAction> {
         let mut action = None;
         let accent = Color32::from_rgb(139, 124, 246);
-        let inactive_bg = Color32::from_rgba_premultiplied(255, 255, 255, 12);
+        let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
 
         ui.spacing_mut().item_spacing = vec2(0.0, 10.0);
 
@@ -139,11 +139,11 @@ impl PlaylistPanel {
 
                     // Row background
                     let row_bg = if is_active {
-                        Color32::from_rgba_premultiplied(139, 124, 246, 35)
+                        Color32::from_rgba_unmultiplied(139, 124, 246, 35)
                     } else if response.hovered() {
-                        Color32::from_rgba_premultiplied(255, 255, 255, 14)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
                     } else {
-                        Color32::from_rgba_premultiplied(255, 255, 255, 5)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 5)
                     };
                     painter.rect_filled(rect, CornerRadius::same(6), row_bg);
 
@@ -151,7 +151,7 @@ impl PlaylistPanel {
                         painter.rect_stroke(
                             rect,
                             CornerRadius::same(6),
-                            Stroke::new(1.0, Color32::from_rgba_premultiplied(139, 124, 246, 120)),
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(139, 124, 246, 120)),
                             eframe::egui::StrokeKind::Inside,
                         );
                     }
@@ -244,12 +244,12 @@ impl PlaylistPanel {
             painter.rect_filled(
                 rect,
                 CornerRadius::same(8),
-                Color32::from_rgba_premultiplied(26, 28, 40, 240),
+                Color32::from_rgba_unmultiplied(26, 28, 40, 240),
             );
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(8),
-                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 20)),
                 eframe::egui::StrokeKind::Inside,
             );
 

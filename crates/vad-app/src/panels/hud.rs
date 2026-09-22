@@ -132,7 +132,7 @@ impl HudPanel {
         painter.rect_filled(
             track_rect,
             CornerRadius::same(radius_u8),
-            Color32::from_rgba_premultiplied(255, 255, 255, 30),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 30),
         );
 
         // Filled progress (accent color #8b7cf6)
@@ -153,7 +153,7 @@ impl HudPanel {
             painter.circle_filled(
                 center,
                 radius + 3.0,
-                Color32::from_rgba_premultiplied(139, 124, 246, 70),
+                Color32::from_rgba_unmultiplied(139, 124, 246, 70),
             );
             // Thumb inner circle
             painter.circle_filled(center, radius, Color32::from_rgb(245, 245, 250));
@@ -199,7 +199,7 @@ impl HudPanel {
         painter.rect_filled(
             track_rect,
             CornerRadius::same(radius_u8),
-            Color32::from_rgba_premultiplied(255, 255, 255, 30),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 30),
         );
 
         // Filled track
@@ -298,8 +298,8 @@ impl HudPanel {
         }
 
         // 3. Render HUD background surface: Fixed ~92% opacity, NO blur shader (§4.29)
-        let surface_fill = Color32::from_rgba_premultiplied(26, 28, 40, 235);
-        let surface_stroke = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 26));
+        let surface_fill = Color32::from_rgba_unmultiplied(26, 28, 40, 235);
+        let surface_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 26));
 
         let painter = ui.painter();
         painter.rect(
@@ -436,7 +436,7 @@ impl HudPanel {
                 ui.add_enabled(false, whisper_btn)
                     .on_disabled_hover_text("Desativado: Requer FFmpeg (`sudo apt install ffmpeg`)");
             } else {
-                let active_btn = whisper_btn.fill(Color32::from_rgba_premultiplied(217, 158, 66, 45));
+                let active_btn = whisper_btn.fill(Color32::from_rgba_unmultiplied(217, 158, 66, 45));
                 if ui
                     .add(active_btn)
                     .on_hover_text("Abrir painel de Transcrição Whisper AI")
