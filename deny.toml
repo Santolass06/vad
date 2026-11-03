@@ -1,0 +1,51 @@
+# cargo-deny configuration (Sprint_17, M7). Development tool, not a dependency of the product.
+#   cargo deny check licenses      # must exit 0
+#   cargo deny check bans sources advisories
+#
+# This is evidence, not legal advice: the allowlist below lists licenses that are widely
+# regarded as compatible with distributing a GPL-3.0 binary, and every non-obvious case is
+# decided in writing next to it. Final compatibility sign-off is a human (🧑‍⚖️) task.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.9
+# Workspace crates are unpublished and carry `license-file` (the GPL-3.0 text) until the
+# user decides between GPL-3.0-only and GPL-3.0-or-later.
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",          # 18 crates (unicode-ident, ICU data...): requires its notice text; included in THIRD_PARTY_NOTICES.md
+    "CDLA-Permissive-2.0",  # webpki-roots: license for *data* (Mozilla CA list); requires a notice; included
+    "OFL-1.1",              # fonts embedded by egui (epaint_default_fonts); applies to the fonts, with MIT/Apache for the code
+    "Ubuntu-font-1.0",      # Ubuntu-Light, embedded by egui; Ubuntu Font Licence 1.0 (free font license, GPL-compatibility of embedding: 🧑‍⚖️)
+    "LGPL-2.1",             # libmpv2 / libmpv2-sys bindings. Dynamic link only; the project is GPL-3.0 (see COMPONENTES.md). 🧑‍⚖️ confirm LGPL-2.1 + GPL-3.0 combination
+]
+
+# Decisions in writing for the dual-licensed cases of the audit:
+#   self_cell: "Apache-2.0 OR GPL-2.0-only"  -> we choose Apache-2.0 (the expression is satisfied
+#   by Apache-2.0, which is in `allow`; GPL-2.0-only is deliberately NOT allowed, it is not
+#   GPL-3.0-compatible).
+# `cargo deny` evaluates OR expressions as "any allowed alternative suffices", so no clarify is needed.
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true   # path dependencies between workspace crates
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

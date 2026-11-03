@@ -2,6 +2,10 @@
 name = "vad-app"
 version = "0.1.0"
 edition = "2021"
+# Project license is the GPL-3.0 text in LICENSE. -only vs -or-later is a pending user decision
+# (Sprint_17, task 1): until then the SPDX `license` field is deliberately NOT set.
+license-file = "../../LICENSE"
+publish = false
 description = "VAD video player desktop application with egui and OpenGL"
 
 [dependencies]

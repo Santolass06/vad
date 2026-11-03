@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ESQUELETO NÃO VALIDADO (Sprint_17). Não foi corrido `appstreamcli validate`. -->
+<component type="desktop-application">
+  <id>io.github.santolass06.Vad</id> <!-- TODO confirmar o App ID -->
+  <name>VAD</name>
+  <summary>Leitor multimédia para Linux sobre libmpv, com transcrição e resumo por IA</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!--
+    TODO 🧑‍⚖️ <project_license>: decisão do autor entre GPL-3.0-only e GPL-3.0-or-later.
+    Um valor por defeito escolhido pelo agente seria uma decisão jurídica; fica em falta de propósito.
+  -->
+  <project_license>TODO-DECISAO-DO-AUTOR</project_license>
+  <url type="homepage">https://github.com/santolass06/vad</url>
+  <description>
+    <p>VAD é um leitor multimédia para Linux. Não tem telemetria; a IA corre localmente por omissão e os providers cloud são opcionais.</p>
+  </description>
+</component>

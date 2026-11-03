@@ -607,6 +607,12 @@ impl WhisperPanel {
                         format!("Descarregar e Ativar {}", preset.id)
                     };
 
+                    // License shown BEFORE the download (Sprint_17, same pattern as §4.13).
+                    ui.label(
+                        RichText::new(preset.license_line())
+                            .size(crate::theme::MIN_TEXT_SIZE)
+                            .color(crate::theme::TEXT_MUTED),
+                    );
                     let btn = egui::Button::new(RichText::new(btn_text).strong());
                     if ui.add_sized([ui.available_width(), 32.0], btn).clicked() {
                         self.start_model_load(preset, self.storage_mode);
@@ -697,6 +703,14 @@ impl WhisperPanel {
                     .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
                     .color(crate::theme::TEXT_MUTED),
+            );
+            // Informative notice (Sprint_17); final wording is a human 🧑‍⚖️ review item.
+            ui.label(
+                RichText::new(
+                    "Gravar ou transcrever terceiros pode exigir o consentimento deles segundo a lei local; a responsabilidade é tua. A transcrição corre neste computador.",
+                )
+                .size(crate::theme::MIN_TEXT_SIZE)
+                .color(crate::theme::TEXT_MUTED),
             );
             ui.add_space(4.0);
 
@@ -1222,6 +1236,14 @@ impl WhisperPanel {
             ui.add(egui::ProgressBar::new(pct / 100.0).animate(true));
         } else {
             let mb: f64 = PRESET_LLM_MODELS.iter().map(|p| p.approx_size_mb).sum();
+            // License of each file shown BEFORE the download (Sprint_17).
+            for p in PRESET_LLM_MODELS.iter() {
+                ui.label(
+                    RichText::new(p.license_line())
+                        .size(crate::theme::MIN_TEXT_SIZE)
+                        .color(crate::theme::TEXT_MUTED),
+                );
+            }
             let btn = egui::Button::new(
                 RichText::new(format!("⬇ Descarregar modelo de linguagem (~{mb:.0} MB)")).strong(),
             );

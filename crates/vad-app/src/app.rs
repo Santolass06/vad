@@ -71,6 +71,7 @@ pub struct VadApp {
     fatal_error: Option<VadError>,
     missing_dependencies: Vec<VadError>,
     show_dependency_dialog: bool,
+    about: crate::about::AboutDialog,
     copy_feedback: Option<(&'static str, Instant)>,
     open_modal_open: bool,
     open_modal_is_url: bool,
@@ -279,6 +280,7 @@ impl VadApp {
             fatal_error: fatal_error.or(gl_fatal_error),
             missing_dependencies,
             show_dependency_dialog,
+            about: crate::about::AboutDialog::default(),
             copy_feedback: None,
             open_modal_open: false,
             open_modal_is_url: false,
@@ -546,6 +548,8 @@ impl VadApp {
                 self.selection_playback = None;
             } else if self.resume_toast.is_some() {
                 self.resume_toast = None;
+            } else if self.about.open {
+                self.about.open = false;
             } else if self.show_dependency_dialog {
                 self.show_dependency_dialog = false;
             } else if self.open_modal_open {
@@ -862,6 +866,16 @@ impl VadApp {
                 } else {
                     "Introduz o caminho do ficheiro ou arrasta-o para a janela:"
                 });
+                if is_url {
+                    // Informative notice (Sprint_17): not legal advice, the user's responsibility.
+                    ui.label(
+                        egui::RichText::new(
+                            "Os termos da plataforma e o direito de autor do conteúdo são da tua responsabilidade; o VAD não redistribui conteúdo.",
+                        )
+                        .size(crate::theme::MIN_TEXT_SIZE)
+                        .color(crate::theme::TEXT_MUTED),
+                    );
+                }
                 ui.add_space(6.0);
 
                 let edit = ui.add(
@@ -2502,6 +2516,10 @@ impl eframe::App for VadApp {
                         }
                     }
 
+                    if ui.button("Sobre").clicked() {
+                        self.about.open = !self.about.open;
+                    }
+
                     if ui.button("Abrir...").clicked() {
                         self.open_modal_is_url = false;
                         self.open_modal_open = true;
@@ -2887,6 +2905,7 @@ impl eframe::App for VadApp {
         // Dialogs
         self.render_dependency_dialog(&ctx);
         self.render_open_modal(&ctx);
+        self.about.show(&ctx);
         self.render_subtitles_modal(&ctx);
         self.render_resume_toast(&ctx);
     }

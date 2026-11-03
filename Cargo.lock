@@ -4829,6 +4829,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokenizers 0.23.2",
  "tracing",

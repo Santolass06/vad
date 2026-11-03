@@ -25,6 +25,24 @@ pub struct ModelPreset {
     pub filename: &'static str,
     pub url: &'static str,
     pub approx_size_mb: f64,
+    /// SPDX id of the model's license as declared by its authors.
+    pub license: &'static str,
+    /// Page where the license can be checked (the model card / repository), not the file URL.
+    pub source_page: &'static str,
+    /// `YYYY-MM-DD` on which someone confirmed `license` on `source_page`; `None` = not yet
+    /// verified. The VAD never redistributes weights: it only downloads from the original host
+    /// when the user asks (Sprint_17).
+    pub verified_on: Option<&'static str>,
+}
+
+impl ModelPreset {
+    /// One line shown **before** the download (same pattern as the storage tooltips, §4.13).
+    pub fn license_line(&self) -> String {
+        match self.verified_on {
+            Some(d) => format!("Licença: {} (verificada em {d}) — {}", self.license, self.source_page),
+            None => format!("Licença: {} (declarada pelo autor, por verificar) — {}", self.license, self.source_page),
+        }
+    }
 }
 
 pub const PRESET_MODELS: [ModelPreset; 5] = [
@@ -34,6 +52,9 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
         filename: "ggml-tiny.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
         approx_size_mb: 75.0,
+        license: "MIT",
+        source_page: "https://huggingface.co/ggerganov/whisper.cpp",
+        verified_on: None,
     },
     ModelPreset {
         id: "base-q5",
@@ -41,6 +62,9 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
         filename: "ggml-base-q5_1.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
         approx_size_mb: 55.0,
+        license: "MIT",
+        source_page: "https://huggingface.co/ggerganov/whisper.cpp",
+        verified_on: None,
     },
     ModelPreset {
         id: "base",
@@ -48,6 +72,9 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
         filename: "ggml-base.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         approx_size_mb: 142.0,
+        license: "MIT",
+        source_page: "https://huggingface.co/ggerganov/whisper.cpp",
+        verified_on: None,
     },
     ModelPreset {
         id: "small",
@@ -55,6 +82,9 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
         filename: "ggml-small.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         approx_size_mb: 466.0,
+        license: "MIT",
+        source_page: "https://huggingface.co/ggerganov/whisper.cpp",
+        verified_on: None,
     },
     ModelPreset {
         id: "medium",
@@ -62,6 +92,9 @@ pub const PRESET_MODELS: [ModelPreset; 5] = [
         filename: "ggml-medium.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
         approx_size_mb: 1500.0,
+        license: "MIT",
+        source_page: "https://huggingface.co/ggerganov/whisper.cpp",
+        verified_on: None,
     },
 ];
 
@@ -73,6 +106,9 @@ pub const PRESET_LLM_MODELS: [ModelPreset; 2] = [
         filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
         url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         approx_size_mb: 491.0,
+        license: "Apache-2.0",
+        source_page: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        verified_on: None,
     },
     ModelPreset {
         id: "qwen2.5-tokenizer",
@@ -80,6 +116,9 @@ pub const PRESET_LLM_MODELS: [ModelPreset; 2] = [
         filename: "qwen2.5-tokenizer.json",
         url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json",
         approx_size_mb: 7.0,
+        license: "Apache-2.0",
+        source_page: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
+        verified_on: None,
     },
 ];
 
@@ -601,6 +640,9 @@ mod tests {
             filename: "ggml-test.bin",
             url: Box::leak(url.into_boxed_str()),
             approx_size_mb: 0.0,
+            license: "MIT",
+            source_page: "https://example.invalid/model",
+            verified_on: None,
         }
     }
 
@@ -700,5 +742,26 @@ mod tests {
         assert!(files_in(&sandbox_dir).is_empty(), "a truncated download must not be kept, not even as .tmp");
 
         let _ = fs::remove_dir_all(&sandbox_dir);
+    }
+
+    /// Sprint_17: every downloadable model declares license and source, and never claims a
+    /// verification without a date.
+    #[test]
+    fn test_every_preset_declares_license_and_source() {
+        for p in PRESET_MODELS.iter().chain(PRESET_LLM_MODELS.iter()) {
+            assert!(!p.license.trim().is_empty(), "{}: no license", p.id);
+            assert!(p.source_page.starts_with("https://"), "{}: no source page", p.id);
+            assert!(p.url.starts_with("https://"), "{}", p.id);
+            if let Some(d) = p.verified_on {
+                assert!(d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-', "{}: bad date {d}", p.id);
+            }
+            assert!(p.license_line().contains(p.license));
+        }
+    }
+
+    #[test]
+    fn test_license_line_says_when_unverified() {
+        let p = &PRESET_LLM_MODELS[0];
+        assert!(p.license_line().contains("por verificar") == p.verified_on.is_none());
     }
 }

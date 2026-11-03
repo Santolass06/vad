@@ -2,6 +2,10 @@
 name = "vad-ai"
 version = "0.1.0"
 edition = "2021"
+# Project license is the GPL-3.0 text in LICENSE. -only vs -or-later is a pending user decision
+# (Sprint_17, task 1): until then the SPDX `license` field is deliberately NOT set.
+license-file = "../../LICENSE"
+publish = false
 description = "VAD AI crate (Whisper, VAD, LLM providers, Summarization) - Milestone M3/M5"
 
 [dependencies]
@@ -25,4 +29,5 @@ keyring = { version = "3", default-features = false, features = ["sync-secret-se
 libc = "0.2"
 
 [dev-dependencies]
+sha2 = "0.10"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
