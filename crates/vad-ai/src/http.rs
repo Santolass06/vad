@@ -142,7 +142,12 @@ fn attempt(req: RequestBuilder, abort: Option<&AtomicBool>) -> Result<Value, Fai
 
 /// Sends `req` and returns the JSON body, honouring `abort` while waiting and retrying 429/5xx
 /// with backoff+jitter (and the provider's `Retry-After`) per `policy`.
-pub(crate) fn execute(req: RequestBuilder, abort: Option<&AtomicBool>, policy: RetryPolicy) -> Result<Value, VadError> {
+pub(crate) fn execute(
+    req: RequestBuilder,
+    abort: Option<&AtomicBool>,
+    policy: RetryPolicy,
+    secret: Option<&str>,
+) -> Result<Value, VadError> {
     let mut tries = 0;
     let mut req = req;
     loop {
@@ -151,14 +156,31 @@ pub(crate) fn execute(req: RequestBuilder, abort: Option<&AtomicBool>, policy: R
         match attempt(req, abort) {
             Ok(v) => return Ok(v),
             Err(f) => {
-                let Some(next) = spare.filter(|_| f.retryable) else { return Err(f.error) };
+                // Redacted before it is logged or returned: a provider may echo the key in a
+                // 400/500 body, and the log must never hold it (§10.7).
+                let error = redact_error(f.error, secret);
+                let Some(next) = spare.filter(|_| f.retryable) else { return Err(error) };
                 let wait = policy.delay(tries, f.retry_after);
-                tracing::warn!("provider de IA: {} — nova tentativa em {} ms ({}/{})", f.error, wait.as_millis(), tries + 1, policy.max_retries);
+                tracing::warn!("provider de IA: {} — nova tentativa em {} ms ({}/{})", error, wait.as_millis(), tries + 1, policy.max_retries);
                 sleep_abortable(wait, abort)?;
                 tries += 1;
                 req = next;
             }
         }
+    }
+}
+
+/// Replaces every occurrence of `secret` in the error's text.
+pub(crate) fn redact_error(e: VadError, secret: Option<&str>) -> VadError {
+    let Some(secret) = secret.filter(|s| s.len() >= 4) else { return e };
+    let r = |m: String| m.replace(secret, "***");
+    match e {
+        VadError::Llm(m) => VadError::Llm(r(m)),
+        VadError::LlmAuthFailed(m) => VadError::LlmAuthFailed(r(m)),
+        VadError::LlmTimeout(m) => VadError::LlmTimeout(r(m)),
+        VadError::LlmRateLimited(m) => VadError::LlmRateLimited(r(m)),
+        VadError::NoNetwork(m) => VadError::NoNetwork(r(m)),
+        other => other,
     }
 }
 

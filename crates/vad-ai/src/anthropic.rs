@@ -62,7 +62,7 @@ impl AnthropicSummarizer {
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
             }));
-        let body = crate::http::execute(req, abort, self.retry)?;
+        let body = crate::http::execute(req, abort, self.retry, Some(self.api_key.expose()))?;
         // content is a list of blocks; join the text ones.
         let text: String = body["content"]
             .as_array()

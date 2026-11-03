@@ -15,6 +15,8 @@ pub mod secrets;
 mod quality_gate;
 pub mod summarizer;
 #[cfg(test)]
+mod m5b_tests;
+#[cfg(test)]
 mod test_http;
 pub mod translator;
 pub mod vad_detector;

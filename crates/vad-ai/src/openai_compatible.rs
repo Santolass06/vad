@@ -72,7 +72,7 @@ impl OpenAiCompatibleSummarizer {
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key.expose());
         }
-        let body = crate::http::execute(req, abort, self.retry)?;
+        let body = crate::http::execute(req, abort, self.retry, self.api_key.as_ref().map(|k| k.expose()))?;
         crate::http::non_empty(body["choices"][0]["message"]["content"].as_str(), "choices[0].message.content")
     }
 
@@ -87,6 +87,13 @@ impl OpenAiCompatibleSummarizer {
     #[allow(dead_code)]
     pub(crate) fn with_retry(mut self, retry: crate::http::RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Test hook: shorter request timeout.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(mut self, d: std::time::Duration) -> Self {
+        self.client = crate::http::client(d).expect("client");
         self
     }
 

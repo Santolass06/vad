@@ -25,3 +25,4 @@ keyring = { version = "3", default-features = false, features = ["sync-secret-se
 libc = "0.2"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }

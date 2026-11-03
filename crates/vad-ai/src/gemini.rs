@@ -67,7 +67,7 @@ impl GeminiSummarizer {
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
                 "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.2},
             }));
-        let body = crate::http::execute(req, abort, self.retry)?;
+        let body = crate::http::execute(req, abort, self.retry, Some(self.api_key.expose()))?;
         let text: String = body["candidates"][0]["content"]["parts"]
             .as_array()
             .map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect::<Vec<_>>().join(""))
