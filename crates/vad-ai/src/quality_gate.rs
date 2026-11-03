@@ -125,8 +125,18 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .collect();
         assert_eq!(corpus.len(), 100, "the gate needs exactly 100 segments");
-        let qwen = Arc::new(real_qwen(crate::llm_provider::DEFAULT_QWEN_MAX_OUTPUT_TOKENS).expect("env vars not set"));
-        let translator = LlmTranslator::new(qwen);
+        // Same gate for a custom endpoint (PLANO §4.1): with VAD_GATE_BASE_URL/VAD_GATE_MODEL
+        // set (key from VAD_CUSTOM_KEY, optional) the 100 segments go through that model
+        // instead of LocalQwen.
+        let backend: Arc<dyn crate::llm_provider::Summarizer> = match std::env::var("VAD_GATE_BASE_URL") {
+            Ok(base) => {
+                let model = std::env::var("VAD_GATE_MODEL").expect("VAD_GATE_MODEL required with VAD_GATE_BASE_URL");
+                let key = std::env::var("VAD_CUSTOM_KEY").ok().map(crate::secrets::Secret::new);
+                Arc::new(crate::openai_compatible::OpenAiCompatibleSummarizer::new(&base, &model, key).expect("endpoint"))
+            }
+            Err(_) => Arc::new(real_qwen(crate::llm_provider::DEFAULT_QWEN_MAX_OUTPUT_TOKENS).expect("env vars not set")),
+        };
+        let translator = LlmTranslator::new(backend);
         let segments: Vec<TranscriptionSegment> = corpus
             .iter()
             .enumerate()

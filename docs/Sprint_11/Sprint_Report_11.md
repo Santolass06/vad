@@ -18,7 +18,7 @@ Cliente `OpenAiCompatible`, gestão de segredos (keyring → env → memória de
 | 3. Keyring + env + memória de sessão | ✅ (`secrets.rs`), sem chave em `config.toml` |
 | 4. `LlmAuthFailed` na UI | ✅ texto «abre Definições → IA» |
 | 5. `settings_panel.rs` scaffold | ✅ compilado e testado, ❌ não visto no ecrã |
-| 6. Gate para endpoint personalizado | ✅ confirmação explícita ligada ao URL |
+| 6. Gate para endpoint personalizado | ⚠️ só uma **confirmação explícita** ligada ao URL, não o gate em si. O harness `gate_sprint10_translate_corpus` aceita agora `VAD_GATE_BASE_URL`/`VAD_GATE_MODEL`/`VAD_CUSTOM_KEY` para correr os mesmos 100 segmentos contra o endpoint personalizado; a revisão manual continua por fazer. |
 
 ## Critério de saída — cumprido?
 

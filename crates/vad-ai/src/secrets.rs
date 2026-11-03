@@ -83,11 +83,19 @@ pub trait SecretBackend: Send + Sync {
 }
 
 /// OS keyring through the Secret Service.
-pub struct KeyringBackend;
+pub struct KeyringBackend {
+    service: &'static str,
+}
+
+impl KeyringBackend {
+    pub fn new(service: &'static str) -> Self {
+        Self { service }
+    }
+}
 
 impl SecretBackend for KeyringBackend {
     fn get(&self, account: &str) -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(SERVICE, account).map_err(|e| e.to_string())?;
+        let entry = keyring::Entry::new(self.service, account).map_err(|e| e.to_string())?;
         match entry.get_password() {
             Ok(p) => Ok(Some(p)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -95,12 +103,12 @@ impl SecretBackend for KeyringBackend {
         }
     }
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
-        keyring::Entry::new(SERVICE, account)
+        keyring::Entry::new(self.service, account)
             .and_then(|e| e.set_password(value))
             .map_err(|e| e.to_string())
     }
     fn delete(&self, account: &str) -> Result<(), String> {
-        match keyring::Entry::new(SERVICE, account).and_then(|e| e.delete_credential()) {
+        match keyring::Entry::new(self.service, account).and_then(|e| e.delete_credential()) {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
@@ -117,7 +125,7 @@ pub struct SecretStore {
 
 impl SecretStore {
     pub fn system() -> Self {
-        Self::with(Box::new(KeyringBackend), Box::new(|k| std::env::var(k).ok()))
+        Self::with(Box::new(KeyringBackend::new(SERVICE)), Box::new(|k| std::env::var(k).ok()))
     }
 
     pub fn with(backend: Box<dyn SecretBackend>, env: EnvLookup) -> Self {
@@ -244,7 +252,8 @@ mod tests {
     /// exists, and `save` must report honestly where the key ended up.
     #[test]
     fn system_store_degrades_without_secret_service() {
-        let s = SecretStore::system();
+        // Separate service name: this test must never touch the user's real "vad" key.
+        let s = SecretStore::with(Box::new(KeyringBackend::new("vad-test")), Box::new(|_| None));
         let src = s.save(SecretSlot::Custom, "sk-probe-do-not-keep");
         assert!(matches!(src, KeySource::Keyring | KeySource::Session));
         assert_eq!(s.resolve(SecretSlot::Custom).unwrap().0.expose(), "sk-probe-do-not-keep");

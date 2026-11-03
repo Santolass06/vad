@@ -300,4 +300,18 @@ mod tests {
         ai.openai_base_url = "http://169.254.169.254/v1".into();
         assert!(build_from_config(&ai, &store).is_err());
     }
+
+    #[test]
+    fn exported_summary_badge_follows_the_provider_not_a_constant() {
+        use crate::summarizer::MapReduceSummarizer;
+        use crate::whisper::TranscriptionSegment;
+        let (base, _) = serve("200 OK", OK_BODY);
+        let local = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap();
+        let segs = [TranscriptionSegment { start_ms: 0, end_ms: 1000, text: "Bom dia.".into() }];
+        let sum = MapReduceSummarizer::new(Arc::new(local)).summarize(&segs, None::<fn(crate::summarizer::SummarizeProgress)>, None).unwrap();
+        assert_eq!(sum.privacy_badge, AiPrivacyBadge::Local, "loopback server");
+        // Non-loopback endpoint: construction does no I/O, so no server is needed.
+        let cloud = OpenAiCompatibleSummarizer::new("http://10.1.2.3:8080/v1", "m", None).unwrap();
+        assert_eq!(cloud.privacy_badge(), AiPrivacyBadge::Cloud);
+    }
 }

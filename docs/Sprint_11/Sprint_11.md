@@ -25,7 +25,8 @@ não resultou tem valor para quem vier depois.
 - `vad-core`: nova secção `[ai]` em `config.toml` (provider, base_url, modelo, confirmação) — sem qualquer segredo. Texto do `LlmAuthFailed` passou a «Chave inválida — abre Definições → IA…».
 - `vad-app/src/panels/settings_panel.rs` + separador «IA»/botão «⚙ IA»: escolha de provider, card OpenAI-compatible funcional, Anthropic/Gemini como placeholders. Keyring sempre em thread, resultado por canal; a chave digitada é movida para fora do campo no clique.
 - `WhisperPanel` usa o provider escolhido; o badge dos painéis de resumo/tradução (antes fixo em 🔒 Local) reflete agora o provider.
-- Verificação: `cargo clippy --workspace --all-targets -- -D warnings` limpo; `vad-ai` 63 + `vad-app` 37 testes verdes.
+- Verificação final (`cargo test --workspace`): `vad-ai` 64 (+10 ignorados), `vad-app` 37 (+1), `vad-audio-tools` 21, `vad-core` 35 aprovados + 1 falha pré-existente; clippy `-D warnings` limpo.
+- Revisão (advisor): o teste do keyring real usava o serviço `vad` e apagaria a chave do utilizador num desktop com Secret Service → agora usa o serviço `vad-test`. Confirmado que o badge exportado vem de `summarizer.privacy_badge()`; teste novo com `OpenAiCompatibleSummarizer`.
 - `vad-core::tests::test_seek_applies_only_after_file_loaded` falha neste container **com e sem** as minhas alterações (verificado com `git stash`): o mpv não carrega o ficheiro de teste aqui. Não relacionado.
 
 ## Desvios face ao Sprint_Planning_11.md
