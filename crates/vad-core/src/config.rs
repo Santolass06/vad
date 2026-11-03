@@ -211,6 +211,10 @@ pub enum AiProviderKind {
     Local,
     /// OpenAI or any OpenAI-compatible endpoint (Ollama, OpenRouter, self-hosted).
     OpenaiCompatible,
+    /// Anthropic Messages API.
+    Anthropic,
+    /// Google Gemini API.
+    Gemini,
 }
 
 fn default_openai_base_url() -> String {
@@ -219,6 +223,14 @@ fn default_openai_base_url() -> String {
 
 fn default_openai_model() -> String {
     "gpt-4o-mini".to_string()
+}
+
+fn default_anthropic_model() -> String {
+    "claude-haiku-5-5".to_string()
+}
+
+fn default_gemini_model() -> String {
+    "gemini-2.0-flash".to_string()
 }
 
 /// AI provider choice. **No secret ever lives here** (§4.2, §10.7): API keys go to the OS
@@ -231,6 +243,10 @@ pub struct AiConfig {
     pub openai_base_url: String,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
+    #[serde(default = "default_anthropic_model")]
+    pub anthropic_model: String,
+    #[serde(default = "default_gemini_model")]
+    pub gemini_model: String,
     /// Normalised custom `base_url` the user confirmed is not covered by the Sprint_10
     /// quality gate (§4.1). Changing the URL invalidates the confirmation.
     #[serde(default)]
@@ -243,6 +259,8 @@ impl Default for AiConfig {
             provider: AiProviderKind::Local,
             openai_base_url: default_openai_base_url(),
             openai_model: default_openai_model(),
+            anthropic_model: default_anthropic_model(),
+            gemini_model: default_gemini_model(),
             custom_endpoint_acknowledged: None,
         }
     }
@@ -390,7 +408,22 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(!toml_str.contains("api_key"));
         assert!(!toml_str.contains("secret"));
-        assert!(!toml_str.contains("anthropic"));
-        assert!(!toml_str.contains("gemini"));
+        assert!(!toml_str.contains("token"));
+        // Sprint_12: provider *model names* legitimately live in config; anything else that
+        // mentions a provider (a stray key or URL carrying one) is still a failure.
+        let stripped: String = toml_str
+            .lines()
+            .filter(|l| !l.starts_with("anthropic_model") && !l.starts_with("gemini_model"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!stripped.contains("anthropic"));
+        assert!(!stripped.contains("gemini"));
+        // Even with every field set, the serialised config holds no credential-shaped text.
+        let cfg = VadConfig {
+            ai: AiConfig { provider: AiProviderKind::Anthropic, ..AiConfig::default() },
+            ..VadConfig::default()
+        };
+        let all = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!all.contains("sk-") && !all.contains("AIza") && !all.to_lowercase().contains("bearer"));
     }
 }

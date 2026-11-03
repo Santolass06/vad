@@ -4,10 +4,9 @@
 //! speaks `POST {base_url}/chat/completions`. It is synchronous (blocking `reqwest`) and
 //! must run on a worker thread, never inside the egui `update()`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use url::Url;
 use vad_core::VadError;
 
@@ -17,7 +16,6 @@ use crate::secrets::Secret;
 
 pub const DEFAULT_CLOUD_CONTEXT_WINDOW: usize = 16_000;
 pub const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: usize = 1_024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct OpenAiCompatibleSummarizer {
     chat_url: String,
@@ -47,12 +45,7 @@ impl OpenAiCompatibleSummarizer {
         if model.trim().is_empty() {
             return Err(VadError::Llm("modelo não definido nas Definições → IA".into()));
         }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            // A redirect could carry the Authorization header to another host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| VadError::Llm(format!("cliente HTTP: {e}")))?;
+        let client = crate::http::client(crate::http::REQUEST_TIMEOUT)?;
         Ok(Self {
             chat_url: format!("{}/chat/completions", url.as_str().trim_end_matches('/')),
             model: model.trim().to_string(),
@@ -65,9 +58,6 @@ impl OpenAiCompatibleSummarizer {
     }
 
     fn chat(&self, system: &str, user: &str, abort: Option<&AtomicBool>) -> Result<String, VadError> {
-        if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
-            return Err(VadError::LlmCancelled);
-        }
         let mut req = self.client.post(&self.chat_url).json(&json!({
             "model": self.model,
             "messages": [
@@ -80,38 +70,13 @@ impl OpenAiCompatibleSummarizer {
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key.expose());
         }
-        let resp = req.send().map_err(|e| {
-            if e.is_timeout() {
-                VadError::LlmTimeout("o provider não respondeu a tempo".into())
-            } else {
-                // reqwest errors can embed the URL but never the headers.
-                VadError::Llm(format!("falha de ligação ao provider: {}", e.without_url()))
-            }
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Bodies are not echoed on auth errors: some providers repeat part of the key.
-            return Err(match status.as_u16() {
-                401 | 403 => VadError::LlmAuthFailed(format!("HTTP {status}")),
-                429 => VadError::LlmRateLimited("HTTP 429".into()),
-                _ => {
-                    let body = resp.text().unwrap_or_default();
-                    VadError::Llm(format!("HTTP {status}: {}", body.chars().take(200).collect::<String>()))
-                }
-            });
-        }
-        let body: Value = resp
-            .json()
-            .map_err(|e| VadError::Llm(format!("resposta do provider não é JSON válido: {e}")))?;
-        let text = body["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| VadError::Llm("resposta sem choices[0].message.content".into()))?
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            return Err(VadError::Llm("o provider devolveu texto vazio".into()));
-        }
-        Ok(text)
+        let body = crate::http::execute(req, abort)?;
+        crate::http::non_empty(body["choices"][0]["message"]["content"].as_str(), "choices[0].message.content")
+    }
+
+    /// Cheapest possible real round-trip, for "Testar ligação" (§4.23).
+    pub fn ping(&self) -> Result<(), VadError> {
+        self.chat("Responde apenas com a palavra: ok", "ping", None).map(|_| ())
     }
 }
 
@@ -163,40 +128,8 @@ pub fn build_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-
-    /// One-shot-per-request HTTP server. Returns `(base_url, captured_requests)`.
-    fn serve(status: &'static str, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let seen2 = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut s) = stream else { break };
-                let mut buf = vec![0u8; 16384];
-                let mut got = 0;
-                // Read headers, then the body announced by Content-Length.
-                loop {
-                    let n = s.read(&mut buf[got..]).unwrap_or(0);
-                    if n == 0 { break; }
-                    got += n;
-                    let text = String::from_utf8_lossy(&buf[..got]).to_string();
-                    if let Some(h) = text.find("\r\n\r\n") {
-                        let len = text[..h].to_lowercase().split("content-length:").nth(1)
-                            .and_then(|r| r.lines().next()).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
-                        if got >= h + 4 + len { break; }
-                    }
-                }
-                seen2.lock().unwrap().push(String::from_utf8_lossy(&buf[..got]).to_string());
-                let resp = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                let _ = s.write_all(resp.as_bytes());
-            }
-        });
-        (format!("http://127.0.0.1:{port}/v1"), seen)
-    }
+    use crate::test_http::serve;
+    use std::sync::Arc;
 
     const OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":" Good morning. "}}]}"#;
 

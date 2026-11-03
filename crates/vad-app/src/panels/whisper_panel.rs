@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use tracing::{error, info};
 use vad_ai::{
-    find_preset, build_openai_from_config, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
+    find_preset, build_cloud, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
     MapReduceSummarizer, MeetingSummary, MockSummarizer, ModelManager, ModelPreset, ModelSource,
     PcmAudio, SummarizeProgress, Summarizer, TargetLanguage, TranscriptionSegment, WhisperEngine,
     DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS, DEFAULT_QWEN_MODEL_FILENAME,
@@ -67,8 +67,8 @@ fn load_llm(
     }
     // Cloud/custom provider chosen in Definições → IA. Errors (bad key, unconfirmed
     // endpoint) are shown to the user; there is no silent switch to another provider.
-    if ai.provider == AiProviderKind::OpenaiCompatible {
-        return Ok(Arc::new(build_openai_from_config(ai, secrets)?));
+    if ai.provider != AiProviderKind::Local {
+        return build_cloud(ai, secrets);
     }
     let Some((model_path, tokenizer_path)) =
         manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME)
@@ -235,6 +235,7 @@ impl WhisperPanel {
     pub fn provider_badge(&self) -> AiPrivacyBadge {
         match self.ai_config.provider {
             AiProviderKind::Local => AiPrivacyBadge::Local,
+            AiProviderKind::Anthropic | AiProviderKind::Gemini => AiPrivacyBadge::Cloud,
             AiProviderKind::OpenaiCompatible => vad_ai::LlmProviderConfig::OpenAiCompatible {
                 base_url: self.ai_config.openai_base_url.clone(),
                 model: self.ai_config.openai_model.clone(),

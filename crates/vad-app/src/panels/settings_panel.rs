@@ -1,29 +1,59 @@
 //! Definições → IA (design `Settings.dc.html`, PLANO_VAD.md §4.2/§4.23).
 //!
-//! Sprint_11 scaffold: the OpenAI-compatible card works (endpoint, model, key); Anthropic and
-//! Gemini are visual placeholders until Sprint_12.
+//! Three provider cards (OpenAI-compatible, Anthropic, Gemini), each with its own key and a
+//! "Testar ligação" button. Testing and saving are separate steps: the test uses what is typed
+//! in the card (a draft) and persists nothing; "Aplicar" is what writes `AiConfig`.
 //!
-//! Keyring access is D-Bus and blocks, so it never runs inside `ui()`: every operation goes to
-//! a short-lived thread and its result comes back over a channel polled once per frame. The
-//! key typed by the user lives in `key_input` only until the click and is never stored in
-//! `AiConfig`/`config.toml`.
+//! Keyring access (D-Bus) and HTTP both block, so neither runs inside `ui()`: each goes to a
+//! short-lived thread and its result comes back over a channel polled once per frame. A typed
+//! key lives in `key_input` only until the click and is never stored in `AiConfig`.
 
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{self, Color32, RichText, Ui};
 use vad_ai::endpoint::{is_loopback, is_official_openai, validate_base_url};
-use vad_ai::{AiPrivacyBadge, KeySource, SecretSlot, SecretStore};
+use vad_ai::{diagnose, test_connection, AiPrivacyBadge, Draft, KeySource, Secret, SecretSlot, SecretStore};
 use vad_core::config::{AiConfig, AiProviderKind};
 
 use super::whisper_panel::render_privacy_badge;
 
-/// Result of a background keyring operation.
-enum KeyEvent {
-    Checked(SecretSlot, Option<KeySource>),
-    Saved(SecretSlot, KeySource),
-    Forgotten(SecretSlot),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Which {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+impl Which {
+    const ALL: [Which; 3] = [Which::OpenAi, Which::Anthropic, Which::Gemini];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI-compatible (OpenAI, Ollama, OpenRouter…)",
+            Self::Anthropic => "Anthropic Claude",
+            Self::Gemini => "Google Gemini",
+        }
+    }
+
+    fn kind(self) -> AiProviderKind {
+        match self {
+            Self::OpenAi => AiProviderKind::OpenaiCompatible,
+            Self::Anthropic => AiProviderKind::Anthropic,
+            Self::Gemini => AiProviderKind::Gemini,
+        }
+    }
+}
+
+enum Event {
+    KeyChecked(Which, SecretSlot, Option<KeySource>),
+    KeySaved(Which, SecretSlot, KeySource),
+    KeyForgotten(Which, SecretSlot),
+    /// `u64` is the card's edit generation when the test started: a result for fields the
+    /// user has since changed is stale and ignored.
+    TestDone(Which, u64, Result<u64, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,21 +64,44 @@ enum KeyState {
     Present(KeySource),
 }
 
-/// Emitted when `AiConfig` changed and must be saved and propagated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsAction {
-    ConfigChanged,
+/// The four explicit states of §4.23.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TestState {
+    Idle,
+    Testing,
+    Ok { ms: u64 },
+    Failed(String),
+}
+
+struct Card {
+    key_input: String,
+    key_state: KeyState,
+    key_slot: Option<SecretSlot>,
+    test: TestState,
+    /// Bumped whenever a field that affects the test changes.
+    generation: u64,
+}
+
+impl Card {
+    fn new() -> Self {
+        Self { key_input: String::new(), key_state: KeyState::Unknown, key_slot: None, test: TestState::Idle, generation: 0 }
+    }
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.test = TestState::Idle;
+    }
 }
 
 pub struct SettingsPanel {
     secrets: Arc<SecretStore>,
+    tx: Sender<Event>,
+    rx: Receiver<Event>,
     base_url_input: String,
-    model_input: String,
-    key_input: String,
+    openai_model_input: String,
+    anthropic_model_input: String,
+    gemini_model_input: String,
     endpoint_error: Option<String>,
-    key_state: KeyState,
-    key_slot: Option<SecretSlot>,
-    rx: Option<Receiver<KeyEvent>>,
+    cards: [Card; 3],
     synced: bool,
 }
 
@@ -63,7 +116,8 @@ pub fn apply_endpoint(ai: &mut AiConfig, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Which stored key a URL uses: official OpenAI has its own, anything else the custom one.
+/// Which stored key an OpenAI-compatible URL uses: official OpenAI has its own key,
+/// anything else the custom one.
 pub fn slot_for(base_url: &str) -> SecretSlot {
     match validate_base_url(base_url) {
         Ok(u) if is_official_openai(&u) => SecretSlot::OpenAi,
@@ -79,17 +133,23 @@ pub fn needs_confirmation(ai: &AiConfig) -> bool {
     }
 }
 
+fn idx(w: Which) -> usize {
+    Which::ALL.iter().position(|x| *x == w).unwrap_or(0)
+}
+
 impl SettingsPanel {
     pub fn new(secrets: Arc<SecretStore>) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             secrets,
+            tx,
+            rx,
             base_url_input: String::new(),
-            model_input: String::new(),
-            key_input: String::new(),
+            openai_model_input: String::new(),
+            anthropic_model_input: String::new(),
+            gemini_model_input: String::new(),
             endpoint_error: None,
-            key_state: KeyState::Unknown,
-            key_slot: None,
-            rx: None,
+            cards: [Card::new(), Card::new(), Card::new()],
             synced: false,
         }
     }
@@ -98,166 +158,250 @@ impl SettingsPanel {
         &self.secrets
     }
 
-    fn spawn(&mut self, job: impl FnOnce(&SecretStore) -> KeyEvent + Send + 'static) {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let secrets = Arc::clone(&self.secrets);
-        self.key_state = KeyState::Busy;
-        thread::spawn(move || {
-            let _ = tx.send(job(&secrets));
-        });
-        self.rx = Some(rx);
+    fn spawn(&self, job: impl FnOnce(&SecretStore, &Sender<Event>) + Send + 'static) {
+        let (secrets, tx) = (Arc::clone(&self.secrets), self.tx.clone());
+        thread::spawn(move || job(&secrets, &tx));
+    }
+
+    fn slot(&self, w: Which, ai: &AiConfig) -> SecretSlot {
+        match w {
+            Which::OpenAi => slot_for(&ai.openai_base_url),
+            Which::Anthropic => SecretSlot::Anthropic,
+            Which::Gemini => SecretSlot::Gemini,
+        }
     }
 
     fn poll(&mut self) {
-        let Some(rx) = &self.rx else { return };
-        match rx.try_recv() {
-            Ok(ev) => {
-                self.rx = None;
-                let (KeyEvent::Checked(slot, ..) | KeyEvent::Saved(slot, _) | KeyEvent::Forgotten(slot)) = ev;
-                // Result for a slot we no longer show (endpoint changed meanwhile): drop it
-                // and look the current slot up again.
-                if Some(slot) != self.key_slot {
-                    self.key_slot = None;
-                    self.key_state = KeyState::Unknown;
-                    return;
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                Event::KeyChecked(w, slot, src) => {
+                    let c = &mut self.cards[idx(w)];
+                    // Stale if the card moved to another slot meanwhile (endpoint changed).
+                    if c.key_slot == Some(slot) {
+                        c.key_state = src.map_or(KeyState::Absent, KeyState::Present);
+                    }
                 }
-                self.key_state = match ev {
-                    KeyEvent::Checked(_, Some(src)) | KeyEvent::Saved(_, src) => KeyState::Present(src),
-                    KeyEvent::Checked(_, None) | KeyEvent::Forgotten(_) => KeyState::Absent,
-                };
-            }
-            Err(TryRecvError::Empty) => {}
-            // The worker died (panic): do not leave the UI in "busy" forever.
-            Err(TryRecvError::Disconnected) => {
-                self.rx = None;
-                self.key_state = KeyState::Unknown;
+                Event::KeySaved(w, slot, src) => {
+                    let c = &mut self.cards[idx(w)];
+                    if c.key_slot == Some(slot) {
+                        c.key_state = KeyState::Present(src);
+                    }
+                }
+                Event::KeyForgotten(w, slot) => {
+                    let c = &mut self.cards[idx(w)];
+                    if c.key_slot == Some(slot) {
+                        c.key_state = KeyState::Absent;
+                    }
+                }
+                Event::TestDone(w, generation, res) => {
+                    let c = &mut self.cards[idx(w)];
+                    if c.generation == generation {
+                        c.test = match res {
+                            Ok(ms) => TestState::Ok { ms },
+                            Err(msg) => TestState::Failed(msg),
+                        };
+                    }
+                }
             }
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiConfig) -> Option<SettingsAction> {
-        let mut action = None;
+    fn draft(&self, w: Which) -> Draft {
+        match w {
+            Which::OpenAi => Draft::OpenAi { base_url: self.base_url_input.clone(), model: self.openai_model_input.clone() },
+            Which::Anthropic => Draft::Anthropic { model: self.anthropic_model_input.clone() },
+            Which::Gemini => Draft::Gemini { model: self.gemini_model_input.clone() },
+        }
+    }
+
+    /// Starts a connection test of the card's draft. The typed key wins; otherwise the stored
+    /// one is looked up (on the worker). Nothing is saved.
+    fn start_test(&mut self, w: Which, ai: &AiConfig) {
+        let slot = self.slot(w, ai);
+        let typed = self.cards[idx(w)].key_input.trim().to_string();
+        let generation = self.cards[idx(w)].generation;
+        self.cards[idx(w)].test = TestState::Testing;
+        let draft = self.draft(w);
+        self.spawn(move |secrets, tx| {
+            let key = if typed.is_empty() { secrets.resolve(slot).map(|(k, _)| k) } else { Some(Secret::new(typed)) };
+            let res = test_connection(&draft, key).map_err(|e| diagnose(&e));
+            let _ = tx.send(Event::TestDone(w, generation, res));
+        });
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiConfig) -> Option<()> {
+        let mut changed = false;
         if !self.synced {
             self.base_url_input = ai.openai_base_url.clone();
-            self.model_input = ai.openai_model.clone();
+            self.openai_model_input = ai.openai_model.clone();
+            self.anthropic_model_input = ai.anthropic_model.clone();
+            self.gemini_model_input = ai.gemini_model.clone();
             self.synced = true;
         }
         self.poll();
-        if self.rx.is_some() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        let busy = self.cards.iter().any(|c| c.test == TestState::Testing || c.key_state == KeyState::Busy);
+        if busy {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        // Look the key up (in the background) whenever the slot in use changes.
-        let slot = slot_for(&ai.openai_base_url);
-        if self.key_slot != Some(slot) && self.rx.is_none() {
-            self.key_slot = Some(slot);
-            self.spawn(move |s| KeyEvent::Checked(slot, s.resolve(slot).map(|(_, src)| src)));
+        // Look each card's key up (in the background) when first shown or when its slot changes.
+        for w in Which::ALL {
+            let slot = self.slot(w, ai);
+            if self.cards[idx(w)].key_slot != Some(slot) {
+                let c = &mut self.cards[idx(w)];
+                c.key_slot = Some(slot);
+                c.key_state = KeyState::Busy;
+                self.spawn(move |s, tx| {
+                    let _ = tx.send(Event::KeyChecked(w, slot, s.resolve(slot).map(|(_, src)| src)));
+                });
+            }
         }
 
         ui.label(RichText::new("IA — fornecedor de resumo e tradução").strong());
         ui.add_space(6.0);
-
-        // --- Provider choice ---
         let before = ai.provider;
         ui.radio_value(&mut ai.provider, AiProviderKind::Local, "🔒 Local (Qwen2.5 0.5B) — nada sai do PC");
-        ui.radio_value(&mut ai.provider, AiProviderKind::OpenaiCompatible, "OpenAI-compatible (OpenAI, Ollama, OpenRouter…)");
-        if ai.provider != before {
-            action = Some(SettingsAction::ConfigChanged);
+        for w in Which::ALL {
+            ui.radio_value(&mut ai.provider, w.kind(), w.title());
         }
+        changed |= ai.provider != before;
         ui.add_space(8.0);
 
-        // --- OpenAI-compatible card ---
+        for w in Which::ALL {
+            changed |= self.card(ui, w, ai);
+            ui.add_space(6.0);
+        }
+        changed.then_some(())
+    }
+
+    fn card(&mut self, ui: &mut Ui, w: Which, ai: &mut AiConfig) -> bool {
+        let mut changed = false;
+        let slot = self.slot(w, ai);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("OpenAI-compatible").strong());
-                let badge = match validate_base_url(&ai.openai_base_url) {
-                    Ok(u) if is_loopback(&u) => AiPrivacyBadge::Local,
+                ui.label(RichText::new(w.title()).strong());
+                let badge = match w {
+                    Which::OpenAi => match validate_base_url(&ai.openai_base_url) {
+                        Ok(u) if is_loopback(&u) => AiPrivacyBadge::Local,
+                        _ => AiPrivacyBadge::Cloud,
+                    },
                     _ => AiPrivacyBadge::Cloud,
                 };
                 render_privacy_badge(ui, badge);
             });
             ui.add_space(4.0);
-            ui.label("Endpoint (base_url)");
-            ui.add(egui::TextEdit::singleline(&mut self.base_url_input).desired_width(f32::INFINITY));
+
+            let mut edited = false;
+            if w == Which::OpenAi {
+                ui.label("Endpoint (base_url)");
+                edited |= ui.add(egui::TextEdit::singleline(&mut self.base_url_input).desired_width(f32::INFINITY)).changed();
+            }
             ui.label("Modelo");
-            ui.add(egui::TextEdit::singleline(&mut self.model_input).desired_width(f32::INFINITY));
-            if ui.button("Aplicar endpoint e modelo").clicked() {
-                match apply_endpoint(ai, &self.base_url_input) {
-                    Ok(()) => {
-                        self.base_url_input = ai.openai_base_url.clone();
-                        self.endpoint_error = None;
-                        let model = self.model_input.trim();
-                        if !model.is_empty() {
-                            ai.openai_model = model.to_string();
-                        }
-                        action = Some(SettingsAction::ConfigChanged);
-                    }
-                    Err(e) => self.endpoint_error = Some(e),
-                }
-            }
-            if let Some(err) = &self.endpoint_error {
-                ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+            let model = match w {
+                Which::OpenAi => &mut self.openai_model_input,
+                Which::Anthropic => &mut self.anthropic_model_input,
+                Which::Gemini => &mut self.gemini_model_input,
+            };
+            edited |= ui.add(egui::TextEdit::singleline(model).desired_width(f32::INFINITY)).changed();
+
+            ui.label("Chave de API (keyring do sistema, nunca em config.toml)");
+            edited |= ui
+                .add(egui::TextEdit::singleline(&mut self.cards[idx(w)].key_input).password(true).hint_text("sk-…").desired_width(f32::INFINITY))
+                .changed();
+            if edited {
+                self.cards[idx(w)].invalidate();
             }
 
-            // Custom endpoint: the Sprint_10 gate does not transfer to it (§4.1).
-            if needs_confirmation(ai) && validate_base_url(&ai.openai_base_url).is_ok() {
-                ui.add_space(4.0);
-                ui.colored_label(
-                    Color32::from_rgb(250, 204, 21),
-                    "⚠ Endpoint personalizado: a qualidade de resumo/tradução deste modelo não foi validada pelo VAD e o texto das transcrições é enviado para lá.",
-                );
-                let mut ack = false;
-                if ui.checkbox(&mut ack, "Percebo e quero usar este endpoint").changed() && ack {
-                    if let Ok(u) = validate_base_url(&ai.openai_base_url) {
-                        ai.custom_endpoint_acknowledged = Some(u.as_str().to_string());
-                        action = Some(SettingsAction::ConfigChanged);
-                    }
-                }
-            }
-
-            ui.add_space(6.0);
-            ui.label("Chave de API (guardada no keyring do sistema, nunca em config.toml)");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.key_input)
-                    .password(true)
-                    .hint_text("sk-…")
-                    .desired_width(f32::INFINITY),
-            );
             ui.horizontal(|ui| {
-                let busy = self.key_state == KeyState::Busy;
-                if ui.add_enabled(!busy && !self.key_input.trim().is_empty(), egui::Button::new("Guardar chave")).clicked() {
-                    // Moved out of the field at once: it must not linger in the widget.
-                    let key = std::mem::take(&mut self.key_input);
-                    self.spawn(move |s| KeyEvent::Saved(slot, s.save(slot, &key)));
+                let testing = self.cards[idx(w)].test == TestState::Testing;
+                if ui.add_enabled(!testing, egui::Button::new("Testar ligação")).clicked() {
+                    self.start_test(w, ai);
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Esquecer")).clicked() {
-                    self.spawn(move |s| {
+                let can_save = !self.cards[idx(w)].key_input.trim().is_empty();
+                if ui.add_enabled(can_save, egui::Button::new("Guardar chave")).clicked() {
+                    // Moved out of the field at once: it must not linger in the widget.
+                    let key = std::mem::take(&mut self.cards[idx(w)].key_input);
+                    self.cards[idx(w)].key_state = KeyState::Busy;
+                    self.spawn(move |s, tx| {
+                        let _ = tx.send(Event::KeySaved(w, slot, s.save(slot, &key)));
+                    });
+                }
+                if ui.button("Esquecer").clicked() {
+                    self.cards[idx(w)].key_state = KeyState::Busy;
+                    self.spawn(move |s, tx| {
                         s.forget(slot);
-                        KeyEvent::Forgotten(slot)
+                        let _ = tx.send(Event::KeyForgotten(w, slot));
                     });
                 }
             });
-            let (text, color) = match self.key_state {
-                KeyState::Unknown | KeyState::Busy => ("A verificar…".to_string(), Color32::GRAY),
-                KeyState::Absent => (
-                    "Sem chave. Define-a aqui ou na variável de ambiente VAD_OPENAI_KEY / VAD_CUSTOM_KEY.".to_string(),
-                    Color32::from_rgb(250, 204, 21),
-                ),
+
+            // Key status.
+            let (text, color) = match self.cards[idx(w)].key_state {
+                KeyState::Unknown | KeyState::Busy => ("A verificar a chave…".to_string(), Color32::GRAY),
+                KeyState::Absent => (format!("Sem chave. Define-a aqui ou em {}.", slot.env_var()), Color32::from_rgb(250, 204, 21)),
                 KeyState::Present(src) => (format!("Chave presente — {}", src.label()), Color32::from_rgb(74, 222, 128)),
             };
             ui.colored_label(color, text);
-        });
 
-        ui.add_space(8.0);
-        // --- Placeholders (Sprint_12) ---
-        for name in ["Anthropic Claude", "Google Gemini"] {
-            ui.add_enabled_ui(false, |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new(name).strong());
-                    ui.label("Disponível na próxima versão.");
-                });
-            });
-        }
-        action
+            // The four explicit states of "Testar ligação" (§4.23).
+            match &self.cards[idx(w)].test {
+                TestState::Idle => {
+                    ui.colored_label(Color32::GRAY, "Repouso — ainda não testada.");
+                }
+                TestState::Testing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("A testar…");
+                    });
+                }
+                TestState::Ok { ms } => {
+                    ui.colored_label(Color32::from_rgb(74, 222, 128), format!("✔ Ligação OK — {ms} ms"));
+                }
+                TestState::Failed(msg) => {
+                    ui.colored_label(Color32::from_rgb(239, 68, 68), format!("✖ {msg}"));
+                }
+            }
+
+            // "Aplicar" is the persisting step, distinct from testing.
+            if ui.button("Aplicar (gravar nas definições)").clicked() {
+                let mut ok = true;
+                match w {
+                    Which::OpenAi => match apply_endpoint(ai, &self.base_url_input) {
+                        Ok(()) => {
+                            self.base_url_input = ai.openai_base_url.clone();
+                            self.endpoint_error = None;
+                            ai.openai_model = self.openai_model_input.trim().to_string();
+                        }
+                        Err(e) => {
+                            self.endpoint_error = Some(e);
+                            ok = false;
+                        }
+                    },
+                    Which::Anthropic => ai.anthropic_model = self.anthropic_model_input.trim().to_string(),
+                    Which::Gemini => ai.gemini_model = self.gemini_model_input.trim().to_string(),
+                }
+                changed |= ok;
+            }
+            if w == Which::OpenAi {
+                if let Some(err) = &self.endpoint_error {
+                    ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+                }
+                // Custom endpoint: the Sprint_10 gate does not transfer to it (§4.1).
+                if needs_confirmation(ai) && validate_base_url(&ai.openai_base_url).is_ok() {
+                    ui.colored_label(
+                        Color32::from_rgb(250, 204, 21),
+                        "⚠ Endpoint personalizado: a qualidade de resumo/tradução deste modelo não foi validada pelo VAD e o texto das transcrições é enviado para lá.",
+                    );
+                    let mut ack = false;
+                    if ui.checkbox(&mut ack, "Percebo e quero usar este endpoint").changed() && ack {
+                        if let Ok(u) = validate_base_url(&ai.openai_base_url) {
+                            ai.custom_endpoint_acknowledged = Some(u.as_str().to_string());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        });
+        changed
     }
 }
 
@@ -302,18 +446,37 @@ mod tests {
     /// Settings must round-trip through config.toml without ever carrying a secret.
     #[test]
     fn ai_config_serialises_no_key_material() {
-        let toml = toml_like(&AiConfig::default());
-        assert!(toml.contains("openai_base_url") && !toml.to_lowercase().contains("key"), "{toml}");
-    }
-
-    fn toml_like(ai: &AiConfig) -> String {
-        let cfg = vad_core::VadConfig { ai: ai.clone(), ..Default::default() };
+        let cfg = vad_core::VadConfig::default();
         let dir = std::env::temp_dir().join(format!("vad-ai-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         cfg.save_to_path(&path).unwrap();
-        let out = std::fs::read_to_string(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(dir);
-        out
+        assert!(toml.contains("openai_base_url") && toml.contains("anthropic_model"), "{toml}");
+        assert!(!toml.to_lowercase().contains("key") && !toml.to_lowercase().contains("secret"), "{toml}");
+    }
+
+    /// Testing must never write the configuration (§4.23 known risk): a test of a draft leaves
+    /// `AiConfig` untouched, and a stale result for edited fields is discarded.
+    #[test]
+    fn test_result_is_discarded_when_the_fields_changed_meanwhile() {
+        let mut p = SettingsPanel::new(Arc::new(SecretStore::with(Box::new(NoKeyring), Box::new(|_| None))));
+        let gen_at_start = p.cards[0].generation;
+        p.cards[0].test = TestState::Testing;
+        p.cards[0].invalidate(); // user edited a field
+        p.tx.send(Event::TestDone(Which::OpenAi, gen_at_start, Ok(42))).unwrap();
+        p.poll();
+        assert_eq!(p.cards[0].test, TestState::Idle, "stale success must not show as current");
+        p.tx.send(Event::TestDone(Which::OpenAi, p.cards[0].generation, Err("x".into()))).unwrap();
+        p.poll();
+        assert_eq!(p.cards[0].test, TestState::Failed("x".into()));
+    }
+
+    struct NoKeyring;
+    impl vad_ai::secrets::SecretBackend for NoKeyring {
+        fn get(&self, _: &str) -> Result<Option<String>, String> { Ok(None) }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> { Err("no".into()) }
+        fn delete(&self, _: &str) -> Result<(), String> { Ok(()) }
     }
 }

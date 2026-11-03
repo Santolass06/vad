@@ -19,6 +19,8 @@ pub enum SecretSlot {
     OpenAi,
     /// Any custom / self-hosted OpenAI-compatible endpoint.
     Custom,
+    Anthropic,
+    Gemini,
 }
 
 impl SecretSlot {
@@ -26,6 +28,8 @@ impl SecretSlot {
         match self {
             Self::OpenAi => "VAD_OPENAI_KEY",
             Self::Custom => "VAD_CUSTOM_KEY",
+            Self::Anthropic => "VAD_ANTHROPIC_KEY",
+            Self::Gemini => "VAD_GEMINI_KEY",
         }
     }
 
@@ -33,6 +37,8 @@ impl SecretSlot {
         match self {
             Self::OpenAi => "openai",
             Self::Custom => "custom",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
         }
     }
 }

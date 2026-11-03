@@ -1,14 +1,20 @@
 //! VAD AI crate (Whisper, Audio Extraction, Model Management).
 
+pub mod anthropic;
 pub mod endpoint;
+pub mod gemini;
+pub(crate) mod http;
 pub mod extractor;
 pub mod llm_provider;
 pub mod model_manager;
 pub mod openai_compatible;
+pub mod provider;
 pub mod secrets;
 #[cfg(test)]
 mod quality_gate;
 pub mod summarizer;
+#[cfg(test)]
+mod test_http;
 pub mod translator;
 pub mod vad_detector;
 pub mod whisper;
@@ -22,6 +28,7 @@ pub use summarizer::{
     MapReduceSummarizer, MeetingSummary, PartialSummary, SummarizeProgress, TranscriptionChunk,
 };
 pub use openai_compatible::{build_from_config as build_openai_from_config, OpenAiCompatibleSummarizer};
+pub use provider::{build_cloud, diagnose, test_connection, Draft};
 pub use secrets::{KeySource, Secret, SecretSlot, SecretStore};
 pub use translator::{LlmTranslator, TargetLanguage};
 
