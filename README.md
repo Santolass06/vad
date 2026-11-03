@@ -10,8 +10,10 @@ interface, a camada de IA e as otimizações de aplicação (ver [`PLANO_VAD.md`
 
 ## Estado
 
-Em fase de planeamento. Ver [`PLANO_VAD.md`](./PLANO_VAD.md) para arquitetura, decisões
-tomadas e milestones.
+Em desenvolvimento ativo (Sprints 0–15 e 17 com código; os gates e verificações manuais
+pendentes estão nos relatórios em `docs/Sprint_*/`). Ver [`PLANO_VAD.md`](./PLANO_VAD.md) para
+arquitetura, decisões tomadas e milestones, [`PRIVACY.md`](./PRIVACY.md) para o que sai do PC e
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) para os avisos de terceiros.
 
 ## Licença
 

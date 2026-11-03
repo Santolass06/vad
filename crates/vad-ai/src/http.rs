@@ -161,7 +161,9 @@ pub(crate) fn execute(
                 let error = redact_error(f.error, secret);
                 let Some(next) = spare.filter(|_| f.retryable) else { return Err(error) };
                 let wait = policy.delay(tries, f.retry_after);
-                tracing::warn!("provider de IA: {} — nova tentativa em {} ms ({}/{})", error, wait.as_millis(), tries + 1, policy.max_retries);
+                // Only the error *kind* is logged: the message may carry up to 200 chars of the provider's
+                // body, and a provider can echo the prompt (transcript text) back.
+                tracing::warn!("provider de IA: {} — nova tentativa em {} ms ({}/{})", error.action().title, wait.as_millis(), tries + 1, policy.max_retries);
                 sleep_abortable(wait, abort)?;
                 tries += 1;
                 req = next;

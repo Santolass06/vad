@@ -169,8 +169,10 @@ mod tests {
         assert!(contrast(ON_ACCENT_TEXT, ACCENT) >= AA_TEXT);
     }
 
-    /// Every literal `Color32::from_rgb(..)` used as *text* in the sources (not the named
-    /// theme constants, tested above) must meet AA on the worst panel backdrop.
+    /// Every literal `Color32::from_rgb(..)` used as *text* **on the same source line** as
+    /// `colored_label`/`.color(`/`painter.text`/`RichText` (not the named theme constants, tested
+    /// above) must meet AA on the worst panel backdrop. Colors passed on a different line of a
+    /// multi-line call are NOT seen by this scan.
     #[test]
     fn hard_coded_text_colors_in_sources_meet_aa() {
         fn scan(dir: &std::path::Path, out: &mut Vec<String>) {

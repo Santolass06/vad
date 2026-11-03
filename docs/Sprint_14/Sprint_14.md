@@ -34,3 +34,7 @@ não resultou tem valor para quem vier depois.
 
 - Corpo de erro que repete a chave chegava ao log/erro (corrigido, ver acima).
 - Primeira tentativa de mutação não compilava e dava um falso «passou»; repetida com uma mutação válida antes de confiar no resultado.
+
+### 2026-11-03 (nota posterior, Sprint_17)
+
+- A auditoria da Sprint_17 achou que o aviso de retry e os `error!` da UI ainda podiam registar texto de transcrição citado por um corpo de erro do provider. Corrigido e coberto por teste novo (`transcript_text_never_reaches_the_log_even_if_the_provider_echoes_it`). O teste anti-leak desta sprint cobria **chaves**, não texto de transcrição.

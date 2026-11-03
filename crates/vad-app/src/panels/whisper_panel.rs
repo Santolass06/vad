@@ -459,7 +459,7 @@ impl WhisperPanel {
                         self.summarize_error = None;
                     }
                     Err(err) => {
-                        error!("Meeting summarization error: {}", err);
+                        error!("Meeting summarization failed (details withheld from the log: they may quote the transcript)");
                         self.summarize_error = Some(err);
                     }
                 }
@@ -485,7 +485,7 @@ impl WhisperPanel {
                         self.translation_error = None;
                     }
                     Err(err) => {
-                        error!("Translation error: {}", err);
+                        error!("Translation failed (details withheld from the log: they may quote the transcript)");
                         self.translation_error = Some(err);
                     }
                 }
@@ -1206,6 +1206,9 @@ impl WhisperPanel {
                 summary.fallback_note = note;
                 summary
             });
+            if let Err(e) = &res {
+                error!("Meeting summarization failed: {}", e.action().title);
+            }
             let _ = tx.send(res.map_err(|e| e.to_string()));
             *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
@@ -1343,6 +1346,9 @@ impl WhisperPanel {
                     Some(Arc::clone(&abort_flag)),
                 )
             });
+            if let Err(e) = &res {
+                error!("Translation failed: {}", e.action().title);
+            }
             let _ = tx.send(res.map_err(|e| e.to_string()));
             *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });

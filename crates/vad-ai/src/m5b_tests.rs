@@ -213,6 +213,26 @@ fn the_api_key_never_reaches_logs_errors_or_config() {
     assert!(!toml.contains("LEAKCANARY") && !toml.contains("sk-") && !toml.contains("AIza"));
 }
 
+/// Sprint_17 follow-up: transcript text must not reach the log either, even when a provider echoes
+/// the prompt back in an error body (which is also what the 4xx/5xx messages quote, up to 200 chars).
+#[test]
+fn transcript_text_never_reaches_the_log_even_if_the_provider_echoes_it() {
+    let sink = log_capture();
+    const TEXT_CANARY: &str = "TRANSCRIPTCANARY-4e1b9c07 decisão confidencial";
+    let echo: &'static str = Box::leak(format!("bad request: could not parse {TEXT_CANARY}").into_boxed_str());
+    for (status, label) in [("500 Internal Server Error", "5xx (retried, logged)"), ("400 Bad Request", "4xx")] {
+        let (base, _) = serve_seq(&[(status, echo, "")]);
+        for (name, s) in providers(&base, Duration::from_secs(5)) {
+            for r in [s.summarize_chunk(TEXT_CANARY, false, None), s.translate_text(TEXT_CANARY, "Português", "Inglês", None)] {
+                assert!(r.is_err(), "{name}/{label}");
+            }
+        }
+    }
+    let log = String::from_utf8_lossy(&sink.0.lock().unwrap()).to_string();
+    assert!(log.contains("nova tentativa"), "retry warnings must have been exercised");
+    assert!(!log.contains("TRANSCRIPTCANARY"), "TRANSCRIPT TEXT LEAKED INTO THE LOG:\n{log}");
+}
+
 /// The grep of §10.7 as a reusable check: scans files on disk for key-shaped strings.
 #[test]
 fn key_shaped_strings_are_detected_by_the_scanner_used_on_real_files() {
