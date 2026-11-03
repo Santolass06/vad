@@ -59,7 +59,7 @@ impl VideoPanel {
     pub fn ui(&mut self, ui: &mut Ui, player: &Player) {
         self.sync_from_player(player);
 
-        let accent = Color32::from_rgb(139, 124, 246);
+        let accent = crate::theme::ACCENT;
         let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 15);
         let active_bg = accent;
 
@@ -68,8 +68,8 @@ impl VideoPanel {
         // --- SECTION: PROPORÇÃO (Aspect Ratio) ---
         ui.vertical(|ui| {
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                egui::RichText::new("PROPORÇÃO").size(11.0).strong(),
+                crate::theme::TEXT_SECONDARY,
+                egui::RichText::new("PROPORÇÃO").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
             ui.add_space(4.0);
 
@@ -91,7 +91,7 @@ impl VideoPanel {
                     };
 
                     let btn_text = egui::RichText::new(label)
-                        .size(11.5)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .strong()
                         .color(if is_active { Color32::from_rgb(20, 20, 28) } else { Color32::from_rgb(200, 205, 225) });
 
@@ -110,8 +110,8 @@ impl VideoPanel {
         // --- SECTION: ROTAÇÃO ---
         ui.vertical(|ui| {
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                egui::RichText::new("ROTAÇÃO").size(11.0).strong(),
+                crate::theme::TEXT_SECONDARY,
+                egui::RichText::new("ROTAÇÃO").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
             ui.add_space(4.0);
 
@@ -123,7 +123,7 @@ impl VideoPanel {
                     let is_active = current_rotate == deg;
                     let label = format!("{deg}°");
                     let btn_text = egui::RichText::new(label)
-                        .size(11.5)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .strong()
                         .color(if is_active { Color32::from_rgb(20, 20, 28) } else { Color32::from_rgb(200, 205, 225) });
 
@@ -142,8 +142,8 @@ impl VideoPanel {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    Color32::from_rgb(150, 155, 175),
-                    egui::RichText::new("ENQUADRAMENTO (CROP/PANSCAN)").size(11.0).strong(),
+                    crate::theme::TEXT_SECONDARY,
+                    egui::RichText::new("ENQUADRAMENTO (CROP/PANSCAN)").size(crate::theme::MIN_TEXT_SIZE).strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.monospace(format!("{:.0}%", self.panscan * 100.0));
@@ -171,8 +171,8 @@ impl VideoPanel {
         // --- SECTION: SINCRONIZAÇÃO (Delays) ---
         ui.vertical(|ui| {
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                egui::RichText::new("SINCRONIZAÇÃO").size(11.0).strong(),
+                crate::theme::TEXT_SECONDARY,
+                egui::RichText::new("SINCRONIZAÇÃO").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
             ui.add_space(4.0);
 
@@ -215,8 +215,8 @@ impl VideoPanel {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    Color32::from_rgb(150, 155, 175),
-                    egui::RichText::new("COR").size(11.0).strong(),
+                    crate::theme::TEXT_SECONDARY,
+                    egui::RichText::new("COR").size(crate::theme::MIN_TEXT_SIZE).strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Repor").clicked() {

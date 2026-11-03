@@ -34,7 +34,7 @@ impl PlaylistPanel {
         total_duration: f64,
     ) -> Option<PlaylistAction> {
         let mut action = None;
-        let accent = Color32::from_rgb(139, 124, 246);
+        let accent = crate::theme::ACCENT;
         let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
 
         ui.spacing_mut().item_spacing = vec2(0.0, 10.0);
@@ -50,7 +50,7 @@ impl PlaylistPanel {
             };
             let shuffle_btn = egui::Button::new(
                 egui::RichText::new(shuffle_text)
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
                     .color(if is_shuffle {
                         Color32::from_rgb(20, 20, 28)
@@ -74,7 +74,7 @@ impl PlaylistPanel {
             let is_rep_active = playlist.repeat() != RepeatMode::Off;
             let rep_btn = egui::Button::new(
                 egui::RichText::new(rep_label)
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
                     .color(if is_rep_active {
                         accent
@@ -192,7 +192,7 @@ impl PlaylistPanel {
                             pos2(rect.right() - 26.0, rect.center().y),
                             egui::Align2::RIGHT_CENTER,
                             Self::format_duration(dur),
-                            egui::FontId::monospace(10.5),
+                            egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                             Color32::from_rgb(140, 145, 165),
                         );
                     }
@@ -210,13 +210,13 @@ impl PlaylistPanel {
                     let del_color = if del_resp.hovered() {
                         Color32::from_rgb(240, 90, 90)
                     } else {
-                        Color32::from_rgb(120, 125, 140)
+                        crate::theme::TEXT_MUTED
                     };
                     painter.text(
                         del_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "✕",
-                        egui::FontId::monospace(11.0),
+                        egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                         del_color,
                     );
                     if del_resp.clicked() {
@@ -257,7 +257,7 @@ impl PlaylistPanel {
                 pos2(rect.left() + 10.0, rect.top() + 10.0),
                 egui::Align2::LEFT_TOP,
                 "A TOCAR AGORA",
-                egui::FontId::monospace(9.5),
+                egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                 Color32::from_rgb(140, 145, 165),
             );
 
@@ -279,8 +279,8 @@ impl PlaylistPanel {
                 pos2(rect.left() + 10.0, rect.top() + 42.0),
                 egui::Align2::LEFT_TOP,
                 time_str,
-                egui::FontId::monospace(10.5),
-                Color32::from_rgb(160, 165, 185),
+                egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
+                crate::theme::TEXT_MUTED,
             );
         }
 

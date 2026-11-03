@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui::{self, Color32, RichText, Ui};
+use eframe::egui::{self, RichText, Ui};
 use vad_ai::endpoint::{is_loopback, is_official_openai, validate_base_url};
 use vad_ai::{diagnose, test_connection, AiPrivacyBadge, Draft, KeySource, Secret, SecretSlot, SecretStore};
 use vad_core::config::{AiConfig, AiProviderKind};
@@ -30,9 +30,19 @@ enum Which {
 impl Which {
     const ALL: [Which; 3] = [Which::OpenAi, Which::Anthropic, Which::Gemini];
 
+    /// Long name for the provider radio list (wraps).
     fn title(self) -> &'static str {
         match self {
             Self::OpenAi => "OpenAI-compatible (OpenAI, Ollama, OpenRouter…)",
+            Self::Anthropic => "Anthropic Claude",
+            Self::Gemini => "Google Gemini",
+        }
+    }
+
+    /// Short name for the card header, which also holds the privacy badge on one row.
+    fn short(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI-compatible",
             Self::Anthropic => "Anthropic Claude",
             Self::Gemini => "Google Gemini",
         }
@@ -256,6 +266,9 @@ impl SettingsPanel {
             }
         }
 
+        // The side panel is a fixed 340 px: nothing here may ask for more, or the panel is
+        // pushed past the window edge (seen on screen in Sprint_15).
+        ui.set_max_width(ui.available_width());
         ui.label(RichText::new("IA — fornecedor de resumo e tradução").strong());
         ui.add_space(6.0);
         let before = ai.provider;
@@ -277,8 +290,9 @@ impl SettingsPanel {
         let mut changed = false;
         let slot = self.slot(w, ai);
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(w.title()).strong());
+                ui.label(RichText::new(w.short()).strong());
                 let badge = match w {
                     Which::OpenAi => match validate_base_url(&ai.openai_base_url) {
                         Ok(u) if is_loopback(&u) => AiPrivacyBadge::Local,
@@ -293,7 +307,7 @@ impl SettingsPanel {
             let mut edited = false;
             if w == Which::OpenAi {
                 ui.label("Endpoint (base_url)");
-                edited |= ui.add(egui::TextEdit::singleline(&mut self.base_url_input).desired_width(f32::INFINITY)).changed();
+                edited |= ui.add(egui::TextEdit::singleline(&mut self.base_url_input).desired_width(ui.available_width())).changed();
             }
             ui.label("Modelo");
             let model = match w {
@@ -301,11 +315,11 @@ impl SettingsPanel {
                 Which::Anthropic => &mut self.anthropic_model_input,
                 Which::Gemini => &mut self.gemini_model_input,
             };
-            edited |= ui.add(egui::TextEdit::singleline(model).desired_width(f32::INFINITY)).changed();
+            edited |= ui.add(egui::TextEdit::singleline(model).desired_width(ui.available_width())).changed();
 
-            ui.label("Chave de API (keyring do sistema, nunca em config.toml)");
+            ui.label("Chave de API (guardada no keyring, nunca em config.toml)");
             edited |= ui
-                .add(egui::TextEdit::singleline(&mut self.cards[idx(w)].key_input).password(true).hint_text("sk-…").desired_width(f32::INFINITY))
+                .add(egui::TextEdit::singleline(&mut self.cards[idx(w)].key_input).password(true).hint_text("sk-…").desired_width(ui.available_width()))
                 .changed();
             if edited {
                 self.cards[idx(w)].invalidate();
@@ -336,16 +350,16 @@ impl SettingsPanel {
 
             // Key status.
             let (text, color) = match self.cards[idx(w)].key_state {
-                KeyState::Unknown | KeyState::Busy => ("A verificar a chave…".to_string(), Color32::GRAY),
-                KeyState::Absent => (format!("Sem chave. Define-a aqui ou em {}.", slot.env_var()), Color32::from_rgb(250, 204, 21)),
-                KeyState::Present(src) => (format!("Chave presente — {}", src.label()), Color32::from_rgb(74, 222, 128)),
+                KeyState::Unknown | KeyState::Busy => ("A verificar a chave…".to_string(), crate::theme::TEXT_MUTED),
+                KeyState::Absent => (format!("Sem chave. Define-a aqui ou em {}.", slot.env_var()), crate::theme::WARN),
+                KeyState::Present(src) => (format!("Chave presente — {}", src.label()), crate::theme::OK),
             };
             ui.colored_label(color, text);
 
             // The four explicit states of "Testar ligação" (§4.23).
             match &self.cards[idx(w)].test {
                 TestState::Idle => {
-                    ui.colored_label(Color32::GRAY, "Repouso — ainda não testada.");
+                    ui.colored_label(crate::theme::TEXT_MUTED, "Repouso — ainda não testada.");
                 }
                 TestState::Testing => {
                     ui.horizontal(|ui| {
@@ -354,10 +368,10 @@ impl SettingsPanel {
                     });
                 }
                 TestState::Ok { ms } => {
-                    ui.colored_label(Color32::from_rgb(74, 222, 128), format!("✔ Ligação OK — {ms} ms"));
+                    ui.colored_label(crate::theme::OK, format!("✔ Ligação OK — {ms} ms"));
                 }
                 TestState::Failed(msg) => {
-                    ui.colored_label(Color32::from_rgb(239, 68, 68), format!("✖ {msg}"));
+                    ui.colored_label(crate::theme::ERROR, format!("✖ {msg}"));
                 }
             }
 
@@ -383,12 +397,12 @@ impl SettingsPanel {
             }
             if w == Which::OpenAi {
                 if let Some(err) = &self.endpoint_error {
-                    ui.colored_label(Color32::from_rgb(239, 68, 68), err);
+                    ui.colored_label(crate::theme::ERROR, err);
                 }
                 // Custom endpoint: the Sprint_10 gate does not transfer to it (§4.1).
                 if needs_confirmation(ai) && validate_base_url(&ai.openai_base_url).is_ok() {
                     ui.colored_label(
-                        Color32::from_rgb(250, 204, 21),
+                        crate::theme::WARN,
                         "⚠ Endpoint personalizado: a qualidade de resumo/tradução deste modelo não foi validada pelo VAD e o texto das transcrições é enviado para lá.",
                     );
                     let mut ack = false;

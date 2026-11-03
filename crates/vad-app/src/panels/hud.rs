@@ -141,7 +141,7 @@ impl HudPanel {
             track_rect.min,
             pos2(track_rect.left() + filled_w, track_rect.max.y),
         );
-        let accent_color = Color32::from_rgb(139, 124, 246);
+        let accent_color = crate::theme::ACCENT;
         painter.rect_filled(filled_rect, CornerRadius::same(radius_u8), accent_color);
 
         // Scrubber thumb handle (16px diameter when dragged, 12px when hovered)
@@ -222,7 +222,7 @@ impl HudPanel {
             painter.circle_stroke(
                 center,
                 radius,
-                Stroke::new(1.0, Color32::from_rgb(139, 124, 246)),
+                Stroke::new(1.0, crate::theme::ACCENT),
             );
         }
 
@@ -321,7 +321,7 @@ impl HudPanel {
         // Optional feedback notification banner
         if let Some((ref text, ref time)) = self.notification {
             if time.elapsed() < Duration::from_secs(3) {
-                child_ui.colored_label(Color32::from_rgb(139, 124, 246), text);
+                child_ui.colored_label(crate::theme::ACCENT, text);
             }
         }
 
@@ -381,7 +381,7 @@ impl HudPanel {
             let play_btn = egui::Button::new(
                 egui::RichText::new(play_btn_text)
                     .strong()
-                    .color(if is_paused { Color32::WHITE } else { Color32::from_rgb(139, 124, 246) }),
+                    .color(if is_paused { Color32::WHITE } else { crate::theme::ACCENT }),
             );
             if ui.add(play_btn).clicked() {
                 let _ = player.toggle_pause();

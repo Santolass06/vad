@@ -94,7 +94,7 @@ impl AudioPanel {
     pub fn ui(&mut self, ui: &mut Ui, player: &Player) {
         self.refresh_devices(player);
 
-        let accent = Color32::from_rgb(139, 124, 246);
+        let accent = crate::theme::ACCENT;
         let inactive_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
 
         ui.spacing_mut().item_spacing = vec2(0.0, 14.0);
@@ -103,8 +103,8 @@ impl AudioPanel {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    Color32::from_rgb(150, 155, 175),
-                    egui::RichText::new("PREDEFINIÇÃO").size(11.0).strong(),
+                    crate::theme::TEXT_SECONDARY,
+                    egui::RichText::new("PREDEFINIÇÃO").size(crate::theme::MIN_TEXT_SIZE).strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Repor").clicked() {
@@ -120,7 +120,7 @@ impl AudioPanel {
                 for (i, &p) in presets.iter().enumerate() {
                     let is_active = self.active_preset == p;
                     let btn_text = egui::RichText::new(p)
-                        .size(11.0)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .strong()
                         .color(if is_active {
                             Color32::from_rgb(20, 20, 28)
@@ -143,8 +143,8 @@ impl AudioPanel {
         // --- SECTION: EQUALIZADOR DE 10 BANDAS (Curva Contínua e 0 dB Baseline) ---
         ui.vertical(|ui| {
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                egui::RichText::new("EQUALIZADOR GRÁFICO (10 BANDAS)").size(11.0).strong(),
+                crate::theme::TEXT_SECONDARY,
+                egui::RichText::new("EQUALIZADOR GRÁFICO (10 BANDAS)").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
             ui.add_space(6.0);
 
@@ -186,7 +186,7 @@ impl AudioPanel {
                 pos2(rect.right() - 8.0, baseline_y),
                 egui::Align2::RIGHT_CENTER,
                 "0 dB",
-                egui::FontId::monospace(9.0),
+                egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                 Color32::from_rgba_unmultiplied(255, 255, 255, 60),
             );
 
@@ -226,7 +226,7 @@ impl AudioPanel {
                     pos2(x, rect.bottom() - 10.0),
                     egui::Align2::CENTER_CENTER,
                     Self::FREQ_LABELS[i],
-                    egui::FontId::monospace(10.0),
+                    egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                     Color32::from_rgb(140, 145, 165),
                 );
 
@@ -247,7 +247,7 @@ impl AudioPanel {
                     pos2(x, rect.top() + 10.0),
                     egui::Align2::CENTER_CENTER,
                     gain_str,
-                    egui::FontId::monospace(9.5),
+                    egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                     val_color,
                 );
 
@@ -331,14 +331,14 @@ impl AudioPanel {
             }
         });
         if let Some(ref err) = self.filter_error {
-            ui.colored_label(Color32::from_rgb(239, 68, 68), egui::RichText::new(err).size(10.5));
+            ui.colored_label(crate::theme::ERROR, egui::RichText::new(err).size(crate::theme::MIN_TEXT_SIZE));
         }
 
         // --- SECTION: DISPOSITIVO DE SAÍDA ---
         ui.vertical(|ui| {
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                egui::RichText::new("DISPOSITIVO DE SAÍDA").size(11.0).strong(),
+                crate::theme::TEXT_SECONDARY,
+                egui::RichText::new("DISPOSITIVO DE SAÍDA").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
             ui.add_space(2.0);
 

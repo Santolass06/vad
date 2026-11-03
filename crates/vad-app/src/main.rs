@@ -2,11 +2,19 @@ mod app;
 mod panels;
 mod probe;
 mod render;
+mod theme;
 
 #[cfg(target_os = "linux")]
 mod mpris;
 #[cfg(target_os = "linux")]
 mod screensaver;
+#[cfg(target_os = "linux")]
+mod tray;
+
+// mimalloc as global allocator (PLANO_VAD.md §5, Sprint_15). Not `panic = "abort"`: a handled
+// error must not crash the app (M1 criterion).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use app::VadApp;
 use clap::Parser;

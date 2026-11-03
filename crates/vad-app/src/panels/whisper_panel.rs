@@ -22,11 +22,11 @@ pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
     let (bg, text_color) = match badge {
         AiPrivacyBadge::Local => (
             Color32::from_rgba_unmultiplied(34, 197, 94, 40),
-            Color32::from_rgb(74, 222, 128),
+            crate::theme::OK,
         ),
         AiPrivacyBadge::Cloud => (
             Color32::from_rgba_unmultiplied(234, 179, 8, 40),
-            Color32::from_rgb(250, 204, 21),
+            crate::theme::WARN,
         ),
     };
 
@@ -35,7 +35,7 @@ pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(badge.label()).size(10.5).color(text_color).strong());
+            ui.label(RichText::new(badge.label()).size(crate::theme::MIN_TEXT_SIZE).color(text_color).strong());
         })
         .response
         .on_hover_text(badge.tooltip());
@@ -418,7 +418,7 @@ impl WhisperPanel {
         current_audio: Option<&PcmAudio>,
     ) -> Option<WhisperAction> {
         let mut action = None;
-        let accent = Color32::from_rgb(139, 124, 246);
+        let accent = crate::theme::ACCENT;
 
         // Non-blocking poll for transcription completion
         if let Some(ref rx) = self.transcription_rx {
@@ -502,9 +502,9 @@ impl WhisperPanel {
             // --- SECTION 1: Model Preset Selection ---
             ui.label(
                 RichText::new("MODELO")
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
-                    .color(Color32::from_rgb(160, 165, 185)),
+                    .color(crate::theme::TEXT_MUTED),
             );
             ui.add_space(4.0);
 
@@ -530,9 +530,9 @@ impl WhisperPanel {
             // --- SECTION 2: Storage Mode Selection & Tooltips (§4.13) ---
             ui.label(
                 RichText::new("ARMAZENAMENTO")
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
-                    .color(Color32::from_rgb(160, 165, 185)),
+                    .color(crate::theme::TEXT_MUTED),
             );
             ui.add_space(4.0);
 
@@ -564,7 +564,7 @@ impl WhisperPanel {
             };
             ui.label(
                 RichText::new(note_text)
-                    .size(10.5)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .color(Color32::from_rgb(140, 145, 165)),
             );
 
@@ -616,7 +616,7 @@ impl WhisperPanel {
 
             let load_error = self.download_error.lock().ok().and_then(|g| g.clone());
             if let Some(err) = load_error {
-                ui.colored_label(Color32::RED, format!("Erro: {err}"));
+                ui.colored_label(crate::theme::ERROR, format!("Erro: {err}"));
             }
 
             ui.separator();
@@ -625,16 +625,16 @@ impl WhisperPanel {
             // --- SECTION 4: Models on Disk List (§4.13, Meeting.dc.html) ---
             ui.label(
                 RichText::new("MODELOS NO DISCO")
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
-                    .color(Color32::from_rgb(160, 165, 185)),
+                    .color(crate::theme::TEXT_MUTED),
             );
             ui.add_space(4.0);
 
             if self.cached_disk_models.is_empty() {
                 ui.label(
                     RichText::new("Nenhum modelo guardado em disco.")
-                        .size(11.0)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .italics()
                         .color(Color32::from_rgb(130, 135, 155)),
                 );
@@ -643,7 +643,7 @@ impl WhisperPanel {
                 let mut to_activate = None;
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
+                    .fill(crate::theme::CARD_FILL)
                     .corner_radius(8.0)
                     .inner_margin(6.0)
                     .show(ui, |ui| {
@@ -694,9 +694,9 @@ impl WhisperPanel {
             // --- SECTION 5: Transcription ---
             ui.label(
                 RichText::new("TRANSCRIÇÃO")
-                    .size(11.0)
+                    .size(crate::theme::MIN_TEXT_SIZE)
                     .strong()
-                    .color(Color32::from_rgb(160, 165, 185)),
+                    .color(crate::theme::TEXT_MUTED),
             );
             ui.add_space(4.0);
 
@@ -730,7 +730,7 @@ impl WhisperPanel {
             }
 
             if let Some(ref err) = self.transcription_error {
-                ui.colored_label(Color32::RED, format!("Erro de transcrição: {err}"));
+                ui.colored_label(crate::theme::ERROR, format!("Erro de transcrição: {err}"));
             }
 
             // Results List
@@ -791,9 +791,9 @@ impl WhisperPanel {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("RESUMO DA REUNIÃO")
-                        .size(11.0)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .strong()
-                        .color(Color32::from_rgb(160, 165, 185)),
+                        .color(crate::theme::TEXT_MUTED),
                 );
                 render_privacy_badge(ui, self.provider_badge());
             });
@@ -819,7 +819,7 @@ impl WhisperPanel {
                 ui.add_space(2.0);
 
                 if ui
-                    .button(RichText::new("✕ Cancelar").color(Color32::from_rgb(239, 68, 68)))
+                    .button(RichText::new("✕ Cancelar").color(crate::theme::ERROR))
                     .on_hover_text("Cancelar a geração do resumo")
                     .clicked()
                 {
@@ -840,24 +840,24 @@ impl WhisperPanel {
             }
 
             if let Some(ref err) = self.summarize_error {
-                ui.colored_label(Color32::RED, format!("Erro no resumo: {err}"));
+                ui.colored_label(crate::theme::ERROR, format!("Erro no resumo: {err}"));
             }
 
             if let Some(note) = self.meeting_summary.as_ref().and_then(|s| s.fallback_note.as_ref()) {
-                ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+                ui.colored_label(crate::theme::WARN, format!("⚠ {note}"));
             }
             if let Some(ref summary) = self.meeting_summary {
                 ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
+                    .fill(crate::theme::CARD_FILL)
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!("{} blocos processados ({:.1}s)", summary.total_chunks, summary.duration_seconds))
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(160, 165, 185)),
+                                    .size(crate::theme::MIN_TEXT_SIZE)
+                                    .color(crate::theme::TEXT_MUTED),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("📋 Copiar").clicked() {
@@ -869,7 +869,7 @@ impl WhisperPanel {
                         egui::ScrollArea::vertical()
                             .max_height(160.0)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&summary.markdown).size(11.5));
+                                ui.label(RichText::new(&summary.markdown).size(crate::theme::MIN_TEXT_SIZE));
                             });
                     });
             }
@@ -881,9 +881,9 @@ impl WhisperPanel {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("TRADUÇÃO MULTI-IDIOMA")
-                        .size(11.0)
+                        .size(crate::theme::MIN_TEXT_SIZE)
                         .strong()
-                        .color(Color32::from_rgb(160, 165, 185)),
+                        .color(crate::theme::TEXT_MUTED),
                 );
                 render_privacy_badge(ui, self.provider_badge());
             });
@@ -916,7 +916,7 @@ impl WhisperPanel {
                 ui.add(egui::ProgressBar::new(prog.0 as f32 / prog.1 as f32).animate(true));
 
                 if ui
-                    .button(RichText::new("✕ Cancelar").color(Color32::from_rgb(239, 68, 68)))
+                    .button(RichText::new("✕ Cancelar").color(crate::theme::ERROR))
                     .on_hover_text("Cancelar tradução")
                     .clicked()
                 {
@@ -938,11 +938,11 @@ impl WhisperPanel {
             }
 
             if let Some(ref err) = self.translation_error {
-                ui.colored_label(Color32::RED, format!("Erro de tradução: {err}"));
+                ui.colored_label(crate::theme::ERROR, format!("Erro de tradução: {err}"));
             }
 
             if let Some(ref note) = self.translation_fallback_note {
-                ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+                ui.colored_label(crate::theme::WARN, format!("⚠ {note}"));
             }
             if let Some(ref trans_segs) = self.translated_segments {
                 ui.add_space(2.0);
@@ -952,14 +952,14 @@ impl WhisperPanel {
                 );
                 ui.label(
                     RichText::new(format!("{} segmentos traduzidos disponíveis", trans_segs.len()))
-                        .size(11.0)
-                        .color(Color32::from_rgb(160, 165, 185)),
+                        .size(crate::theme::MIN_TEXT_SIZE)
+                        .color(crate::theme::TEXT_MUTED),
                 );
             }
 
             if let Some((ref msg, instant)) = self.export_notification {
                 if instant.elapsed().as_secs() < 6 {
-                    let color = if msg.starts_with("Falha") { Color32::RED } else { Color32::GREEN };
+                    let color = if msg.starts_with("Falha") { crate::theme::ERROR } else { crate::theme::OK };
                     ui.colored_label(color, msg);
                 }
             }
@@ -1237,7 +1237,7 @@ impl WhisperPanel {
             }
         }
         if let Some(err) = self.llm_download_error.lock().ok().and_then(|g| g.clone()) {
-            ui.colored_label(Color32::RED, format!("Erro ao descarregar: {err}"));
+            ui.colored_label(crate::theme::ERROR, format!("Erro ao descarregar: {err}"));
         }
         false
     }

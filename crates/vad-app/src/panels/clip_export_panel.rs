@@ -254,7 +254,7 @@ impl ClipExportPanel {
         // here fired while typing a file name such as "intro_clip.mp4".
         self.ensure_media(media_path, duration_safe);
 
-        let accent = Color32::from_rgb(139, 124, 246); // #8b7cf6
+        let accent = crate::theme::ACCENT; // #8b7cf6
         let bg_card = Color32::from_rgba_unmultiplied(32, 34, 46, 220);
         let border_color = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
 
@@ -290,8 +290,8 @@ impl ClipExportPanel {
 
             // 2. MAIN SECTION: SELECIONAR TROÇO (Waveform with handles & Keyframe marks)
             ui.colored_label(
-                Color32::from_rgb(150, 155, 175),
-                RichText::new("SELECIONAR TROÇO").size(11.5).strong(),
+                crate::theme::TEXT_SECONDARY,
+                RichText::new("SELECIONAR TROÇO").size(crate::theme::MIN_TEXT_SIZE).strong(),
             );
 
             let card_height = 135.0_f32;
@@ -396,7 +396,7 @@ impl ClipExportPanel {
             let playhead_x = wave_rect.left() + playhead_fraction * wave_rect.width();
             painter.line_segment(
                 [pos2(playhead_x, wave_rect.top()), pos2(playhead_x, wave_rect.bottom())],
-                Stroke::new(1.5, Color32::from_rgb(250, 204, 21)),
+                Stroke::new(1.5, crate::theme::WARN),
             );
 
             // Handle dragging interaction
@@ -473,7 +473,7 @@ impl ClipExportPanel {
                 pos2(wave_rect.left(), labels_y),
                 egui::Align2::LEFT_TOP,
                 "00:00:00",
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                 Color32::from_rgb(140, 145, 165),
             );
             let kf_note = match self.keyframes {
@@ -485,14 +485,14 @@ impl ClipExportPanel {
                 pos2(wave_rect.center().x, labels_y),
                 egui::Align2::CENTER_TOP,
                 kf_note,
-                egui::FontId::proportional(10.5),
-                Color32::from_rgb(120, 125, 145),
+                egui::FontId::proportional(crate::theme::MIN_TEXT_SIZE),
+                crate::theme::TEXT_MUTED,
             );
             painter.text(
                 pos2(wave_rect.right(), labels_y),
                 egui::Align2::RIGHT_TOP,
                 Self::format_hms(duration_safe),
-                egui::FontId::monospace(10.5),
+                egui::FontId::monospace(crate::theme::MIN_TEXT_SIZE),
                 Color32::from_rgb(140, 145, 165),
             );
 
@@ -511,7 +511,7 @@ impl ClipExportPanel {
 
                         // Início
                         ui.vertical(|ui| {
-                            ui.colored_label(Color32::from_rgb(150, 155, 175), RichText::new("Início").size(11.0).strong());
+                            ui.colored_label(crate::theme::TEXT_SECONDARY, RichText::new("Início").size(crate::theme::MIN_TEXT_SIZE).strong());
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.start_input_text)
                                     .font(egui::TextStyle::Monospace)
@@ -527,7 +527,7 @@ impl ClipExportPanel {
 
                         // Fim
                         ui.vertical(|ui| {
-                            ui.colored_label(Color32::from_rgb(150, 155, 175), RichText::new("Fim").size(11.0).strong());
+                            ui.colored_label(crate::theme::TEXT_SECONDARY, RichText::new("Fim").size(crate::theme::MIN_TEXT_SIZE).strong());
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.end_input_text)
                                     .font(egui::TextStyle::Monospace)
@@ -543,7 +543,7 @@ impl ClipExportPanel {
 
                         // Duração (Calculada e Desativada)
                         ui.vertical(|ui| {
-                            ui.colored_label(Color32::from_rgb(150, 155, 175), RichText::new("Duração").size(11.0).strong());
+                            ui.colored_label(crate::theme::TEXT_SECONDARY, RichText::new("Duração").size(crate::theme::MIN_TEXT_SIZE).strong());
                             let clip_duration = (self.end_seconds - self.start_seconds).max(0.0);
                             let mut dur_text = Self::format_hms(clip_duration);
                             ui.add_enabled(
@@ -559,7 +559,7 @@ impl ClipExportPanel {
                     ui.colored_label(
                         Color32::from_rgb(130, 135, 155),
                         RichText::new("Atalhos: Tecla 'I' define Início, Tecla 'O' define Fim na posição atual do leitor.")
-                            .size(10.5),
+                            .size(crate::theme::MIN_TEXT_SIZE),
                     );
 
                     // Checkbox "Corte exato (recodificar)"
@@ -569,12 +569,12 @@ impl ClipExportPanel {
                             ui.vertical(|ui| {
                                 ui.strong("Corte exato (recodificar)");
                                 ui.colored_label(
-                                    Color32::from_rgb(150, 155, 175),
+                                    crate::theme::TEXT_SECONDARY,
                                     RichText::new(
                                         "Desligado: corte instantâneo no keyframe mais próximo, sem perda de qualidade.\n\
                                          Ligado: preciso ao frame, mais lento, ficheiro pode crescer.",
                                     )
-                                    .size(10.5),
+                                    .size(crate::theme::MIN_TEXT_SIZE),
                                 );
                             });
                         });
@@ -595,7 +595,7 @@ impl ClipExportPanel {
                             None => None,
                         };
                         if let Some(hint) = hint {
-                            ui.colored_label(Color32::from_rgb(250, 204, 21), RichText::new(hint).size(10.5));
+                            ui.colored_label(crate::theme::WARN, RichText::new(hint).size(crate::theme::MIN_TEXT_SIZE));
                         }
                     }
 
@@ -623,8 +623,8 @@ impl ClipExportPanel {
                     ui.spacing_mut().item_spacing = vec2(0.0, 12.0);
 
                     ui.colored_label(
-                        Color32::from_rgb(150, 155, 175),
-                        RichText::new("Nome do ficheiro").size(11.0).strong(),
+                        crate::theme::TEXT_SECONDARY,
+                        RichText::new("Nome do ficheiro").size(crate::theme::MIN_TEXT_SIZE).strong(),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filename_input)
@@ -636,8 +636,8 @@ impl ClipExportPanel {
                         .and_then(|p| p.to_str())
                         .unwrap_or(".");
                     ui.colored_label(
-                        Color32::from_rgb(120, 125, 145),
-                        RichText::new(format!("Pasta de destino: {parent_dir}")).size(10.5),
+                        crate::theme::TEXT_MUTED,
+                        RichText::new(format!("Pasta de destino: {parent_dir}")).size(crate::theme::MIN_TEXT_SIZE),
                     );
 
                     ui.add_space(8.0);
@@ -677,11 +677,11 @@ impl ClipExportPanel {
                         // an error stays until the next attempt; a success fades out
                         if is_err || at.elapsed() < SHOWN_FOR {
                             let col = if is_err {
-                                Color32::from_rgb(239, 68, 68)
+                                crate::theme::ERROR
                             } else {
                                 Color32::from_rgb(34, 197, 94)
                             };
-                            ui.colored_label(col, RichText::new(msg).size(11.5).strong());
+                            ui.colored_label(col, RichText::new(msg).size(crate::theme::MIN_TEXT_SIZE).strong());
                             if !is_err {
                                 ui.ctx().request_repaint_after(SHOWN_FOR.saturating_sub(at.elapsed()));
                             }

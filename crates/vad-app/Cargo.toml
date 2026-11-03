@@ -15,6 +15,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 num_cpus = "1.16"
+mimalloc = "0.1.52"
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"

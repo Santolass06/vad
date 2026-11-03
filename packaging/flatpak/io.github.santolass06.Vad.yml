@@ -1,0 +1,51 @@
+# ESQUELETO NÃO VALIDADO — ver README.md nesta pasta. Nunca foi construído.
+app-id: io.github.santolass06.Vad   # TODO confirmar
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'            # TODO confirmar a versão corrente
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: vad
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri                         # aceleração gráfica / hwdec
+  - --socket=pulseaudio
+  - --share=network                      # URLs (yt-dlp), descarga de modelos, IA cloud opt-in
+  - --talk-name=org.freedesktop.secrets  # keyring das chaves de API (§4.2)
+  - --talk-name=org.freedesktop.ScreenSaver
+  - --own-name=org.mpris.MediaPlayer2.vad
+  - --talk-name=org.kde.StatusNotifierWatcher   # bandeja (best-effort)
+  # Acesso a ficheiros: preferir o portal (FileChooser). Se for preciso aceder à pasta do
+  # vídeo para escrever clips (clip_export.rs escreve ao lado do original por omissão),
+  # decidir entre --filesystem=xdg-videos e o portal. TODO
+
+modules:
+  # TODO: módulo mpv/libmpv (+ libplacebo, libass, ...) — ver README.
+  # TODO: ffmpeg (CLI + libs) — ver README.
+
+  - name: yt-dlp
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 yt-dlp /app/bin/yt-dlp
+    sources:
+      - type: file
+        url: https://github.com/yt-dlp/yt-dlp/releases/download/TODO_VERSION/yt-dlp
+        sha256: TODO_SHA256_OF_THAT_EXACT_RELEASE   # não inventar; copiar da release
+    # O binário "yt-dlp" da release é um zipapp Python: precisa de python3 no runtime. TODO verificar.
+
+  - name: vad
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/vad/cargo
+    build-commands:
+      - cargo --offline build --release -p vad-app
+      - install -Dm755 target/release/vad-app /app/bin/vad
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json   # TODO gerar com flatpak-cargo-generator a partir do Cargo.lock

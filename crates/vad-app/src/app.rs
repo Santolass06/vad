@@ -93,6 +93,8 @@ pub struct VadApp {
     waveform_pyramid: Option<WaveformPyramid>,
     waveform_zoom_window: Option<(f64, f64)>,
     meeting_mode_view: bool,
+    /// Picture-in-picture style "always on top" (best effort, §4.9).
+    always_on_top: bool,
     load_subtitles_modal_open: bool,
     load_subtitles_input: String,
     recents: RecentsStore,
@@ -129,6 +131,7 @@ impl VadApp {
         initial_file: Option<String>,
         missing_dependencies: Vec<VadError>,
     ) -> Self {
+        crate::theme::apply(&cc.egui_ctx);
         let (event_tx, event_rx) = create_event_channel();
         let shared_state = Arc::new(SharedPlayerState::new());
         let show_dependency_dialog = !missing_dependencies.is_empty();
@@ -203,6 +206,11 @@ impl VadApp {
             ) {
                 Ok(mpris) => platform_integrations.push(Box::new(mpris)),
                 Err(err) => error!("Failed to initialize MPRIS integration: {:?}", err),
+            }
+            // Best effort (§4.8): a missing StatusNotifierWatcher only means no icon.
+            match crate::tray::TrayIntegration::new(p.clone(), cc.egui_ctx.clone()) {
+                Ok(tray) => platform_integrations.push(Box::new(tray)),
+                Err(err) => tracing::warn!("Tray unavailable: {err}"),
             }
             match crate::screensaver::ScreenSaverInhibitor::new() {
                 Ok(inhibitor) => platform_integrations.push(Box::new(inhibitor)),
@@ -292,6 +300,7 @@ impl VadApp {
             waveform_pyramid: None,
             waveform_zoom_window: None,
             meeting_mode_view: false,
+            always_on_top: false,
             load_subtitles_modal_open: false,
             load_subtitles_input: String::new(),
             recents,
@@ -760,7 +769,7 @@ impl VadApp {
                     let action = err.action();
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            ui.colored_label(Color32::from_rgb(230, 70, 70), "✕");
+                            ui.colored_label(crate::theme::ERROR, "✕");
                             ui.strong(action.title);
                         });
                         ui.add_space(2.0);
@@ -1000,7 +1009,7 @@ impl VadApp {
             ui.add_space(6.0);
 
             ui.colored_label(
-                Color32::from_rgb(160, 165, 185),
+                crate::theme::TEXT_MUTED,
                 "Suporta MP4, MKV, WebM, Opus, FLAC, AAC e múltiplos fluxos de áudio e legendas.",
             );
             ui.add_space(16.0);
@@ -1054,7 +1063,7 @@ impl VadApp {
 
             if !has_recents {
                 recents_ui.colored_label(
-                    Color32::from_rgb(100, 105, 120),
+                    crate::theme::TEXT_MUTED,
                     "Nenhum ficheiro recente ainda.",
                 );
             } else {
@@ -1074,7 +1083,7 @@ impl VadApp {
                             open_item = Some((entry.location.clone(), entry.timestamp));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.colored_label(Color32::from_rgb(139, 124, 246), summary);
+                            ui.colored_label(crate::theme::ACCENT, summary);
                         });
                     });
                 }
@@ -1159,7 +1168,7 @@ impl VadApp {
 
         ctx.request_repaint();
 
-        let accent = Color32::from_rgb(139, 124, 246);
+        let accent = crate::theme::ACCENT;
         let mut action_continue = false;
         let mut action_start_over = false;
         let mut action_close = false;
@@ -1297,7 +1306,7 @@ impl VadApp {
         let action = err.action();
         ui.centered_and_justified(|ui| {
             ui.group(|ui| {
-                ui.colored_label(Color32::RED, egui::RichText::new("⚠️ Falha Crítica").size(24.0).strong());
+                ui.colored_label(crate::theme::ERROR, egui::RichText::new("⚠️ Falha Crítica").size(24.0).strong());
                 ui.add_space(8.0);
                 ui.heading(action.title);
                 ui.add_space(4.0);
@@ -1752,7 +1761,7 @@ impl VadApp {
                 let num_pts = points.len();
 
                 if num_pts > 0 {
-                    let wave_color = Color32::from_rgb(139, 124, 246);
+                    let wave_color = crate::theme::ACCENT;
                     let half_h = (rect.height() * 0.44).max(5.0);
                     let col_w = (rect.width() / num_pts as f32).max(1.0);
 
@@ -1776,7 +1785,7 @@ impl VadApp {
                 let span = (view_end - view_start).max(0.001);
                 let pos_fraction = ((current_time - view_start) / span).clamp(0.0, 1.0);
                 let playhead_x = rect.left() + pos_fraction as f32 * rect.width();
-                let playhead_color = Color32::from_rgb(250, 204, 21); // Yellow/Gold
+                let playhead_color = crate::theme::WARN; // Yellow/Gold
 
                 painter.line_segment(
                     [pos2(playhead_x, rect.top()), pos2(playhead_x, rect.bottom())],
@@ -1909,7 +1918,7 @@ impl VadApp {
                         } else {
                             format!("Zoom: {:.1}m", span / 60.0)
                         };
-                        ui.colored_label(Color32::from_rgb(139, 124, 246), span_str);
+                        ui.colored_label(crate::theme::ACCENT, span_str);
                         if ui.small_button("Reset Zoom").on_hover_text("Voltar ao nível global completo").clicked() {
                             self.waveform_zoom_window = None;
                         }
@@ -1925,7 +1934,7 @@ impl VadApp {
 
             // --- CONTROLOS RÁPIDOS DE REUNIÃO (PLANO_VAD.md §6, Meeting.dc.html) ---
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(160, 165, 185), "Controlos Rápidos:");
+                ui.colored_label(crate::theme::TEXT_MUTED, "Controlos Rápidos:");
 
                 // Pill: Saltar Silêncios (Meeting.dc.html lines 60-63)
                 let skip_btn_text = if self.skip_silence_enabled {
@@ -1937,7 +1946,7 @@ impl VadApp {
                 if self.skip_silence_enabled {
                     skip_btn = skip_btn
                         .fill(Color32::from_rgba_unmultiplied(139, 124, 246, 55))
-                        .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
+                        .stroke(Stroke::new(1.2, crate::theme::ACCENT));
                 }
                 if ui
                     .add(skip_btn)
@@ -1963,7 +1972,7 @@ impl VadApp {
                 if self.audio_panel.rnnoise {
                     rn_btn = rn_btn
                         .fill(Color32::from_rgba_unmultiplied(139, 124, 246, 55))
-                        .stroke(Stroke::new(1.2, Color32::from_rgb(139, 124, 246)));
+                        .stroke(Stroke::new(1.2, crate::theme::ACCENT));
                 }
                 if ui
                     .add(rn_btn)
@@ -1976,7 +1985,7 @@ impl VadApp {
                     }
                 }
                 if let Some(ref err) = self.audio_panel.filter_error {
-                    ui.colored_label(Color32::from_rgb(239, 68, 68), RichText::new(err).size(11.0));
+                    ui.colored_label(crate::theme::ERROR, RichText::new(err).size(crate::theme::MIN_TEXT_SIZE));
                 }
 
                 // Botão: Cortar Clip - Task 3
@@ -1993,7 +2002,7 @@ impl VadApp {
                 if self.whisper_panel.is_transcribing() {
                     let prog = self.whisper_panel.transcribe_progress().unwrap_or(0);
                     ui.spinner();
-                    ui.colored_label(Color32::from_rgb(139, 124, 246), format!("A transcrever: {}%", prog));
+                    ui.colored_label(crate::theme::ACCENT, format!("A transcrever: {}%", prog));
                 } else if ui
                     .button("🎙 Abrir Whisper AI")
                     .on_hover_text("Abrir painel lateral de Transcrição Whisper AI")
@@ -2011,13 +2020,13 @@ impl VadApp {
                     RichText::new("MARCADORES DA REUNIÃO")
                         .size(12.0)
                         .strong()
-                        .color(Color32::from_rgb(160, 165, 185)),
+                        .color(crate::theme::TEXT_MUTED),
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let add_btn = egui::Button::new(
                         RichText::new("+ Adicionar nota")
-                            .color(Color32::from_rgb(139, 124, 246))
+                            .color(crate::theme::ACCENT)
                             .strong(),
                     );
                     if ui
@@ -2044,7 +2053,7 @@ impl VadApp {
             let mut bookmark_to_edit = None;
 
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
+                .fill(crate::theme::CARD_FILL)
                 .corner_radius(8.0)
                 .inner_margin(8.0)
                 .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 15)))
@@ -2063,9 +2072,9 @@ impl VadApp {
                         for bm in &self.bookmark_store.bookmarks {
                             let is_current = (cur_sec - bm.timestamp_secs).abs() < 2.0;
                             let ts_color = if is_current {
-                                Color32::from_rgb(250, 204, 21)
+                                crate::theme::WARN
                             } else {
-                                Color32::from_rgb(139, 124, 246)
+                                crate::theme::ACCENT
                             };
 
                             ui.horizontal(|ui| {
@@ -2156,9 +2165,9 @@ impl VadApp {
             if let Some((ref msg, instant)) = self.export_notification {
                 if instant.elapsed().as_secs() < 6 {
                     let color = if msg.starts_with("Falha") {
-                        Color32::RED
+                        crate::theme::ERROR
                     } else {
-                        Color32::GREEN
+                        crate::theme::OK
                     };
                     ui.colored_label(color, msg);
                 }
@@ -2174,19 +2183,19 @@ impl VadApp {
                     crate::panels::render_privacy_badge(ui, summary.privacy_badge);
                 });
                 if let Some(note) = &summary.fallback_note {
-                    ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+                    ui.colored_label(crate::theme::WARN, format!("⚠ {note}"));
                 }
                 ui.add_space(4.0);
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
+                    .fill(crate::theme::CARD_FILL)
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .max_height(140.0)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&summary.markdown).size(11.5));
+                                ui.label(RichText::new(&summary.markdown).size(crate::theme::MIN_TEXT_SIZE));
                             });
                     });
             }
@@ -2213,7 +2222,7 @@ impl VadApp {
                 ui.add_space(4.0);
 
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(25, 27, 36, 255))
+                    .fill(crate::theme::CARD_FILL)
                     .corner_radius(6.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
@@ -2223,9 +2232,9 @@ impl VadApp {
                             ui.horizontal(|ui| {
                                 let time_lbl = format!("[{}]", TranscriptionSegment::format_timestamp(seg.start_ms));
                                 let color = if is_current {
-                                    Color32::from_rgb(250, 204, 21)
+                                    crate::theme::WARN
                                 } else {
-                                    Color32::from_rgb(139, 124, 246)
+                                    crate::theme::ACCENT
                                 };
 
                                 if ui.link(RichText::new(time_lbl).color(color).monospace()).clicked() {
@@ -2352,6 +2361,15 @@ impl VadApp {
     }
 }
 
+/// Tooltip for the always-on-top toggle; warns when the session is Wayland (§4.9).
+fn always_on_top_hint() -> &'static str {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        "Mantém a janela por cima das outras. Em Wayland depende do compositor: no GNOME é ignorado (restrição do protocolo)."
+    } else {
+        "Mantém a janela por cima das outras."
+    }
+}
+
 /// Next waveform zoom window after a mouse-wheel step (§5); `None` is the global overview.
 /// Scrolling up zooms in around the playhead (down to a 3s window), scrolling down zooms out
 /// around the window centre and returns to the global overview once it would cover everything.
@@ -2432,7 +2450,7 @@ impl eframe::App for VadApp {
                     let title = if self.current_title.is_empty() { path } else { &self.current_title };
                     ui.label(title);
                 } else {
-                    ui.colored_label(Color32::from_rgb(150, 155, 175), "Nenhum ficheiro aberto");
+                    ui.colored_label(crate::theme::TEXT_SECONDARY, "Nenhum ficheiro aberto");
                 }
 
                 // Task 5: Non-blocking top bar progress indicator (§4.17)
@@ -2491,6 +2509,20 @@ impl eframe::App for VadApp {
                     }
 
                     ui.separator();
+
+                    // PIP / always on top (§4.9). Reliable on X11; on Wayland it depends on the
+                    // compositor (GNOME ignores it), so the UI says so instead of looking broken.
+                    let pip_resp = ui
+                        .selectable_label(self.always_on_top, "📌 Sempre visível")
+                        .on_hover_text(always_on_top_hint());
+                    if pip_resp.clicked() {
+                        self.always_on_top = !self.always_on_top;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+                            egui::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::WindowLevel::Normal
+                        }));
+                    }
 
                     // Lateral Panel toggle buttons (Top Bar)
                     let whisper_active = self.active_side_panel == ActiveSidePanel::Whisper;
@@ -2563,7 +2595,7 @@ impl eframe::App for VadApp {
             });
 
             if let Some(ref err) = self.last_error {
-                ui.colored_label(Color32::RED, format!("Aviso: {err}"));
+                ui.colored_label(crate::theme::ERROR, format!("Aviso: {err}"));
             }
         });
 
@@ -2574,21 +2606,21 @@ impl eframe::App for VadApp {
                 .resizable(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(20, 22, 30, 248))
+                        .fill(crate::theme::PANEL_FILL)
                         .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)))
                         .inner_margin(14),
                 )
                 .show(ui, |ui| {
                     // Header tabs
                     ui.horizontal(|ui| {
-                        let accent = Color32::from_rgb(139, 124, 246);
+                        let accent = crate::theme::ACCENT;
                         let is_pl = self.active_side_panel == ActiveSidePanel::Playlist;
                         if ui
                             .add(
                                 egui::Button::new(
                                     egui::RichText::new("Playlist")
                                         .strong()
-                                        .color(if is_pl { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                        .color(if is_pl { accent } else { crate::theme::TEXT_SECONDARY }),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
@@ -2603,7 +2635,7 @@ impl eframe::App for VadApp {
                                 egui::Button::new(
                                     egui::RichText::new("Equalizador")
                                         .strong()
-                                        .color(if is_eq { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                        .color(if is_eq { accent } else { crate::theme::TEXT_SECONDARY }),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
@@ -2618,7 +2650,7 @@ impl eframe::App for VadApp {
                                 egui::Button::new(
                                     egui::RichText::new("Vídeo")
                                         .strong()
-                                        .color(if is_vid { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                        .color(if is_vid { accent } else { crate::theme::TEXT_SECONDARY }),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
@@ -2633,7 +2665,7 @@ impl eframe::App for VadApp {
                                 egui::Button::new(
                                     egui::RichText::new("Whisper")
                                         .strong()
-                                        .color(if is_wh { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                        .color(if is_wh { accent } else { crate::theme::TEXT_SECONDARY }),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
@@ -2648,7 +2680,7 @@ impl eframe::App for VadApp {
                                 egui::Button::new(
                                     egui::RichText::new("IA")
                                         .strong()
-                                        .color(if is_set { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                        .color(if is_set { accent } else { crate::theme::TEXT_SECONDARY }),
                                 )
                                 .fill(Color32::TRANSPARENT),
                             )
@@ -2727,7 +2759,12 @@ impl eframe::App for VadApp {
                             }
                         }
                         ActiveSidePanel::Settings => {
-                            if self.settings_panel.ui(ui, &mut self.config.ai).is_some() {
+                            // Three provider cards are taller than the window: scroll.
+                            let changed = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.settings_panel.ui(ui, &mut self.config.ai))
+                                .inner;
+                            if changed.is_some() {
                                 self.whisper_panel.set_ai(
                                     &self.config.ai,
                                     std::sync::Arc::clone(self.settings_panel.secrets()),
@@ -2834,7 +2871,7 @@ impl eframe::App for VadApp {
                 painter.rect_stroke(
                     available_rect.shrink(8.0),
                     CornerRadius::same(12),
-                    Stroke::new(2.5, Color32::from_rgb(139, 124, 246)),
+                    Stroke::new(2.5, crate::theme::ACCENT),
                     StrokeKind::Inside,
                 );
                 painter.text(
