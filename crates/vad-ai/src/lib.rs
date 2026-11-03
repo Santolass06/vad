@@ -5,6 +5,7 @@ pub mod endpoint;
 pub mod gemini;
 pub(crate) mod http;
 pub mod extractor;
+pub mod fallback;
 pub mod llm_provider;
 pub mod model_manager;
 pub mod openai_compatible;
@@ -28,6 +29,7 @@ pub use summarizer::{
     MapReduceSummarizer, MeetingSummary, PartialSummary, SummarizeProgress, TranscriptionChunk,
 };
 pub use openai_compatible::{build_from_config as build_openai_from_config, OpenAiCompatibleSummarizer};
+pub use fallback::{fallback_notice, run_with_local_fallback};
 pub use provider::{build_cloud, diagnose, test_connection, Draft};
 pub use secrets::{KeySource, Secret, SecretSlot, SecretStore};
 pub use translator::{LlmTranslator, TargetLanguage};

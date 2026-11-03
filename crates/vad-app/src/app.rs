@@ -2173,6 +2173,9 @@ impl VadApp {
                     ui.label(RichText::new("Resumo da Reunião:").size(12.0).strong());
                     crate::panels::render_privacy_badge(ui, summary.privacy_badge);
                 });
+                if let Some(note) = &summary.fallback_note {
+                    ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+                }
                 ui.add_space(4.0);
 
                 egui::Frame::new()
@@ -2320,10 +2323,14 @@ impl VadApp {
                 .and_then(|rest| rest.split_once('\n'))
                 .map_or(summary.markdown.as_str(), |(_, rest)| rest.trim_start());
             md_content.push_str(&format!(
-                "\n\n---\n\n## Resumo da Reunião ({})\n\n{}\n",
+                "\n\n---\n\n## Resumo da Reunião ({})\n\n",
                 summary.privacy_badge.label(),
-                body
             ));
+            // A fallback result must say so in the exported file too (§4.21).
+            if let Some(note) = &summary.fallback_note {
+                md_content.push_str(&format!("> ⚠ {note}\n\n"));
+            }
+            md_content.push_str(&format!("{body}\n"));
         }
 
         // Same folder as the transcript export of the Whisper panel (`~/.local/share/vad/`),

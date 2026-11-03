@@ -19,6 +19,7 @@ pub struct AnthropicSummarizer {
     model: String,
     api_key: Secret,
     client: reqwest::blocking::Client,
+    retry: crate::http::RetryPolicy,
 }
 
 impl std::fmt::Debug for AnthropicSummarizer {
@@ -45,6 +46,7 @@ impl AnthropicSummarizer {
             model: model.trim().to_string(),
             api_key,
             client: crate::http::client(timeout)?,
+            retry: crate::http::RetryPolicy::DEFAULT,
         })
     }
 
@@ -60,7 +62,7 @@ impl AnthropicSummarizer {
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
             }));
-        let body = crate::http::execute(req, abort)?;
+        let body = crate::http::execute(req, abort, self.retry)?;
         // content is a list of blocks; join the text ones.
         let text: String = body["content"]
             .as_array()
@@ -71,7 +73,23 @@ impl AnthropicSummarizer {
 
     /// Smallest real round-trip, for "Testar ligação" (§4.23).
     pub fn ping(&self) -> Result<(), VadError> {
-        self.call("Responde apenas com a palavra: ok", "ping", 8, None).map(|_| ())
+        self.without_retry().call("Responde apenas com a palavra: ok", "ping", 8, None).map(|_| ())
+    }
+}
+
+impl AnthropicSummarizer {
+    /// Test hook / "Testar ligação": single attempt, or a custom policy.
+    #[allow(dead_code)]
+    pub(crate) fn with_retry(mut self, retry: crate::http::RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    fn without_retry(&self) -> Self {
+        Self {
+            retry: crate::http::RetryPolicy::NONE,
+            messages_url: self.messages_url.clone(), model: self.model.clone(), api_key: self.api_key.clone(), client: self.client.clone(),
+        }
     }
 }
 

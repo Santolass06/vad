@@ -96,6 +96,11 @@ pub enum VadError {
 
     #[error("Limite de taxa (rate limit) do LLM excedido: {0}")]
     LlmRateLimited(String),
+
+    /// The provider could not be reached at all (offline, DNS, refused). Triggers the
+    /// disclosed local fallback of §4.21.
+    #[error("Sem ligação ao provider de IA: {0}")]
+    NoNetwork(String),
 }
 
 impl VadError {
@@ -290,6 +295,14 @@ impl VadError {
                 severity: ErrorSeverity::Warning,
                 title: "Limite de Requisições Excedido",
                 description: "O provider de IA atingiu o limite de taxa (rate limit).",
+                install_command: None,
+                disabled_features: &[],
+                can_ignore: true,
+            },
+            VadError::NoNetwork(_) => ErrorAction {
+                severity: ErrorSeverity::Warning,
+                title: "Sem ligação ao provider de IA",
+                description: "Não foi possível contactar o provider. Verifica a rede ou o endereço em Definições → IA.",
                 install_command: None,
                 disabled_features: &[],
                 can_ignore: true,

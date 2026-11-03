@@ -21,6 +21,7 @@ pub struct GeminiSummarizer {
     model: String,
     api_key: Secret,
     client: reqwest::blocking::Client,
+    retry: crate::http::RetryPolicy,
 }
 
 impl std::fmt::Debug for GeminiSummarizer {
@@ -52,6 +53,7 @@ impl GeminiSummarizer {
             model: model.to_string(),
             api_key,
             client: crate::http::client(timeout)?,
+            retry: crate::http::RetryPolicy::DEFAULT,
         })
     }
 
@@ -65,7 +67,7 @@ impl GeminiSummarizer {
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
                 "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.2},
             }));
-        let body = crate::http::execute(req, abort)?;
+        let body = crate::http::execute(req, abort, self.retry)?;
         let text: String = body["candidates"][0]["content"]["parts"]
             .as_array()
             .map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect::<Vec<_>>().join(""))
@@ -75,7 +77,23 @@ impl GeminiSummarizer {
     }
 
     pub fn ping(&self) -> Result<(), VadError> {
-        self.call("Responde apenas com a palavra: ok", "ping", 8, None).map(|_| ())
+        self.without_retry().call("Responde apenas com a palavra: ok", "ping", 8, None).map(|_| ())
+    }
+}
+
+impl GeminiSummarizer {
+    /// Test hook / "Testar ligação": single attempt, or a custom policy.
+    #[allow(dead_code)]
+    pub(crate) fn with_retry(mut self, retry: crate::http::RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    fn without_retry(&self) -> Self {
+        Self {
+            retry: crate::http::RetryPolicy::NONE,
+            url: self.url.clone(), model: self.model.clone(), api_key: self.api_key.clone(), client: self.client.clone(),
+        }
     }
 }
 

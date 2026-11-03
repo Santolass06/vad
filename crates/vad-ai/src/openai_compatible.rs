@@ -25,6 +25,7 @@ pub struct OpenAiCompatibleSummarizer {
     context_window: usize,
     max_output_tokens: usize,
     client: reqwest::blocking::Client,
+    retry: crate::http::RetryPolicy,
 }
 
 impl std::fmt::Debug for OpenAiCompatibleSummarizer {
@@ -54,6 +55,7 @@ impl OpenAiCompatibleSummarizer {
             context_window: DEFAULT_CLOUD_CONTEXT_WINDOW,
             max_output_tokens: DEFAULT_CLOUD_MAX_OUTPUT_TOKENS,
             client,
+            retry: crate::http::RetryPolicy::DEFAULT,
         })
     }
 
@@ -70,13 +72,29 @@ impl OpenAiCompatibleSummarizer {
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key.expose());
         }
-        let body = crate::http::execute(req, abort)?;
+        let body = crate::http::execute(req, abort, self.retry)?;
         crate::http::non_empty(body["choices"][0]["message"]["content"].as_str(), "choices[0].message.content")
     }
 
     /// Cheapest possible real round-trip, for "Testar ligação" (§4.23).
     pub fn ping(&self) -> Result<(), VadError> {
-        self.chat("Responde apenas com a palavra: ok", "ping", None).map(|_| ())
+        self.without_retry().chat("Responde apenas com a palavra: ok", "ping", None).map(|_| ())
+    }
+}
+
+impl OpenAiCompatibleSummarizer {
+    /// Test hook / "Testar ligação": single attempt, or a custom policy.
+    #[allow(dead_code)]
+    pub(crate) fn with_retry(mut self, retry: crate::http::RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    fn without_retry(&self) -> Self {
+        Self {
+            retry: crate::http::RetryPolicy::NONE,
+            chat_url: self.chat_url.clone(), model: self.model.clone(), api_key: self.api_key.clone(), badge: self.badge, context_window: self.context_window, max_output_tokens: self.max_output_tokens, client: self.client.clone(),
+        }
     }
 }
 
@@ -191,7 +209,7 @@ mod tests {
     fn connection_refused_is_a_clean_error_and_abort_is_honoured() {
         let s = OpenAiCompatibleSummarizer::new("http://127.0.0.1:1/v1", "m", Some(Secret::new("sk-x"))).unwrap();
         let e = s.summarize_chunk("x", false, None).unwrap_err();
-        assert!(matches!(e, VadError::Llm(_)) && !format!("{e}").contains("sk-x"), "{e:?}");
+        assert!(matches!(e, VadError::NoNetwork(_)) && !format!("{e}").contains("sk-x"), "{e:?}");
         let flag = AtomicBool::new(true);
         assert!(matches!(s.summarize_chunk("x", false, Some(&flag)), Err(VadError::LlmCancelled)));
     }
@@ -246,5 +264,77 @@ mod tests {
         // Non-loopback endpoint: construction does no I/O, so no server is needed.
         let cloud = OpenAiCompatibleSummarizer::new("http://10.1.2.3:8080/v1", "m", None).unwrap();
         assert_eq!(cloud.privacy_badge(), AiPrivacyBadge::Cloud);
+    }
+
+    // ---- Sprint_13: retry with backoff+jitter ----
+    use crate::http::RetryPolicy;
+    use crate::test_http::serve_seq;
+    use std::time::{Duration, Instant};
+
+    const FAST: RetryPolicy = RetryPolicy { max_retries: 2, base: Duration::from_millis(20), cap: Duration::from_millis(200) };
+
+    #[test]
+    fn retries_429_and_5xx_then_succeeds() {
+        let (base, seen) = serve_seq(&[("429 Too Many Requests", "{}", ""), ("503 Service Unavailable", "x", ""), ("200 OK", OK_BODY, "")]);
+        let s = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(FAST);
+        assert_eq!(s.summarize_chunk("x", false, None).unwrap(), "Good morning.");
+        assert_eq!(seen.lock().unwrap().len(), 3, "1 attempt + 2 retries");
+    }
+
+    #[test]
+    fn gives_up_after_max_retries_with_the_real_error() {
+        let (base, seen) = serve_seq(&[("429 Too Many Requests", "{}", "")]);
+        let s = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(FAST);
+        assert!(matches!(s.summarize_chunk("x", false, None), Err(VadError::LlmRateLimited(_))));
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn auth_errors_and_other_4xx_and_offline_are_never_retried() {
+        for (st, kind) in [("401 Unauthorized", 0), ("400 Bad Request", 1)] {
+            let (base, seen) = serve_seq(&[(st, "{}", "")]);
+            let r = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(FAST).summarize_chunk("x", false, None);
+            assert!(r.is_err(), "{kind}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "{st} must not be retried");
+        }
+        let t = Instant::now();
+        let r = OpenAiCompatibleSummarizer::new("http://127.0.0.1:1/v1", "m", None).unwrap().with_retry(FAST).summarize_chunk("x", false, None);
+        assert!(matches!(r, Err(VadError::NoNetwork(_))));
+        assert!(t.elapsed() < Duration::from_millis(500), "offline goes straight to fallback, no backoff");
+    }
+
+    #[test]
+    fn retry_after_header_is_honoured_and_capped() {
+        let (base, seen) = serve_seq(&[("429 Too Many Requests", "{}", "Retry-After: 1\r\n"), ("200 OK", OK_BODY, "")]);
+        let policy = RetryPolicy { max_retries: 1, base: Duration::from_millis(10), cap: Duration::from_millis(400) };
+        let t = Instant::now();
+        OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(policy).summarize_chunk("x", false, None).unwrap();
+        let waited = t.elapsed();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(waited >= Duration::from_millis(300) && waited < Duration::from_millis(900), "Retry-After 1s capped to 400ms, waited {waited:?}");
+    }
+
+    #[test]
+    fn cancel_during_backoff_is_prompt() {
+        let (base, _) = serve_seq(&[("503 Service Unavailable", "x", "Retry-After: 30\r\n")]);
+        let policy = RetryPolicy { max_retries: 2, base: Duration::from_secs(5), cap: Duration::from_secs(30) };
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            f2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        let r = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(policy).summarize_chunk("x", false, Some(&flag));
+        assert!(matches!(r, Err(VadError::LlmCancelled)), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn ping_is_a_single_attempt_so_a_429_is_shown_not_hidden() {
+        let (base, seen) = serve_seq(&[("429 Too Many Requests", "{}", "")]);
+        let s = OpenAiCompatibleSummarizer::new(&base, "m", None).unwrap().with_retry(FAST);
+        assert!(matches!(s.ping(), Err(VadError::LlmRateLimited(_))));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

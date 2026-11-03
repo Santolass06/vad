@@ -73,6 +73,7 @@ pub fn diagnose(e: &VadError) -> String {
         VadError::LlmAuthFailed(_) => "Chave inválida ou sem permissão (HTTP 401/403).".into(),
         VadError::LlmRateLimited(_) => "O provider limitou os pedidos (HTTP 429): a chave funciona, tenta mais tarde.".into(),
         VadError::LlmTimeout(_) => "O provider não respondeu a tempo.".into(),
+        VadError::NoNetwork(_) => "Sem ligação ao provider: verifica a rede e o endereço (sem resposta).".into(),
         other => other.to_string(),
     }
 }
@@ -110,7 +111,7 @@ mod tests {
         assert!(msgs[0].contains("Chave inválida"), "{msgs:?}");
         assert!(msgs[1].contains("404") && msgs[1].contains("modelo"), "{msgs:?}");
         assert!(msgs[2].contains("429"), "{msgs:?}");
-        assert!(msgs[3].contains("sem ligação"), "{msgs:?}");
+        assert!(msgs[3].contains("Sem ligação"), "{msgs:?}");
         let unique: std::collections::HashSet<_> = msgs.iter().collect();
         assert_eq!(unique.len(), 4, "four different problems, four different messages");
     }

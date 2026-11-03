@@ -66,6 +66,9 @@ pub struct MeetingSummary {
     pub duration_seconds: f64,
     /// Privacy indicator of the model used (§4.1).
     pub privacy_badge: AiPrivacyBadge,
+    /// Set when the cloud provider was unreachable and the local model produced this instead (§4.21).
+    #[serde(default)]
+    pub fallback_note: Option<String>,
 }
 
 /// Helper struct defining the boundaries and text of a raw chunk.
@@ -175,6 +178,7 @@ impl MapReduceSummarizer {
                 total_chunks: 0,
                 duration_seconds: 0.0,
                 privacy_badge: self.summarizer.privacy_badge(),
+                fallback_note: None,
             });
         }
 
@@ -267,6 +271,7 @@ impl MapReduceSummarizer {
             total_chunks,
             duration_seconds: total_duration_secs,
             privacy_badge: self.summarizer.privacy_badge(),
+            fallback_note: None,
         })
     }
 

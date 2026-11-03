@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use tracing::{error, info};
 use vad_ai::{
-    find_preset, build_cloud, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
+    find_preset, build_cloud, run_with_local_fallback, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
     MapReduceSummarizer, MeetingSummary, MockSummarizer, ModelManager, ModelPreset, ModelSource,
     PcmAudio, SummarizeProgress, Summarizer, TargetLanguage, TranscriptionSegment, WhisperEngine,
     DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS, DEFAULT_QWEN_MODEL_FILENAME,
@@ -41,6 +41,9 @@ pub fn render_privacy_badge(ui: &mut Ui, badge: AiPrivacyBadge) {
         .on_hover_text(badge.tooltip());
 }
 
+/// Translated segments plus the fallback notice, if the local model had to stand in (§4.21).
+type TranslationResult = Result<(Vec<TranscriptionSegment>, Option<String>), String>;
+
 /// Clears a "busy" flag when the worker thread ends, even if it panics: a flag stuck at `true`
 /// would leave the spinner going forever with nothing to cancel.
 struct ClearOnDrop(Arc<AtomicBool>);
@@ -70,6 +73,11 @@ fn load_llm(
     if ai.provider != AiProviderKind::Local {
         return build_cloud(ai, secrets);
     }
+    load_local_llm(manager)
+}
+
+/// The local Qwen. A missing or unreadable model is an error the user sees.
+fn load_local_llm(manager: &ModelManager) -> Result<Arc<dyn Summarizer>, VadError> {
     let Some((model_path, tokenizer_path)) =
         manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME)
     else {
@@ -85,6 +93,32 @@ fn load_llm(
         DEFAULT_QWEN_MAX_OUTPUT_TOKENS,
     )?;
     Ok(Arc::new(summarizer))
+}
+
+fn provider_name(ai: &AiConfig) -> &'static str {
+    match ai.provider {
+        AiProviderKind::Local => "ao modelo local",
+        AiProviderKind::OpenaiCompatible => "ao endpoint OpenAI-compatible",
+        AiProviderKind::Anthropic => "à Anthropic",
+        AiProviderKind::Gemini => "ao Google Gemini",
+    }
+}
+
+/// Runs `op` on the chosen provider. If a cloud provider is unreachable (`NoNetwork`) the
+/// whole operation is redone locally and the returned notice says so (§4.21): the result is
+/// never passed off as coming from the provider that was asked for.
+fn run_llm<T>(
+    manager: &ModelManager,
+    use_mock: bool,
+    ai: &AiConfig,
+    secrets: &SecretStore,
+    op: impl Fn(Arc<dyn Summarizer>) -> Result<T, VadError>,
+) -> Result<(T, Option<String>), VadError> {
+    let primary = load_llm(manager, use_mock, ai, secrets)?;
+    if use_mock || ai.provider == AiProviderKind::Local {
+        return op(primary).map(|v| (v, None));
+    }
+    run_with_local_fallback(provider_name(ai), primary, || load_local_llm(manager), op)
 }
 
 /// Idle time after which a RAM-only Whisper model is released (§4.16).
@@ -148,7 +182,9 @@ pub struct WhisperPanel {
     translation_abort: Arc<AtomicBool>,
     selected_target_lang: TargetLanguage,
     translated_segments: Option<Vec<TranscriptionSegment>>,
-    translation_rx: Option<crossbeam_channel::Receiver<Result<Vec<TranscriptionSegment>, String>>>,
+    /// Set when the translation came from the local fallback instead of the cloud provider (§4.21).
+    translation_fallback_note: Option<String>,
+    translation_rx: Option<crossbeam_channel::Receiver<TranslationResult>>,
     show_translated_subtitles: bool,
 
     // --- LLM model on disk (explicit download, never a silent fallback) ---
@@ -210,6 +246,7 @@ impl WhisperPanel {
             translation_abort: Arc::new(AtomicBool::new(false)),
             selected_target_lang: TargetLanguage::English,
             translated_segments: None,
+            translation_fallback_note: None,
             translation_rx: None,
             show_translated_subtitles: false,
 
@@ -369,6 +406,7 @@ impl WhisperPanel {
         self.summarize_error = None;
         self.summary_rx = None;
         self.translated_segments = None;
+        self.translation_fallback_note = None;
         self.translation_error = None;
         self.translation_rx = None;
     }
@@ -440,9 +478,10 @@ impl WhisperPanel {
             };
             if let Some(res) = polled {
                 match res {
-                    Ok(segs) => {
+                    Ok((segs, note)) => {
                         info!("Translation finished successfully ({} segments)", segs.len());
                         self.translated_segments = Some(segs);
+                        self.translation_fallback_note = note;
                         self.translation_error = None;
                     }
                     Err(err) => {
@@ -804,6 +843,9 @@ impl WhisperPanel {
                 ui.colored_label(Color32::RED, format!("Erro no resumo: {err}"));
             }
 
+            if let Some(note) = self.meeting_summary.as_ref().and_then(|s| s.fallback_note.as_ref()) {
+                ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+            }
             if let Some(ref summary) = self.meeting_summary {
                 ui.add_space(4.0);
                 egui::Frame::new()
@@ -899,6 +941,9 @@ impl WhisperPanel {
                 ui.colored_label(Color32::RED, format!("Erro de tradução: {err}"));
             }
 
+            if let Some(ref note) = self.translation_fallback_note {
+                ui.colored_label(Color32::from_rgb(250, 204, 21), format!("⚠ {note}"));
+            }
             if let Some(ref trans_segs) = self.translated_segments {
                 ui.add_space(2.0);
                 ui.checkbox(
@@ -1134,15 +1179,18 @@ impl WhisperPanel {
 
         thread::spawn(move || {
             let _busy = busy;
-            let prog_clone = Arc::clone(&progress_state);
-            let progress_cb = move |p: SummarizeProgress| {
-                if let Ok(mut g) = prog_clone.lock() {
-                    *g = Some(p);
-                }
-            };
-
-            let res = load_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets).and_then(|summarizer| {
-                MapReduceSummarizer::new(summarizer).summarize(&segments, Some(progress_cb), Some(abort_flag))
+            let res = run_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets, |summarizer| {
+                let prog = Arc::clone(&progress_state);
+                let progress_cb = move |p: SummarizeProgress| {
+                    if let Ok(mut g) = prog.lock() {
+                        *g = Some(p);
+                    }
+                };
+                MapReduceSummarizer::new(summarizer).summarize(&segments, Some(progress_cb), Some(Arc::clone(&abort_flag)))
+            })
+            .map(|(mut summary, note)| {
+                summary.fallback_note = note;
+                summary
             });
             let _ = tx.send(res.map_err(|e| e.to_string()));
             *progress_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1254,24 +1302,23 @@ impl WhisperPanel {
         let ai_config = self.ai_config.clone();
         let ai_secrets = Arc::clone(&self.ai_secrets);
 
-        let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
+        let (tx, rx) = crossbeam_channel::bounded::<TranslationResult>(1);
 
         thread::spawn(move || {
             let _busy = busy;
-            let prog_clone = Arc::clone(&progress_state);
-            let progress_cb = move |curr: usize, total: usize| {
-                if let Ok(mut g) = prog_clone.lock() {
-                    *g = Some((curr, total));
-                }
-            };
-
-            let res = load_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets).and_then(|summarizer| {
+            let res = run_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets, |summarizer| {
+                let prog = Arc::clone(&progress_state);
+                let progress_cb = move |curr: usize, total: usize| {
+                    if let Ok(mut g) = prog.lock() {
+                        *g = Some((curr, total));
+                    }
+                };
                 LlmTranslator::new(summarizer).translate_segments(
                     &segments,
                     "Português",
                     target_lang,
                     Some(progress_cb),
-                    Some(abort_flag),
+                    Some(Arc::clone(&abort_flag)),
                 )
             });
             let _ = tx.send(res.map_err(|e| e.to_string()));
@@ -1485,10 +1532,39 @@ mod tests {
         let translation_rx = panel.translation_rx.take().expect("translation_rx must be present");
         let res = translation_rx.recv_timeout(Duration::from_millis(500)).unwrap();
         assert!(res.is_ok());
-        let translated = res.unwrap();
+        let (translated, note) = res.unwrap();
+        assert_eq!(note, None, "mock/local run is not a fallback");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].start_ms, 0);
         assert_eq!(translated[0].end_ms, 2500);
+    }
+
+    /// Unreachable cloud endpoint + no local model: the user gets an error that names both
+    /// problems. Not a mock result, not a silent success (§4.21).
+    #[test]
+    fn test_offline_cloud_without_local_model_is_a_visible_error() {
+        let dir = std::env::temp_dir().join(format!("vad-offline-{}", std::process::id()));
+        let manager = ModelManager::with_dir(dir.clone());
+        let ai = AiConfig {
+            provider: AiProviderKind::OpenaiCompatible,
+            openai_base_url: "http://127.0.0.1:1/v1".into(),
+            custom_endpoint_acknowledged: Some("http://127.0.0.1:1/v1".into()),
+            ..AiConfig::default()
+        };
+        let secrets = SecretStore::with(Box::new(NoKeyring), Box::new(|_| None));
+        let err = run_llm(&manager, false, &ai, &secrets, |s| s.summarize_chunk("x", false, None))
+            .expect_err("must fail visibly");
+        let msg = err.to_string();
+        assert!(matches!(err, VadError::NoNetwork(_)), "{msg}");
+        assert!(msg.contains("modelo local não está disponível"), "{msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct NoKeyring;
+    impl vad_ai::secrets::SecretBackend for NoKeyring {
+        fn get(&self, _: &str) -> Result<Option<String>, String> { Ok(None) }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> { Err("no".into()) }
+        fn delete(&self, _: &str) -> Result<(), String> { Ok(()) }
     }
 
     #[test]
