@@ -3,6 +3,8 @@
 pub mod extractor;
 pub mod llm_provider;
 pub mod model_manager;
+#[cfg(test)]
+mod quality_gate;
 pub mod summarizer;
 pub mod translator;
 pub mod vad_detector;

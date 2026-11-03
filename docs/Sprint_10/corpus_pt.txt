@@ -1,0 +1,100 @@
+Bom dia a todos.
+Vamos começar.
+Pois.
+Sim, claro.
+Ok, obrigado.
+Está bem assim?
+Não percebi a pergunta.
+Pode repetir, por favor?
+Tenho uma dúvida.
+Concordo totalmente.
+Isso não é bem assim.
+Já falámos sobre isso ontem.
+Quem fica responsável pelo relatório?
+Eu trato disso amanhã de manhã.
+O orçamento foi aprovado na semana passada.
+Precisamos de fechar as datas de entrega.
+A reunião passa para as três da tarde.
+Temos de rever o contrato com o fornecedor.
+O cliente pediu mais duas semanas.
+Ficou decidido manter o mesmo fornecedor.
+A latência baixou cerca de trinta por cento.
+O servidor caiu às quatro da manhã.
+Vou enviar o link por email.
+Podem partilhar o ecrã, por favor?
+Não estou a ouvir nada.
+O som está cortado.
+Alguém quer acrescentar mais alguma coisa?
+Passamos ao ponto seguinte da ordem de trabalhos.
+Primeiro ponto: o estado do projeto.
+Segundo ponto: os custos de infraestrutura.
+O projeto está atrasado dois dias.
+A equipa de testes encontrou onze erros críticos.
+Já corrigimos nove, faltam dois.
+O erro acontece só quando o utilizador não tem sessão iniciada.
+Isto só se resolve com uma migração da base de dados.
+A migração demora cerca de vinte minutos.
+Vamos fazê-la na madrugada de domingo.
+O João está de férias até dia quinze de novembro.
+A Maria vai substituí-lo nesse período.
+Ninguém tinha avisado a direção.
+Falei com o diretor financeiro esta manhã.
+Ele disse que não há margem para mais despesas.
+Então temos de cortar no orçamento de marketing.
+Reduzimos em dez por cento, no máximo.
+Isso é inaceitável para a equipa comercial.
+Compreendo, mas não temos alternativa.
+Vamos votar a proposta.
+Quem é a favor?
+Quem é contra?
+Uma abstenção.
+A proposta foi aprovada por maioria.
+Fica registado em ata.
+Quando é a próxima reunião?
+Na primeira terça-feira do mês.
+Preciso de um dia para preparar os slides.
+Mandem-me os números até quinta-feira.
+Os dados de outubro ainda não estão consolidados.
+A faturação cresceu doze vírgula cinco por cento.
+O custo por cliente desceu para quarenta e dois euros.
+Perdemos três clientes importantes este trimestre.
+O principal motivo foi o preço.
+A concorrência lançou um produto mais barato.
+Temos de melhorar a nossa oferta.
+Estamos a trabalhar numa versão nova da aplicação.
+A interface vai ser totalmente redesenhada.
+Os utilizadores queixam-se de que é lenta.
+Vamos otimizar o arranque da aplicação.
+Também vamos reduzir o consumo de memória.
+O objetivo é arrancar em menos de dois segundos.
+Isso é ambicioso, mas possível.
+Precisamos de mais um programador a tempo inteiro.
+Já abrimos a vaga na semana passada.
+Recebemos quarenta candidaturas.
+Entrevistámos cinco pessoas até agora.
+Duas delas parecem muito boas.
+Vamos decidir até ao final do mês.
+Desculpem o atraso, estava preso no trânsito.
+Não faz mal, ainda agora começámos.
+Alguém tem o código de acesso à sala?
+Esqueci-me do portátil em casa.
+Posso usar o seu telemóvel para mostrar isto?
+A rede wifi não está a funcionar.
+Reiniciem o router, por favor.
+Agora já está a funcionar.
+Muito obrigado pela vossa paciência.
+Gostava de agradecer o esforço de toda a equipa.
+Foi um trimestre difícil, mas conseguimos.
+Os próximos meses vão ser ainda mais exigentes.
+Mantenham o foco nas prioridades.
+Qualquer problema, falem comigo diretamente.
+Tenho a agenda cheia até sexta-feira.
+Marcamos uma chamada na segunda-feira de manhã?
+Pode ser às nove e meia.
+Perfeito, fica combinado.
+Alguma pergunta final?
+Não, por agora está tudo claro.
+Então encerramos a reunião por aqui.
+Bom fim de semana a todos.
+Até à próxima.
+Obrigado, igualmente.
