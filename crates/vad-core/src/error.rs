@@ -273,7 +273,7 @@ impl VadError {
             VadError::LlmAuthFailed(_) => ErrorAction {
                 severity: ErrorSeverity::Degraded,
                 title: "Chave de API Inválida",
-                description: "Não foi possível autenticar com o provider de IA. Verifica a configuração ou chave de API.",
+                description: "Chave inválida — abre Definições → IA e verifica a chave.",
                 install_command: None,
                 disabled_features: &["cloud_llm"],
                 can_ignore: true,

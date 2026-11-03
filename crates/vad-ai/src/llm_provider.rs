@@ -116,9 +116,11 @@ impl LlmProviderConfig {
     pub fn privacy_badge(&self) -> AiPrivacyBadge {
         match self {
             Self::LocalQwen { .. } => AiPrivacyBadge::Local,
+            // Only the machine itself is "Local": a LAN address or a lookalike such as
+            // `localhost.evil.com` sends the transcript out of the PC (§4.1). An invalid
+            // URL fails closed, as Cloud.
             Self::OpenAiCompatible { base_url, .. } => {
-                let lower = base_url.to_lowercase();
-                if lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("0.0.0.0") {
+                if crate::endpoint::is_loopback_str(base_url) {
                     AiPrivacyBadge::Local
                 } else {
                     AiPrivacyBadge::Cloud
@@ -183,6 +185,33 @@ pub trait Summarizer: Send + Sync {
         target_lang: &str,
         abort: Option<&AtomicBool>,
     ) -> Result<String, VadError>;
+}
+
+/// `(system, user)` prompts for a summary call. Shared by every provider so the same text is
+/// judged the same way whether it runs locally or in the cloud.
+pub(crate) fn summary_prompts(chunk: &str, is_final_reduce: bool) -> (&'static str, String) {
+    if is_final_reduce {
+        (
+            "És um assistente executivo de reuniões em língua portuguesa. A tua função é criar um resumo estruturado e profissional com base nos resumos parciais fornecidos. Organiza a resposta com: 1. Sumário Executivo; 2. Principais Discussões; 3. Decisões Tomadas; 4. Próximos Passos e Tarefas. Não inventes factos.",
+            format!("Aqui estão os resumos parciais de diferentes secções da reunião:\n\n{}\n\nPor favor sintetiza o resumo final estruturado da reunião:", chunk),
+        )
+    } else {
+        (
+            "És um assistente de síntese em língua portuguesa. Resume o bloco de transcrição fornecido de forma concisa, capturando os pontos discutidos, ideias centrais e quaisquer decisões ou números mencionados. Responde apenas com o resumo dos pontos relevantes.",
+            format!("Resume objetivamente o seguinte bloco de transcrição:\n\n{}", chunk),
+        )
+    }
+}
+
+/// `(system, user)` prompts for a translation call.
+pub(crate) fn translate_prompts(text: &str, source_lang: &str, target_lang: &str) -> (String, String) {
+    (
+        format!(
+            "És um tradutor profissional e rigoroso de {} para {}. Traduz o texto fornecido com máxima fidelidade e naturalidade, sem alucinações, sem comentários adicionais e sem explicações.",
+            source_lang, target_lang
+        ),
+        format!("Texto a traduzir:\n{}", text),
+    )
 }
 
 fn is_aborted(abort: Option<&AtomicBool>) -> bool {
@@ -389,18 +418,7 @@ impl Summarizer for LocalQwenSummarizer {
         is_final_reduce: bool,
         abort: Option<&AtomicBool>,
     ) -> Result<String, VadError> {
-        let (system_prompt, user_prompt) = if is_final_reduce {
-            (
-                "És um assistente executivo de reuniões em língua portuguesa. A tua função é criar um resumo estruturado e profissional com base nos resumos parciais fornecidos. Organiza a resposta com: 1. Sumário Executivo; 2. Principais Discussões; 3. Decisões Tomadas; 4. Próximos Passos e Tarefas. Não inventes factos.",
-                format!("Aqui estão os resumos parciais de diferentes secções da reunião:\n\n{}\n\nPor favor sintetiza o resumo final estruturado da reunião:", chunk),
-            )
-        } else {
-            (
-                "És um assistente de síntese em língua portuguesa. Resume o bloco de transcrição fornecido de forma concisa, capturando os pontos discutidos, ideias centrais e quaisquer decisões ou números mencionados. Responde apenas com o resumo dos pontos relevantes.",
-                format!("Resume objetivamente o seguinte bloco de transcrição:\n\n{}", chunk),
-            )
-        };
-
+        let (system_prompt, user_prompt) = summary_prompts(chunk, is_final_reduce);
         let prompt = Self::format_prompt(system_prompt, &user_prompt);
         self.generate(&prompt, self.max_output_tokens, abort)
     }
@@ -412,11 +430,7 @@ impl Summarizer for LocalQwenSummarizer {
         target_lang: &str,
         abort: Option<&AtomicBool>,
     ) -> Result<String, VadError> {
-        let system_prompt = format!(
-            "És um tradutor profissional e rigoroso de {} para {}. Traduz o texto fornecido com máxima fidelidade e naturalidade, sem alucinações, sem comentários adicionais e sem explicações.",
-            source_lang, target_lang
-        );
-        let user_prompt = format!("Texto a traduzir:\n{}", text);
+        let (system_prompt, user_prompt) = translate_prompts(text, source_lang, target_lang);
         let prompt = Self::format_prompt(&system_prompt, &user_prompt);
         self.generate(&prompt, self.max_output_tokens, abort)
     }

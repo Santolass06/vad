@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use tracing::{error, info};
 use vad_ai::{
-    find_preset, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
+    find_preset, build_openai_from_config, AiPrivacyBadge, DiskModelInfo, LlmTranslator, LocalQwenSummarizer,
     MapReduceSummarizer, MeetingSummary, MockSummarizer, ModelManager, ModelPreset, ModelSource,
     PcmAudio, SummarizeProgress, Summarizer, TargetLanguage, TranscriptionSegment, WhisperEngine,
     DEFAULT_QWEN_CONTEXT_WINDOW, DEFAULT_QWEN_MAX_OUTPUT_TOKENS, DEFAULT_QWEN_MODEL_FILENAME,
     DEFAULT_QWEN_TOKENIZER_FILENAME, DISK_TOOLTIP, PRESET_LLM_MODELS, PRESET_MODELS,
     RAM_ONLY_TOOLTIP,
 };
+use vad_ai::SecretStore;
+use vad_core::config::{AiConfig, AiProviderKind};
 use vad_core::{get_process_rss_bytes, ModelStorageMode, VadConfig, VadError};
 
 /// Renders a standardized AI privacy badge (🔒 Local / ☁️ Sai do PC) per PLANO_VAD.md §4.1.
@@ -54,9 +56,19 @@ impl Drop for ClearOnDrop {
 ///
 /// A missing or unreadable model is an error the user sees, never a silent switch to the
 /// mock: canned text under a "🔒 Local" badge would pass for a real summary (§4.21).
-fn load_llm(manager: &ModelManager, use_mock: bool) -> Result<Arc<dyn Summarizer>, VadError> {
+fn load_llm(
+    manager: &ModelManager,
+    use_mock: bool,
+    ai: &AiConfig,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn Summarizer>, VadError> {
     if use_mock {
         return Ok(Arc::new(MockSummarizer::default()));
+    }
+    // Cloud/custom provider chosen in Definições → IA. Errors (bad key, unconfirmed
+    // endpoint) are shown to the user; there is no silent switch to another provider.
+    if ai.provider == AiProviderKind::OpenaiCompatible {
+        return Ok(Arc::new(build_openai_from_config(ai, secrets)?));
     }
     let Some((model_path, tokenizer_path)) =
         manager.get_llm_model_paths(DEFAULT_QWEN_MODEL_FILENAME, DEFAULT_QWEN_TOKENIZER_FILENAME)
@@ -146,6 +158,10 @@ pub struct WhisperPanel {
 
     /// Test hook: use the deterministic `MockSummarizer` instead of the real model.
     use_mock_llm: bool,
+
+    /// Provider chosen in Definições → IA and the shared secret store (§4.2).
+    ai_config: AiConfig,
+    ai_secrets: Arc<SecretStore>,
 }
 
 impl Default for WhisperPanel {
@@ -202,6 +218,28 @@ impl WhisperPanel {
             llm_download_error: Arc::new(Mutex::new(None)),
 
             use_mock_llm: false,
+
+            ai_config: AiConfig::default(),
+            ai_secrets: Arc::new(SecretStore::system()),
+        }
+    }
+
+    /// Sets the AI provider and the secret store shared with the settings panel.
+    pub fn set_ai(&mut self, ai: &AiConfig, secrets: Arc<SecretStore>) {
+        self.ai_config = ai.clone();
+        self.ai_secrets = secrets;
+    }
+
+    /// Badge for the provider that will run the next summary/translation (§4.1): what the
+    /// user sees before pressing the button must match where the text goes.
+    pub fn provider_badge(&self) -> AiPrivacyBadge {
+        match self.ai_config.provider {
+            AiProviderKind::Local => AiPrivacyBadge::Local,
+            AiProviderKind::OpenaiCompatible => vad_ai::LlmProviderConfig::OpenAiCompatible {
+                base_url: self.ai_config.openai_base_url.clone(),
+                model: self.ai_config.openai_model.clone(),
+            }
+            .privacy_badge(),
         }
     }
 
@@ -717,7 +755,7 @@ impl WhisperPanel {
                         .strong()
                         .color(Color32::from_rgb(160, 165, 185)),
                 );
-                render_privacy_badge(ui, AiPrivacyBadge::Local);
+                render_privacy_badge(ui, self.provider_badge());
             });
             ui.add_space(4.0);
 
@@ -804,7 +842,7 @@ impl WhisperPanel {
                         .strong()
                         .color(Color32::from_rgb(160, 165, 185)),
                 );
-                render_privacy_badge(ui, AiPrivacyBadge::Local);
+                render_privacy_badge(ui, self.provider_badge());
             });
             ui.add_space(4.0);
 
@@ -1088,6 +1126,8 @@ impl WhisperPanel {
         let progress_state = Arc::clone(&self.summarize_progress);
         let abort_flag = Arc::clone(&self.summarize_abort);
         let use_mock = self.use_mock_llm;
+        let ai_config = self.ai_config.clone();
+        let ai_secrets = Arc::clone(&self.ai_secrets);
 
         let (tx, rx) = crossbeam_channel::bounded::<Result<MeetingSummary, String>>(1);
 
@@ -1100,7 +1140,7 @@ impl WhisperPanel {
                 }
             };
 
-            let res = load_llm(&ModelManager::new(), use_mock).and_then(|summarizer| {
+            let res = load_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets).and_then(|summarizer| {
                 MapReduceSummarizer::new(summarizer).summarize(&segments, Some(progress_cb), Some(abort_flag))
             });
             let _ = tx.send(res.map_err(|e| e.to_string()));
@@ -1121,7 +1161,7 @@ impl WhisperPanel {
                 DEFAULT_QWEN_TOKENIZER_FILENAME,
             );
         }
-        if self.use_mock_llm || self.llm_ready {
+        if self.use_mock_llm || self.llm_ready || self.ai_config.provider != AiProviderKind::Local {
             return true;
         }
 
@@ -1210,6 +1250,8 @@ impl WhisperPanel {
         let progress_state = Arc::clone(&self.translation_progress);
         let abort_flag = Arc::clone(&self.translation_abort);
         let use_mock = self.use_mock_llm;
+        let ai_config = self.ai_config.clone();
+        let ai_secrets = Arc::clone(&self.ai_secrets);
 
         let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<TranscriptionSegment>, String>>(1);
 
@@ -1222,7 +1264,7 @@ impl WhisperPanel {
                 }
             };
 
-            let res = load_llm(&ModelManager::new(), use_mock).and_then(|summarizer| {
+            let res = load_llm(&ModelManager::new(), use_mock, &ai_config, &ai_secrets).and_then(|summarizer| {
                 LlmTranslator::new(summarizer).translate_segments(
                     &segments,
                     "Português",
@@ -1452,13 +1494,13 @@ mod tests {
     fn test_missing_llm_is_an_error_never_the_mock() {
         let dir = std::env::temp_dir().join(format!("vad-llm-missing-{}", std::process::id()));
         let manager = ModelManager::with_dir(dir.clone());
-        let err = load_llm(&manager, false).err().expect("must not fall back to the mock");
+        let err = load_llm(&manager, false, &AiConfig::default(), &SecretStore::system()).err().expect("must not fall back to the mock");
         assert!(err.to_string().contains("em falta"), "message: {err}");
 
         // Present but unreadable files are an error too, not a silent mock.
         std::fs::write(dir.join(DEFAULT_QWEN_MODEL_FILENAME), b"not a gguf").unwrap();
         std::fs::write(dir.join(DEFAULT_QWEN_TOKENIZER_FILENAME), b"{}").unwrap();
-        assert!(load_llm(&manager, false).is_err());
+        assert!(load_llm(&manager, false, &AiConfig::default(), &SecretStore::system()).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

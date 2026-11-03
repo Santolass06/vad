@@ -53,6 +53,7 @@ pub enum ActiveSidePanel {
     Equalizer,
     Video,
     Whisper,
+    Settings,
 }
 
 /// Main GUI application for VAD.
@@ -81,6 +82,7 @@ pub struct VadApp {
     video_panel: VideoPanel,
     audio_panel: AudioPanel,
     whisper_panel: WhisperPanel,
+    settings_panel: crate::panels::SettingsPanel,
     audio_extractor: AudioExtractor,
     extraction_handle: Option<ExtractionHandle>,
     extraction_rx: Option<crossbeam_channel::Receiver<ExtractionStatus>>,
@@ -251,6 +253,8 @@ impl VadApp {
 
         let mut whisper_panel = WhisperPanel::new();
         whisper_panel.init_from_config(&config);
+        let ai_secrets = std::sync::Arc::new(vad_ai::SecretStore::system());
+        whisper_panel.set_ai(&config.ai, std::sync::Arc::clone(&ai_secrets));
         let audio_extractor = AudioExtractor::new();
 
         let mut app = Self {
@@ -278,6 +282,7 @@ impl VadApp {
             video_panel: VideoPanel::new(),
             audio_panel,
             whisper_panel,
+            settings_panel: crate::panels::SettingsPanel::new(ai_secrets),
             audio_extractor,
             extraction_handle: None,
             extraction_rx: None,
@@ -2490,6 +2495,15 @@ impl eframe::App for VadApp {
                         };
                     }
 
+                    let settings_active = self.active_side_panel == ActiveSidePanel::Settings;
+                    if ui.selectable_label(settings_active, "⚙ IA").clicked() {
+                        self.active_side_panel = if settings_active {
+                            ActiveSidePanel::None
+                        } else {
+                            ActiveSidePanel::Settings
+                        };
+                    }
+
                     if let Some(ref p) = self.player {
                         if p.has_video() {
                             let is_meeting = self.meeting_mode_view;
@@ -2621,6 +2635,21 @@ impl eframe::App for VadApp {
                             self.active_side_panel = ActiveSidePanel::Whisper;
                         }
 
+                        let is_set = self.active_side_panel == ActiveSidePanel::Settings;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("IA")
+                                        .strong()
+                                        .color(if is_set { accent } else { Color32::from_rgb(150, 155, 175) }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            self.active_side_panel = ActiveSidePanel::Settings;
+                        }
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✕").clicked() {
                                 self.active_side_panel = ActiveSidePanel::None;
@@ -2688,6 +2717,15 @@ impl eframe::App for VadApp {
                                         let _ = self.config.save_default();
                                     }
                                 }
+                            }
+                        }
+                        ActiveSidePanel::Settings => {
+                            if self.settings_panel.ui(ui, &mut self.config.ai).is_some() {
+                                self.whisper_panel.set_ai(
+                                    &self.config.ai,
+                                    std::sync::Arc::clone(self.settings_panel.secrets()),
+                                );
+                                let _ = self.config.save_default();
                             }
                         }
                         ActiveSidePanel::None => {}

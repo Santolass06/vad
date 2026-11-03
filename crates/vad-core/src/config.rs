@@ -202,6 +202,52 @@ impl Default for EqualizerConfig {
     }
 }
 
+/// Which LLM backend runs summaries and translations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AiProviderKind {
+    /// Offline Qwen (default, nothing leaves the PC).
+    #[default]
+    Local,
+    /// OpenAI or any OpenAI-compatible endpoint (Ollama, OpenRouter, self-hosted).
+    OpenaiCompatible,
+}
+
+fn default_openai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_openai_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+/// AI provider choice. **No secret ever lives here** (§4.2, §10.7): API keys go to the OS
+/// keyring or env vars (`vad_ai::secrets`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiConfig {
+    #[serde(default)]
+    pub provider: AiProviderKind,
+    #[serde(default = "default_openai_base_url")]
+    pub openai_base_url: String,
+    #[serde(default = "default_openai_model")]
+    pub openai_model: String,
+    /// Normalised custom `base_url` the user confirmed is not covered by the Sprint_10
+    /// quality gate (§4.1). Changing the URL invalidates the confirmation.
+    #[serde(default)]
+    pub custom_endpoint_acknowledged: Option<String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: AiProviderKind::Local,
+            openai_base_url: default_openai_base_url(),
+            openai_model: default_openai_model(),
+            custom_endpoint_acknowledged: None,
+        }
+    }
+}
+
 /// Unified VAD configuration stored in `~/.config/vad/config.toml` per PLANO_VAD.md §5.
 /// Note: API keys and cloud secrets are STRICTLY FORBIDDEN in this structure (§4.2, §10.7).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -216,6 +262,8 @@ pub struct VadConfig {
     pub whisper: WhisperConfig,
     #[serde(default)]
     pub equalizer: EqualizerConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 
 impl VadConfig {
